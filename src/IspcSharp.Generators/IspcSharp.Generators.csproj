@@ -14,10 +14,10 @@
 		<Description>Roslyn source generator for IspcSharp: rewrites [Spmd]-annotated scalar loops into masked SIMD kernels.</Description>
 		<DevelopmentDependency>true</DevelopmentDependency>
 		<SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
-		<IncludeSymbols>true</IncludeSymbols>
 		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
 		<PublishRepositoryUrl>true</PublishRepositoryUrl>
 		<Product>IspcSharp.Generators</Product>
+		<IncludeBuildOutput>false</IncludeBuildOutput>
 		<Copyright>Copyright © JayArrowz 2026</Copyright>
 		<PackageProjectUrl>https://github.com/JayArrowz/IspcSharp</PackageProjectUrl>
 		<RepositoryUrl>https://github.com/JayArrowz/IspcSharp</RepositoryUrl>
@@ -35,7 +35,10 @@
 	
 	<ItemGroup>
 		<PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.8.0" PrivateAssets="all" />
-		<PackageReference Include="Microsoft.CodeAnalysis.Analyzers" Version="3.3.4" PrivateAssets="all" />
+		<PackageReference Include="Microsoft.CodeAnalysis.Analyzers" Version="3.3.4">
+			<PrivateAssets>all</PrivateAssets>
+			<IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+		</PackageReference>
 	</ItemGroup>
 
 	<!-- Development Dependencies -->
@@ -47,5 +50,9 @@
 	<ItemGroup>
 		<AdditionalFiles Include="AnalyzerReleases.Shipped.md" />
 		<AdditionalFiles Include="AnalyzerReleases.Unshipped.md" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<None Include="$(OutputPath)\$(AssemblyName).dll" Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
 	</ItemGroup>
 </Project>
