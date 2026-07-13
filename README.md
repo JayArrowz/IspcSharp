@@ -22,13 +22,10 @@ The .NET JIT auto-vectorizes almost nothing beyond trivial loops. Hardware intri
 
 ## Getting started
 
-Not on NuGet yet, reference the projects directly:
-
 ```xml
 <ItemGroup>
-  <ProjectReference Include="path/to/src/IspcSharp/IspcSharp.csproj" />
-  <ProjectReference Include="path/to/src/IspcSharp.Generators/IspcSharp.Generators.csproj"
-                    OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+  <PackageReference Include="IspcSharp" Version="*" />
+  <PackageReference Include="IspcSharp.Generators" Version="*" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
 </ItemGroup>
 ```
 
