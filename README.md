@@ -1,5 +1,10 @@
 # IspcSharp
 
+[![Build Status](https://github.com/jayarrowz/IspcSharp/workflows/CI/badge.svg)](https://github.com/jayarrowz/IspcSharp/actions)
+[![NuGet](https://img.shields.io/nuget/v/IspcSharp.svg)](https://www.nuget.org/packages/IspcSharp)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-yellow.svg)](https://buymeacoffee.com/jayarrowz)
+
 **SPMD-on-SIMD programming for C#**, write scalar-looking kernels, run them across every SIMD lane and every CPU core. Inspired by [Intel ISPC](https://ispc.github.io/), built on `System.Numerics.Vector<T>` so the same code uses SSE, AVX2, AVX-512, or NEON at runtime.
 
 - **`IspcSharp`**, the runtime: varying types (`VFloat`, `VInt`, `VDouble`, `VLong`, masks), the SPMD execution engine (`Spmd.Foreach`, `Spmd.ParallelForeach`, `Spmd.While`), a vectorized math library, reductions, gather/scatter, cross-lane shuffles, SoA helpers, and a correctness verifier.
@@ -19,6 +24,19 @@ The .NET JIT auto-vectorizes almost nothing beyond trivial loops. Hardware intri
 | One debugger, one profiler, one build | ✅ | ✅ | ❌ | ✅ |
 
 **Realistic wins** (compute-bound kernels): 4–16× from SIMD depending on lane width (SSE/NEON = 4 floats, AVX2 = 8, AVX-512 = 16), multiplied by core count with `ParallelForeach`. Branchy kernels land lower (2–8×) because both sides of masked branches execute. Memory-bandwidth-bound loops may see little or nothing, profile first, vectorize the compute-bound hot spots.
+
+
+## Performance
+Benchmarks are run automatically on Linux x64 (AVX2), Windows x64 (AVX2), and macOS ARM64 (Apple Silicon / NEON) using GitHub Actions [here](https://github.com/JayArrowz/IspcSharp/actions/runs/29269156291/attempts/1#summary-86884172028).
+
+Across the benchmark suite:
+
+- Compute-heavy kernels: typically 4–12× faster than scalar C#
+- Best cases: over 20× faster when combining SIMD with multicore execution
+- Memory-bandwidth-bound kernels: around 1.5–2×, approaching hardware bandwidth limits
+- Branch-heavy kernels: still commonly 2–7× faster, depending on divergence
+
+Every benchmark compares the generated SIMD implementation against the original scalar implementation written by the user.
 
 ## Getting started
 
