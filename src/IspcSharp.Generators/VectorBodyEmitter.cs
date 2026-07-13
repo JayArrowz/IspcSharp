@@ -17,7 +17,7 @@ namespace IspcSharp.Generators
     ///   buf[i]                -> VFloat.Load / VInt.Load  (contiguous gang access)
     ///   buf[i] = e            -> Store, or masked read-modify-write inside divergent flow
     ///   if (c) A else B       -> mask m = c; writes in A blended by m, in B by !m
-    ///   while (c) { A }       -> VMask loop = c & outer; while (loop.Any()) { A@loop; loop &= c; }
+    ///   while (c) { A }       -> VMask loop = c &amp; outer; while (loop.Any()) { A@loop; loop &amp;= c; }
     ///   acc += e (reduction)  -> __red_acc += Select(mask, e, 0)
     ///   (float)x / (int)x     -> lane conversions
     /// </summary>

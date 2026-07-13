@@ -45,7 +45,7 @@ namespace IspcSharp.Generators
 
         private static readonly DiagnosticDescriptor BadParam = new(
             "ISPC004", "Unsupported parameter type",
-            "[Spmd] method '{0}': parameter '{1}' has unsupported type '{2}'. Supported: float[]/int[]/double[], Span<T>/ReadOnlySpan<T> of float/int/double, and uniform float/int/double",
+            "[Spmd] method '{0}': parameter '{1}' has unsupported type '{2}'. Supported: float[]/int[]/double[], Span<T>/ReadOnlySpan<T> of float/int/double, and uniform float/int/double.",
             "IspcSharp", DiagnosticSeverity.Error, true);
 
         private static readonly DiagnosticDescriptor NoParallel = new(
