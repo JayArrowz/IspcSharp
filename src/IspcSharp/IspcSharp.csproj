@@ -1,0 +1,32 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+		<LangVersion>latest</LangVersion>
+		<Nullable>enable</Nullable>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<RootNamespace>IspcSharp</RootNamespace>
+		<NoWarn>$(NoWarn);1591</NoWarn>
+		<PackageId>IspcSharp</PackageId>
+		<Version>0.10.0</Version>
+		<Description>SPMD-on-SIMD programming for C#. Write scalar-looking kernels, run them across all SIMD lanes and all cores. Inspired by Intel ISPC.</Description>
+		<PackageTags>simd;spmd;ispc;vectorization;performance;avx;parallel</PackageTags>
+		<IncludeSymbols>true</IncludeSymbols>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+		<PublishRepositoryUrl>true</PublishRepositoryUrl>
+		<Product>IspcSharp</Product>
+		<Copyright>Copyright © JayArrowz 2026</Copyright>
+		<PackageProjectUrl>https://github.com/JayArrowz/IspcSharp</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/JayArrowz/IspcSharp</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<Summary>IspcSharp SPMD-on-SIMD programming library</Summary>
+		<Authors>JayArrowz</Authors>
+		<Company>JayArrowz</Company>
+	</PropertyGroup>
+	<ItemGroup>
+		<None Include="../../README.md" Pack="true" PackagePath="\" />
+	</ItemGroup>
+</Project>

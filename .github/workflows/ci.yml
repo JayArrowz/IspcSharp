@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x64
+          - os: windows-latest
+            label: windows-x64
+          - os: macos-14
+            label: macos-arm64-neon
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Test (Release)
+        run: dotnet test tests/IspcSharp.Tests/IspcSharp.Tests.csproj -c Release --nologo
+
+      - name: Test (software fallback)
+        run: dotnet test tests/IspcSharp.Tests/IspcSharp.Tests.csproj -c Release --nologo
+        env:
+          DOTNET_EnableHWIntrinsic: "0"
+
+  benchmarks:
+    name: benchmarks (${{ matrix.label }})
+    if: github.event_name == 'workflow_dispatch'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x64
+          - os: windows-latest
+            label: windows-x64
+          - os: macos-14
+            label: macos-arm64-neon
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Run benchmarks
+        run: >
+          dotnet run
+          -c Release
+          --project benchmarks/IspcSharp.Benchmarks
+          --
+          --filter '*'
+          --job short
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ matrix.label }}
+          path: BenchmarkDotNet.Artifacts/results/**
+          if-no-files-found: warn
+
+  combine-benchmarks:
+    name: Combine benchmark results
+    if: github.event_name == 'workflow_dispatch'
+
+    needs: benchmarks
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all benchmark artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: benchmarks
+
+      - name: Build comparison report
+        shell: python
+        run: |
+          from pathlib import Path
+
+          root = Path("benchmarks")
+          # results[(bench, method, n)][platform] = mean
+          results = {}
+          all_platforms = set()
+
+          for platform_dir in sorted(root.iterdir()):
+              if not platform_dir.is_dir():
+                  continue
+
+              # e.g. "benchmark-results-linux-x64" -> "linux-x64"
+              platform = platform_dir.name.replace("benchmark-results-", "")
+              all_platforms.add(platform)
+
+              for md in sorted(platform_dir.glob("*.md")):
+                  # Filename: IspcSharp.Benchmarks.DotProductBench-report-github.md
+                  bench = md.stem.replace("-report-github", "") \
+                                .replace("IspcSharp.Benchmarks.", "")
+
+                  lines = md.read_text().splitlines()
+
+                  try:
+                      start = next(i for i, l in enumerate(lines)
+                                   if l.startswith("| Method"))
+                  except StopIteration:
+                      continue
+
+                  header = [c.strip() for c in lines[start].split("|")[1:-1]]
+                  mean_idx = header.index("Mean") if "Mean" in header else 1
+                  n_idx = header.index("N") if "N" in header else None
+
+                  for row in lines[start + 2:]:
+                      if not row.startswith("|"):
+                          break
+
+                      cols = [c.strip() for c in row.split("|")[1:-1]]
+                      if not cols:
+                          continue
+
+                      method = cols[0]
+                      mean = cols[mean_idx] if mean_idx < len(cols) else "-"
+                      n_val = cols[n_idx] if n_idx is not None and n_idx < len(cols) else ""
+
+                      results.setdefault((bench, method, n_val), {})[platform] = mean
+
+          platforms = sorted(all_platforms)
+
+          with open("benchmark-summary.md", "w") as f:
+              f.write("# Benchmark Comparison\n\n")
+
+              for bench in sorted({k[0] for k in results}):
+                  f.write(f"## {bench}\n\n")
+
+                  bench_keys = [k for k in results if k[0] == bench]
+                  has_n = any(k[2] != "" for k in bench_keys)
+
+                  if has_n:
+                      f.write("| Method | N | " + " | ".join(platforms) + " |\n")
+                      f.write("|" + "---|" * (len(platforms) + 2) + "\n")
+                  else:
+                      f.write("| Method | " + " | ".join(platforms) + " |\n")
+                      f.write("|" + "---|" * (len(platforms) + 1) + "\n")
+
+                  for key in sorted(bench_keys, key=lambda k: (k[1], k[2])):
+                      method, n_val = key[1], key[2]
+                      row = [method]
+                      if has_n:
+                          row.append(n_val)
+                      row += [results[key].get(p, "-") for p in platforms]
+                      f.write("| " + " | ".join(row) + " |\n")
+
+                  f.write("\n")
+
+      - name: Publish summary
+        run: cat benchmark-summary.md >> $GITHUB_STEP_SUMMARY

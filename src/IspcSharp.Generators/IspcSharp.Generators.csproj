@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<!-- Roslyn source generators MUST target netstandard2.0 -->
+		<TargetFramework>netstandard2.0</TargetFramework>
+		<LangVersion>latest</LangVersion>
+		<Nullable>enable</Nullable>
+		<EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
+		<IsRoslynComponent>true</IsRoslynComponent>
+
+		<PackageId>IspcSharp.Generators</PackageId>
+		<Version>0.2.0</Version>
+		<Description>Roslyn source generator for IspcSharp: rewrites [Spmd]-annotated scalar loops into masked SIMD kernels.</Description>
+		<IncludeBuildOutput>false</IncludeBuildOutput>
+		<DevelopmentDependency>true</DevelopmentDependency>
+
+		<IncludeSymbols>true</IncludeSymbols>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+		<PublishRepositoryUrl>true</PublishRepositoryUrl>
+		<Product>IspcSharp.Generators</Product>
+		<Copyright>Copyright © JayArrowz 2026</Copyright>
+		<PackageProjectUrl>https://github.com/JayArrowz/IspcSharp</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/JayArrowz/IspcSharp</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<Summary>IspcSharp SPMD-on-SIMD Generator</Summary>
+		<Authors>JayArrowz</Authors>
+		<Company>JayArrowz</Company>
+	</PropertyGroup>
+	<ItemGroup>
+		<None Include="../../README.md" Pack="true" PackagePath="\" />
+	</ItemGroup>
+	
+	<ItemGroup>
+		<PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.8.0" PrivateAssets="all" />
+		<PackageReference Include="Microsoft.CodeAnalysis.Analyzers" Version="3.3.4" PrivateAssets="all" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<None Remove="bin\" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- Pack the generator into the analyzers folder -->
+		<None Include="$(OutputPath)\$(AssemblyName).dll" Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
+	</ItemGroup>
+
+</Project>
