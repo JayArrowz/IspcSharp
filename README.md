@@ -36,6 +36,8 @@ Across the benchmark suite:
 - Memory-bandwidth-bound kernels: around 1.5–2×, approaching hardware bandwidth limits
 - Branch-heavy kernels: still commonly 2–7× faster, depending on divergence
 
+Gather-heavy workloads are intentionally included to demonstrate the limits of SIMD. When every lane reads unrelated memory locations, memory latency dominates and vectorization may not outperform scalar code.
+
 Every benchmark compares the generated SIMD implementation against the original scalar implementation written by the user.
 
 ## Getting started
