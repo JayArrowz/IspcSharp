@@ -38,13 +38,13 @@
 		<PackageReference Include="Microsoft.CodeAnalysis.Analyzers" Version="3.3.4" PrivateAssets="all" />
 	</ItemGroup>
 
-	<ItemGroup>
-		<None Remove="bin\" />
-	</ItemGroup>
+	<Target Name="AddGeneratorToPackage" AfterTargets="Build">
+		<ItemGroup>
+		<None Include="$(TargetPath)"
+				Pack="true"
+				PackagePath="analyzers/dotnet/cs" />
+		</ItemGroup>
+	</Target>
 
-	<ItemGroup>
-		<!-- Pack the generator into the analyzers folder -->
-		<None Include="$(OutputPath)\$(AssemblyName).dll" Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
-	</ItemGroup>
 
 </Project>
