@@ -1,0 +1,82 @@
+name: CD
+
+# Runs when a GitHub Release is published with a tag of the form vX.X.X.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write # required to upload assets to the release
+  id-token: write
+
+env:
+  CONFIGURATION: Release
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - id: v
+        shell: bash
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'; then
+            echo "::error::Release tag '$TAG' is not of the form vX.X.X"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION (tag $TAG)"
+
+  nuget:
+    name: NuGet packages
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: NuGet login (OIDC → temp API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: JayArrowz
+
+      - name: Pack IspcSharp
+        run: >
+          dotnet pack src/IspcSharp/IspcSharp.csproj
+          -c "$CONFIGURATION"
+          -p:MinVerVersionOverride="$VERSION"
+          -o artifacts/nuget
+
+      - name: Pack IspcSharp.Generators
+        run: >
+          dotnet pack src/IspcSharp.Generators/IspcSharp.Generators.csproj
+          -c "$CONFIGURATION"
+          -p:MinVerVersionOverride="$VERSION"
+          -o artifacts/nuget
+
+      - name: Push to NuGet.org
+        run: >
+          dotnet nuget push "artifacts/nuget/*.nupkg"
+          --api-key ${{steps.login.outputs.NUGET_API_KEY}}
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate
+
+      - name: Attach packages to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ needs.version.outputs.tag }}" artifacts/nuget/*.nupkg --clobber
