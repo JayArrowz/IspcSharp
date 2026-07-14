@@ -44,7 +44,7 @@ public sealed class AosAccessAnalyzer : DiagnosticAnalyzer
         if (!IsInsideSpmdKernel(ma))
             return;
 
-        ctx.ReportDiagnostic(Diagnostic.Create(AosAccess, ma.GetLocation(), ma.ToString()));
+        ctx.ReportDiagnostic(Diagnostic.Create(Descriptors.AosAccess, ma.GetLocation(), ma.ToString()));
     }
 
     private static bool IsInsideSpmdKernel(SyntaxNode node)
