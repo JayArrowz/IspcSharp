@@ -42,19 +42,7 @@ Every benchmark compares the generated SIMD implementation against the original 
 
 ## Getting started
 
-```xml
-<ItemGroup>
-  <PackageReference Include="IspcSharp" Version="1.0.3" />
-  <PackageReference Include="IspcSharp.Generators" Version="1.0.3" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
-</ItemGroup>
-```
-
-Then verify everything works on your machine:
-
-```bash
-dotnet test tests/IspcSharp.Tests                                  # 272 tests
-dotnet run -c Release --project samples/IspcSharp.Samples          # smoke-test samples
-```
+Install the Nuget Packages, IspcSharp & IspcSharp.Generators
 
 ## Usage
 
@@ -406,7 +394,6 @@ Accuracy: `VectorMath` transcendentals are branch-free polynomial/rational appro
 ```
 src/IspcSharp/                  Runtime library
 src/IspcSharp.Generators/       Roslyn source generator + AoS analyzer
-samples/IspcSharp.Samples/      Tonemap, reduction, Newton-sqrt (varying while), Mandelbrot
 benchmarks/IspcSharp.Benchmarks BenchmarkDotNet suite on generated kernels: branchless, reductions,
                                 transcendental, divergent while, 2D Mandelbrot, FFT, matrix
                                 multiply, bandwidth-bound control, grid route finding
