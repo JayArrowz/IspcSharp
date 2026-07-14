@@ -44,8 +44,8 @@ Every benchmark compares the generated SIMD implementation against the original 
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="IspcSharp" Version="*" />
-  <PackageReference Include="IspcSharp.Generators" Version="*" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+  <PackageReference Include="IspcSharp" Version="1.0.3" />
+  <PackageReference Include="IspcSharp.Generators" Version="1.0.3" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
 </ItemGroup>
 ```
 
