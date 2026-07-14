@@ -1,9 +1,6 @@
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Running;
-using IspcSharp;
 
 namespace IspcSharp.Benchmarks;
 
@@ -12,7 +9,7 @@ public static class Program
     public static void Main(string[] args)
     {
         PrintEnvironmentBanner();
-        BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
+        _ = BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
     }
 
     /// <summary>
@@ -31,12 +28,12 @@ public static class Program
         Console.WriteLine($"Vector<double>   : Count={System.Numerics.Vector<double>.Count}");
         Console.WriteLine($"Vector<long>     : Count={System.Numerics.Vector<long>.Count}");
 #if NET8_0_OR_GREATER
-        var x = System.Runtime.Intrinsics.X86.Avx2.IsSupported;
+        bool x = System.Runtime.Intrinsics.X86.Avx2.IsSupported;
         Console.WriteLine($"x86 ISA          : SSE2={System.Runtime.Intrinsics.X86.Sse2.IsSupported} AVX2={System.Runtime.Intrinsics.X86.Avx2.IsSupported} " +
                           $"AVX-512F={System.Runtime.Intrinsics.X86.Avx512F.IsSupported} AVX-512DQ={System.Runtime.Intrinsics.X86.Avx512DQ.IsSupported} FMA={System.Runtime.Intrinsics.X86.Fma.IsSupported}");
         Console.WriteLine($"ARM ISA          : AdvSimd(NEON)={System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported}");
 #endif
-        var pref = Environment.GetEnvironmentVariable("DOTNET_PreferredVectorBitWidth");
+        string? pref = Environment.GetEnvironmentVariable("DOTNET_PreferredVectorBitWidth");
         Console.WriteLine($"PreferredVectorBitWidth env : {(string.IsNullOrEmpty(pref) ? "(unset, JIT default)" : pref)}");
         if (System.Numerics.Vector<float>.Count == 16)
             Console.WriteLine("NOTE: 512-bit vectors in use. If compute-bound SIMD benches lose to scalar, retry with DOTNET_PreferredVectorBitWidth=256 (down-clock check).");
@@ -64,11 +61,13 @@ public static partial class GeneratedKernels
     [Spmd]
     public static void ClampScale(float[] input, float[] output, float scale, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             float x = input[i];
-            if (x < 0f)      x = 0f;
-            else if (x > 1f) x = 1f;
+            if (x < 0f)
+                x = 0f;
+            else if (x > 1f)
+                x = 1f;
             output[i] = x * scale;
         }
     }
@@ -83,11 +82,12 @@ public static partial class GeneratedKernels
     public static void SumOfSquares(float[] input, float[] result, int count)
     {
         float sum = 0f;
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             float x = input[i];
             sum += x * x;
         }
+
         result[0] = sum;
     }
 
@@ -102,10 +102,11 @@ public static partial class GeneratedKernels
     public static void DotProduct(float[] a, float[] b, float[] result, int count)
     {
         float sum = 0f;
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             sum += a[i] * b[i];
         }
+
         result[0] = sum;
     }
 
@@ -121,10 +122,11 @@ public static partial class GeneratedKernels
     public static long WideSum(int[] input, int count)
     {
         long sum = 0;
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             sum += input[i];
         }
+
         return sum;
     }
 
@@ -139,7 +141,7 @@ public static partial class GeneratedKernels
     [Spmd]
     public static void VectorAdd(float[] a, float[] b, float[] c, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             c[i] = a[i] + b[i];
         }
@@ -156,9 +158,9 @@ public static partial class GeneratedKernels
     [Spmd]
     public static void Saxpy(float[] x, float[] y, float alpha, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
-            y[i] = alpha * x[i] + y[i];
+            y[i] = (alpha * x[i]) + y[i];
         }
     }
 
@@ -172,14 +174,14 @@ public static partial class GeneratedKernels
     [Spmd]
     public static void IntMix(int[] input, int[] output, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             int x = input[i];
-            x = x ^ (x >> 16);
-            x = x * 0x45d9f3b;
-            x = x ^ (x >> 16);
-            x = x * 0x45d9f3b;
-            x = x ^ (x >> 16);
+            x ^= x >> 16;
+            x *= 0x45d9f3b;
+            x ^= x >> 16;
+            x *= 0x45d9f3b;
+            x ^= x >> 16;
             output[i] = x;
         }
     }
@@ -194,12 +196,12 @@ public static partial class GeneratedKernels
     [Spmd]
     public static void LongHash(long[] input, long[] output, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             long x = input[i];
-            x = x ^ (x >> 33);
-            x = x * 0x5555555555555555L;
-            x = x ^ (x >> 29);
+            x ^= x >> 33;
+            x *= 0x5555555555555555L;
+            x ^= x >> 29;
             output[i] = x;
         }
     }
@@ -215,7 +217,7 @@ public static partial class GeneratedKernels
     [Spmd]
     public static void DoubleTonemap(double[] input, double[] output, double exposure, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             output[i] = 1.0 - Math.Exp(-input[i] * exposure);
         }
@@ -232,10 +234,11 @@ public static partial class GeneratedKernels
     public static double PreciseSum(float[] input, int count)
     {
         double sum = 0d;
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             sum += input[i];
         }
+
         return sum;
     }
 
@@ -249,10 +252,11 @@ public static partial class GeneratedKernels
     public static float ArrayMax(float[] input, int count)
     {
         float mx = float.NegativeInfinity;
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             mx = MathF.Max(mx, input[i]);
         }
+
         return mx;
     }
 
@@ -267,7 +271,7 @@ public static partial class GeneratedKernels
     [Spmd]
     public static void GatherRead(float[] table, int[] indices, float[] output, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             output[i] = table[indices[i]];
         }
@@ -283,7 +287,7 @@ public static partial class GeneratedKernels
     [Spmd]
     public static void SinCos(float[] input, float[] output, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             float x = input[i];
             output[i] = MathF.Sin(x) * MathF.Cos(x);
@@ -300,7 +304,7 @@ public static partial class GeneratedKernels
     [Spmd]
     public static void Tonemap(float[] input, float[] output, float exposure, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             output[i] = 1f - MathF.Exp(-input[i] * exposure);
         }
@@ -315,7 +319,7 @@ public static partial class GeneratedKernels
     [Spmd]
     public static void AddOne(float[] input, float[] output, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             output[i] = input[i] + 1f;
         }
@@ -330,18 +334,18 @@ public static partial class GeneratedKernels
     [Spmd]
     public static void NewtonSqrt(float[] input, float[] output, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             float x = input[i];
             float guess = x;
             float err = 1f;
-            float next = 0f;              // declared at loop-body top level (generator requirement)
             while (err > 0.0001f)         // per-lane trip counts, masked automatically
             {
-                next = 0.5f * (guess + x / guess);
+                float next = 0.5f * (guess + (x / guess));
                 err = MathF.Abs(next - guess);
                 guess = next;
             }
+
             output[i] = guess;
         }
     }
@@ -364,19 +368,20 @@ public static partial class GeneratedKernels
     {
         foreach (var (x, y) in Spmd.Range2D(width, height))
         {
-            float cx = minX + x * dx;
-            float cy = minY + y * dy;
+            float cx = minX + (x * dx);
+            float cy = minY + (y * dy);
             float zx = 0f;
             float zy = 0f;
             int i = 0;
-            while (zx * zx + zy * zy < 4f && i < maxIter)
+            while ((zx * zx) + (zy * zy) < 4f && i < maxIter)
             {
-                float n = zx * zx - zy * zy + cx;
-                zy = 2f * zx * zy + cy;
+                float n = (zx * zx) - (zy * zy) + cx;
+                zy = (2f * zx * zy) + cy;
                 zx = n;
                 i++;
             }
-            iters[y * width + x] = i;
+
+            iters[(y * width) + x] = i;
         }
     }
 
@@ -404,6 +409,7 @@ public static partial class GeneratedKernels
                 j ^= bit;
                 bit >>= 1;
             }
+
             j ^= bit;
 
             if (i < j)
@@ -420,7 +426,7 @@ public static partial class GeneratedKernels
             int half = len / 2;
             for (int i = 0; i < n; i += len)
             {
-                foreach (var k in Spmd.Range(half))     // vectorized butterfly
+                foreach (int k in Spmd.Range(half))     // vectorized butterfly
                 {
                     float wReal = MathF.Cos(k * angle);
                     float wImag = MathF.Sin(k * angle);
@@ -428,8 +434,8 @@ public static partial class GeneratedKernels
                     int even = i + k;
                     int odd = i + k + half;
 
-                    float oddReal = real[odd] * wReal - imag[odd] * wImag;
-                    float oddImag = real[odd] * wImag + imag[odd] * wReal;
+                    float oddReal = (real[odd] * wReal) - (imag[odd] * wImag);
+                    float oddImag = (real[odd] * wImag) + (imag[odd] * wReal);
 
                     float evenReal = real[even];
                     float evenImag = imag[even];
@@ -459,7 +465,7 @@ public static partial class GeneratedKernels
     [Spmd]
     public static void FftGroup(float[] real, float[] imag, int start, int half, float angle)
     {
-        foreach (var k in Spmd.Range(half))
+        foreach (int k in Spmd.Range(half))
         {
             float wReal = MathF.Cos(k * angle);
             float wImag = MathF.Sin(k * angle);
@@ -467,8 +473,8 @@ public static partial class GeneratedKernels
             int even = start + k;
             int odd = start + k + half;
 
-            float oddReal = real[odd] * wReal - imag[odd] * wImag;
-            float oddImag = real[odd] * wImag + imag[odd] * wReal;
+            float oddReal = (real[odd] * wReal) - (imag[odd] * wImag);
+            float oddImag = (real[odd] * wImag) + (imag[odd] * wReal);
 
             float evenReal = real[even];
             float evenImag = imag[even];
@@ -499,10 +505,11 @@ public static partial class GeneratedKernels
             for (int col = 0; col < p; col++)
             {
                 float sum = 0f;
-                foreach (var k in Spmd.Range(m))
+                foreach (int k in Spmd.Range(m))
                 {
                     sum += a[row, k] * bT[col, k];
                 }
+
                 c[row, col] = sum;
             }
         }
@@ -523,10 +530,11 @@ public static partial class GeneratedKernels
         for (int col = 0; col < p; col++)
         {
             float sum = 0f;
-            foreach (var k in Spmd.Range(m))
+            foreach (int k in Spmd.Range(m))
             {
                 sum += a[row, k] * bT[col, k];
             }
+
             c[row, col] = sum;
         }
     }
@@ -548,10 +556,11 @@ public class ClampScaleBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _input = new float[N];
         _output = new float[N];
-        for (int i = 0; i < N; i++) _input[i] = (float)(rng.NextDouble() * 2 - 0.5);
+        for (int i = 0; i < N; i++)
+            _input[i] = (float)((rng.NextDouble() * 2) - 0.5);
     }
 
     [Benchmark(Baseline = true)]
@@ -560,8 +569,10 @@ public class ClampScaleBench
         for (int i = 0; i < N; i++)
         {
             float x = _input[i];
-            if (x < 0f) x = 0f;
-            else if (x > 1f) x = 1f;
+            if (x < 0f)
+                x = 0f;
+            else if (x > 1f)
+                x = 1f;
             _output[i] = x * 2.5f;
         }
     }
@@ -588,17 +599,19 @@ public class GeneratedReductionBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _input = new float[N];
         _result = new float[1];
-        for (int i = 0; i < N; i++) _input[i] = (float)rng.NextDouble();
+        for (int i = 0; i < N; i++)
+            _input[i] = (float)rng.NextDouble();
     }
 
     [Benchmark(Baseline = true)]
     public float Scalar()
     {
         float sum = 0f;
-        for (int i = 0; i < N; i++) sum += _input[i] * _input[i];
+        for (int i = 0; i < N; i++)
+            sum += _input[i] * _input[i];
         return sum;
     }
 
@@ -625,18 +638,20 @@ public class DotProductBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _a = new float[N];
         _b = new float[N];
         _result = new float[1];
-        for (int i = 0; i < N; i++) { _a[i] = (float)rng.NextDouble(); _b[i] = (float)rng.NextDouble(); }
+        for (int i = 0; i < N; i++)
+        { _a[i] = (float)rng.NextDouble(); _b[i] = (float)rng.NextDouble(); }
     }
 
     [Benchmark(Baseline = true)]
     public float Scalar()
     {
         float sum = 0f;
-        for (int i = 0; i < N; i++) sum += _a[i] * _b[i];
+        for (int i = 0; i < N; i++)
+            sum += _a[i] * _b[i];
         return sum;
     }
 
@@ -672,16 +687,18 @@ public class WideSumBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _input = new int[N];
-        for (int i = 0; i < N; i++) _input[i] = rng.Next(500_000, 1_000_000);
+        for (int i = 0; i < N; i++)
+            _input[i] = rng.Next(500_000, 1_000_000);
     }
 
     [Benchmark(Baseline = true)]
     public long Scalar()
     {
         long sum = 0;
-        for (int i = 0; i < N; i++) sum += _input[i];
+        for (int i = 0; i < N; i++)
+            sum += _input[i];
         return sum;
     }
 
@@ -708,10 +725,11 @@ public class TonemapBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _input = new float[N];
         _output = new float[N];
-        for (int i = 0; i < N; i++) _input[i] = (float)rng.NextDouble() * 4f;
+        for (int i = 0; i < N; i++)
+            _input[i] = (float)rng.NextDouble() * 4f;
     }
 
     [Benchmark(Baseline = true)]
@@ -743,10 +761,11 @@ public class GeneratedNewtonSqrtBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _input = new float[N];
         _output = new float[N];
-        for (int i = 0; i < N; i++) _input[i] = (float)(rng.NextDouble() * 4 + 0.01);
+        for (int i = 0; i < N; i++)
+            _input[i] = (float)((rng.NextDouble() * 4) + 0.01);
     }
 
     [Benchmark(Baseline = true)]
@@ -757,10 +776,11 @@ public class GeneratedNewtonSqrtBench
             float x = _input[i], guess = x, err = 1f;
             while (err > 0.0001f)
             {
-                float next = 0.5f * (guess + x / guess);
+                float next = 0.5f * (guess + (x / guess));
                 err = MathF.Abs(next - guess);
                 guess = next;
             }
+
             _output[i] = guess;
         }
     }
@@ -795,15 +815,18 @@ public class MandelbrotBench
         {
             for (int x = 0; x < W; x++)
             {
-                float cx = -2f + x * dx, cy = -1.25f + y * dy;
-                float zx = 0, zy = 0; int i = 0;
-                while (zx * zx + zy * zy < 4f && i < MaxIter)
+                float cx = -2f + (x * dx), cy = -1.25f + (y * dy);
+                float zx = 0, zy = 0;
+                int i = 0;
+                while ((zx * zx) + (zy * zy) < 4f && i < MaxIter)
                 {
-                    float n = zx * zx - zy * zy + cx;
-                    zy = 2f * zx * zy + cy;
-                    zx = n; i++;
+                    float n = (zx * zx) - (zy * zy) + cx;
+                    zy = (2f * zx * zy) + cy;
+                    zx = n;
+                    i++;
                 }
-                _iters[y * W + x] = i;
+
+                _iters[(y * W) + x] = i;
             }
         }
     }
@@ -842,7 +865,8 @@ public class BandwidthBoundBench
     [Benchmark(Baseline = true)]
     public void Scalar()
     {
-        for (int i = 0; i < N; i++) _output[i] = _input[i] + 1f;
+        for (int i = 0; i < N; i++)
+            _output[i] = _input[i] + 1f;
     }
 
     [Benchmark]
@@ -871,10 +895,12 @@ public class FftBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _realSrc = new float[N];
         _imagSrc = new float[N];
-        for (int i = 0; i < N; i++) { _realSrc[i] = (float)(rng.NextDouble() * 2 - 1); _imagSrc[i] = 0f; }
+        for (int i = 0; i < N; i++)
+        { _realSrc[i] = (float)((rng.NextDouble() * 2) - 1); _imagSrc[i] = 0f; }
+
         _real = new float[N];
         _imag = new float[N];
     }
@@ -913,7 +939,9 @@ public class FftBench
         for (int i = 1; i < n; i++)
         {
             int bit = n >> 1;
-            while ((j & bit) != 0) { j ^= bit; bit >>= 1; }
+            while ((j & bit) != 0)
+            { j ^= bit; bit >>= 1; }
+
             j ^= bit;
             if (i < j)
             {
@@ -921,24 +949,27 @@ public class FftBench
                 (imag[i], imag[j]) = (imag[j], imag[i]);
             }
         }
+
         for (int len = 2; len <= n; len <<= 1)
         {
             float angle = -2.0f * MathF.PI / len;
             int half = len / 2;
             for (int i = 0; i < n; i += len)
+            {
                 for (int k = 0; k < half; k++)
                 {
                     float wReal = MathF.Cos(k * angle);
                     float wImag = MathF.Sin(k * angle);
                     int even = i + k, odd = i + k + half;
-                    float oddReal = real[odd] * wReal - imag[odd] * wImag;
-                    float oddImag = real[odd] * wImag + imag[odd] * wReal;
+                    float oddReal = (real[odd] * wReal) - (imag[odd] * wImag);
+                    float oddImag = (real[odd] * wImag) + (imag[odd] * wReal);
                     float evenReal = real[even], evenImag = imag[even];
                     real[even] = evenReal + oddReal;
                     imag[even] = evenImag + oddImag;
                     real[odd] = evenReal - oddReal;
                     imag[odd] = evenImag - oddImag;
                 }
+            }
         }
     }
 
@@ -949,7 +980,9 @@ public class FftBench
         for (int i = 1; i < n; i++)
         {
             int bit = n >> 1;
-            while ((j & bit) != 0) { j ^= bit; bit >>= 1; }
+            while ((j & bit) != 0)
+            { j ^= bit; bit >>= 1; }
+
             j ^= bit;
             if (i < j)
             {
@@ -957,12 +990,13 @@ public class FftBench
                 (imag[i], imag[j]) = (imag[j], imag[i]);
             }
         }
+
         for (int len = 2; len <= n; len <<= 1)
         {
             float angle = -2.0f * MathF.PI / len;
             int half = len / 2;
             int numGroups = n / len;
-            System.Threading.Tasks.Parallel.For(0, numGroups, g =>
+            _ = System.Threading.Tasks.Parallel.For(0, numGroups, g =>
                 GeneratedKernels.FftGroup_Simd(real, imag, g * len, half, angle));
         }
     }
@@ -989,29 +1023,34 @@ public class MatMulBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _a = new float[N, N];
         _b = new float[N, N];
         _bT = new float[N, N];
         _c = new float[N, N];
         for (int r = 0; r < N; r++)
+        {
             for (int col = 0; col < N; col++)
             {
-                _a[r, col] = (float)(rng.NextDouble() * 2 - 1);
-                _b[r, col] = (float)(rng.NextDouble() * 2 - 1);
+                _a[r, col] = (float)((rng.NextDouble() * 2) - 1);
+                _b[r, col] = (float)((rng.NextDouble() * 2) - 1);
             }
+        }
     }
 
     [Benchmark(Baseline = true)]
     public void Scalar()
     {
         for (int row = 0; row < N; row++)
+        {
             for (int col = 0; col < N; col++)
             {
                 float sum = 0f;
-                for (int k = 0; k < N; k++) sum += _a[row, k] * _b[k, col];
+                for (int k = 0; k < N; k++)
+                    sum += _a[row, k] * _b[k, col];
                 _c[row, col] = sum;
             }
+        }
     }
 
     [Benchmark]
@@ -1025,7 +1064,7 @@ public class MatMulBench
     public void GeneratedParallelSimd()
     {
         Memory.Transpose(_b, _bT);
-        System.Threading.Tasks.Parallel.For(0, N, row =>
+        _ = System.Threading.Tasks.Parallel.For(0, N, row =>
             GeneratedKernels.MatMulTRow_Simd(_a, _bT, _c, row, N, N));
     }
 }
@@ -1048,17 +1087,19 @@ public class VectorAddBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _a = new float[N];
         _b = new float[N];
         _c = new float[N];
-        for (int i = 0; i < N; i++) { _a[i] = (float)rng.NextDouble(); _b[i] = (float)rng.NextDouble(); }
+        for (int i = 0; i < N; i++)
+        { _a[i] = (float)rng.NextDouble(); _b[i] = (float)rng.NextDouble(); }
     }
 
     [Benchmark(Baseline = true)]
     public void Scalar()
     {
-        for (int i = 0; i < N; i++) _c[i] = _a[i] + _b[i];
+        for (int i = 0; i < N; i++)
+            _c[i] = _a[i] + _b[i];
     }
 
     [Benchmark]
@@ -1084,16 +1125,18 @@ public class SaxpyBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _x = new float[N];
         _y = new float[N];
-        for (int i = 0; i < N; i++) { _x[i] = (float)rng.NextDouble(); _y[i] = (float)rng.NextDouble(); }
+        for (int i = 0; i < N; i++)
+        { _x[i] = (float)rng.NextDouble(); _y[i] = (float)rng.NextDouble(); }
     }
 
     [Benchmark(Baseline = true)]
     public void Scalar()
     {
-        for (int i = 0; i < N; i++) _y[i] = 2.5f * _x[i] + _y[i];
+        for (int i = 0; i < N; i++)
+            _y[i] = (2.5f * _x[i]) + _y[i];
     }
 
     [Benchmark]
@@ -1119,10 +1162,11 @@ public class IntMixBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _input = new int[N];
         _output = new int[N];
-        for (int i = 0; i < N; i++) _input[i] = rng.Next();
+        for (int i = 0; i < N; i++)
+            _input[i] = rng.Next();
     }
 
     [Benchmark(Baseline = true)]
@@ -1131,11 +1175,11 @@ public class IntMixBench
         for (int i = 0; i < N; i++)
         {
             int x = _input[i];
-            x = x ^ (x >> 16);
-            x = x * 0x45d9f3b;
-            x = x ^ (x >> 16);
-            x = x * 0x45d9f3b;
-            x = x ^ (x >> 16);
+            x ^= x >> 16;
+            x *= 0x45d9f3b;
+            x ^= x >> 16;
+            x *= 0x45d9f3b;
+            x ^= x >> 16;
             _output[i] = x;
         }
     }
@@ -1164,10 +1208,11 @@ public class LongHashBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _input = new long[N];
         _output = new long[N];
-        for (int i = 0; i < N; i++) _input[i] = rng.NextInt64();
+        for (int i = 0; i < N; i++)
+            _input[i] = rng.NextInt64();
     }
 
     [Benchmark(Baseline = true)]
@@ -1176,9 +1221,9 @@ public class LongHashBench
         for (int i = 0; i < N; i++)
         {
             long x = _input[i];
-            x = x ^ (x >> 33);
-            x = x * 0x5555555555555555L;
-            x = x ^ (x >> 29);
+            x ^= x >> 33;
+            x *= 0x5555555555555555L;
+            x ^= x >> 29;
             _output[i] = x;
         }
     }
@@ -1206,16 +1251,18 @@ public class DoubleTonemapBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _input = new double[N];
         _output = new double[N];
-        for (int i = 0; i < N; i++) _input[i] = rng.NextDouble() * 4.0;
+        for (int i = 0; i < N; i++)
+            _input[i] = rng.NextDouble() * 4.0;
     }
 
     [Benchmark(Baseline = true)]
     public void Scalar()
     {
-        for (int i = 0; i < N; i++) _output[i] = 1.0 - Math.Exp(-_input[i] * 1.5);
+        for (int i = 0; i < N; i++)
+            _output[i] = 1.0 - Math.Exp(-_input[i] * 1.5);
     }
 
     [Benchmark]
@@ -1241,16 +1288,18 @@ public class PreciseSumBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _input = new float[N];
-        for (int i = 0; i < N; i++) _input[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < N; i++)
+            _input[i] = (float)((rng.NextDouble() * 2) - 1);
     }
 
     [Benchmark(Baseline = true)]
     public double Scalar()
     {
         double sum = 0;
-        for (int i = 0; i < N; i++) sum += _input[i];
+        for (int i = 0; i < N; i++)
+            sum += _input[i];
         return sum;
     }
 
@@ -1276,16 +1325,18 @@ public class ArrayMaxBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _input = new float[N];
-        for (int i = 0; i < N; i++) _input[i] = (float)(rng.NextDouble() * 1000 - 500);
+        for (int i = 0; i < N; i++)
+            _input[i] = (float)((rng.NextDouble() * 1000) - 500);
     }
 
     [Benchmark(Baseline = true)]
     public float Scalar()
     {
         float mx = float.NegativeInfinity;
-        for (int i = 0; i < N; i++) mx = MathF.Max(mx, _input[i]);
+        for (int i = 0; i < N; i++)
+            mx = MathF.Max(mx, _input[i]);
         return mx;
     }
 
@@ -1314,17 +1365,19 @@ public class GatherReadBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _table = new float[N];
         _indices = new int[N];
         _output = new float[N];
-        for (int i = 0; i < N; i++) { _table[i] = (float)rng.NextDouble(); _indices[i] = rng.Next(0, N); }
+        for (int i = 0; i < N; i++)
+        { _table[i] = (float)rng.NextDouble(); _indices[i] = rng.Next(0, N); }
     }
 
     [Benchmark(Baseline = true)]
     public void Scalar()
     {
-        for (int i = 0; i < N; i++) _output[i] = _table[_indices[i]];
+        for (int i = 0; i < N; i++)
+            _output[i] = _table[_indices[i]];
     }
 
     [Benchmark]
@@ -1351,10 +1404,11 @@ public class SinCosBench
     [GlobalSetup]
     public void Setup()
     {
-        var rng = new Random(42);
+        Random rng = new Random(42);
         _input = new float[N];
         _output = new float[N];
-        for (int i = 0; i < N; i++) _input[i] = (float)(rng.NextDouble() * 20 - 10);
+        for (int i = 0; i < N; i++)
+            _input[i] = (float)((rng.NextDouble() * 20) - 10);
     }
 
     [Benchmark(Baseline = true)]

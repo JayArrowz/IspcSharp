@@ -1,10 +1,11 @@
 using System;
-using IspcSharp;
 using Xunit;
 
 namespace IspcSharp.Tests;
 
-/// <summary>Blittable [SpmdStruct] values and [SpmdFunction] helpers inside [Spmd] kernels.</summary>
+/// <summary>
+/// Blittable [SpmdStruct] values and [SpmdFunction] helpers inside [Spmd] kernels.
+/// </summary>
 [SpmdStruct]
 public struct Complex
 {
@@ -30,7 +31,9 @@ public struct Hit
     public int Id;
 }
 
-/// <summary>Struct built from reduction accumulators and returned from a kernel (ISPC export-style).</summary>
+/// <summary>
+/// Struct built from reduction accumulators and returned from a kernel (ISPC export-style).
+/// </summary>
 [SpmdStruct]
 public struct Stats
 {
@@ -39,7 +42,9 @@ public struct Stats
     public float Max;
 }
 
-/// <summary>ISPC-style fixed-size array members ([SpmdArray(N)]), including differently-typed arrays.</summary>
+/// <summary>
+/// ISPC-style fixed-size array members ([SpmdArray(N)]), including differently-typed arrays.
+/// </summary>
 [SpmdStruct]
 public struct Poly
 {
@@ -58,7 +63,7 @@ public static partial class StructKernels
     /// <param name="t"></param>
     /// <returns></returns>
     [SpmdFunction]
-    public static float Lerp(float a, float b, float t) => a + (b - a) * t;
+    public static float Lerp(float a, float b, float t) => a + ((b - a) * t);
 
     /// <summary>
     /// Helper that calls another helper (function composition).
@@ -66,7 +71,7 @@ public static partial class StructKernels
     /// <param name="d"></param>
     /// <returns></returns>
     [SpmdFunction]
-    public static float Attenuate(float d) => 1f / (1f + d * d);
+    public static float Attenuate(float d) => 1f / (1f + (d * d));
 
     [SpmdFunction]
     public static float Falloff(float d, float k) => Attenuate(d) * k;
@@ -74,7 +79,8 @@ public static partial class StructKernels
     // Helper taking and returning a struct.
     [SpmdFunction]
     public static Complex CMul(Complex a, Complex b)
-        => new Complex { Re = a.Re * b.Re - a.Im * b.Im, Im = a.Re * b.Im + a.Im * b.Re };
+        => new Complex
+        { Re = (a.Re * b.Re) - (a.Im * b.Im), Im = (a.Re * b.Im) + (a.Im * b.Re) };
 
     /// <summary>
     /// Helper composing another helper + a struct return.
@@ -84,7 +90,8 @@ public static partial class StructKernels
     /// <returns></returns>
     [SpmdFunction]
     public static Vec3 Scale(Vec3 v, float s)
-        => new Vec3 { X = v.X * s, Y = v.Y * s, Z = v.Z * s };
+        => new Vec3
+        { X = v.X * s, Y = v.Y * s, Z = v.Z * s };
 
     /// <summary>
     /// Kernel: primitive helper.
@@ -97,7 +104,7 @@ public static partial class StructKernels
     [Spmd]
     public static void LerpArrays(float[] a, float[] b, float[] o, float t, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             o[i] = Lerp(a[i], b[i], t);
         }
@@ -116,7 +123,7 @@ public static partial class StructKernels
     [Spmd]
     public static void ComplexMul(float[] ar, float[] ai, float[] br, float[] bi, float[] or, float[] oi, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             Complex a = new Complex { Re = ar[i], Im = ai[i] };
             Complex b = new Complex { Re = br[i], Im = bi[i] };
@@ -148,7 +155,7 @@ public static partial class StructKernels
     [Spmd]
     public static void NearestHit(float[] ta, int[] ida, float[] tb, int[] idb, float[] outT, int[] outId, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             Hit a = new Hit { T = ta[i], Id = ida[i] };
             Hit b = new Hit { T = tb[i], Id = idb[i] };
@@ -168,7 +175,7 @@ public static partial class StructKernels
     [Spmd]
     public static void FalloffArray(float[] d, float[] o, float k, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             o[i] = Falloff(d[i], k);
         }
@@ -182,10 +189,10 @@ public static partial class StructKernels
     [Spmd]
     public static void NormalizeBuffer(Vec3[] pts, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             Vec3 v = pts[i];
-            float len = MathF.Sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z);
+            float len = MathF.Sqrt((v.X * v.X) + (v.Y * v.Y) + (v.Z * v.Z));
             float inv = 1f / len;
             pts[i] = new Vec3 { X = v.X * inv, Y = v.Y * inv, Z = v.Z * inv };
         }
@@ -200,7 +207,7 @@ public static partial class StructKernels
     [Spmd]
     public static void TranslateX(Vec3[] pts, float dx, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             pts[i].X = pts[i].X + dx;
         }
@@ -217,7 +224,7 @@ public static partial class StructKernels
     [Spmd]
     public static void ScaleVectors(float[] x, float[] y, float[] z, float s, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             Vec3 v = new Vec3 { X = x[i], Y = y[i], Z = z[i] };
             v = Scale(v, s);
@@ -235,7 +242,7 @@ public static partial class StructKernels
     [Spmd]
     public static void BumpHits(Hit[] hits, float dt, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             Hit h = hits[i];            // whole-struct gather (float T + int Id)
             h.T = h.T + dt;             // float field arithmetic
@@ -250,7 +257,7 @@ public static partial class StructKernels
     [Spmd]
     public static void RetagHits(Hit[] hits, int delta, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             hits[i].Id = hits[i].Id + delta;    // int field gather + scatter
             hits[i].T = hits[i].T * 2f;         // float field gather + scatter
@@ -267,19 +274,22 @@ public static partial class StructKernels
         float sum = 0f;
         float mn = float.MaxValue;
         float mx = float.NegativeInfinity;
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             sum += a[i];
             mn = Math.Min(mn, a[i]);
             mx = Math.Max(mx, a[i]);
         }
+
         return new Stats { Sum = sum, Min = mn, Max = mx };
     }
 
-    /// <summary>Helper reading a struct's fixed-size array members by constant index.</summary>
+    /// <summary>
+    /// Helper reading a struct's fixed-size array members by constant index.
+    /// </summary>
     [SpmdFunction]
     public static float EvalPoly(Poly p, float x)
-        => p.Coef[0] + p.Coef[1] * x + p.Coef[2] * (x * x) + p.Bias;
+        => p.Coef[0] + (p.Coef[1] * x) + (p.Coef[2] * (x * x)) + p.Bias;
 
     /// <summary>
     /// Kernel: build a struct with array members (array + sized-empty initializers), pass it to a
@@ -288,7 +298,7 @@ public static partial class StructKernels
     [Spmd]
     public static void ApplyPoly(float[] c0, float[] c1, float[] c2, float[] bias, float[] x, float[] o, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             Poly p = new Poly { Coef = new float[] { c0[i], c1[i], c2[i] }, Tag = new int[2], Bias = bias[i] };
             o[i] = EvalPoly(p, x[i]);
@@ -301,7 +311,7 @@ public static partial class StructKernels
     [Spmd]
     public static void PolyTags(float[] x, float[] o, int[] tag, int count)
     {
-        foreach (var i in Spmd.Range(count))
+        foreach (int i in Spmd.Range(count))
         {
             Poly p = new Poly { Coef = new float[3], Tag = new int[2], Bias = 0f };
             p.Coef[0] = x[i];
@@ -318,32 +328,37 @@ public class StructAndFunctionTests
 {
     private static float[] Rand(int n, Random r)
     {
-        var a = new float[n];
-        for (int i = 0; i < n; i++) a[i] = (float)(r.NextDouble() * 2 - 1);
+        float[] a = new float[n];
+        for (int i = 0; i < n; i++)
+            a[i] = (float)((r.NextDouble() * 2) - 1);
         return a;
     }
 
-    private const int N = 8192 * 2 + 3;
+    private const int N = (8192 * 2) + 3;
 
     [Fact]
     public void LerpArrays_MatchesScalar()
     {
-        var r = new Random(1);
+        Random r = new Random(1);
         float[] a = Rand(N, r), b = Rand(N, r), o = new float[N];
         float t = 0.3f;
         StructKernels.LerpArrays_Simd(a, b, o, t, N);
         for (int i = 0; i < N; i++)
-            Assert.Equal(a[i] + (b[i] - a[i]) * t, o[i], 3);
+            Assert.Equal(a[i] + ((b[i] - a[i]) * t), o[i], 3);
     }
 
     [Fact]
     public void NearestHit_StructTernary_SelectsPerLane()
     {
-        var r = new Random(7);
+        Random r = new Random(7);
         float[] ta = Rand(N, r), tb = Rand(N, r);
-        var ida = new int[N]; var idb = new int[N];
-        for (int i = 0; i < N; i++) { ida[i] = i; idb[i] = i + 1_000_000; }
-        var outT = new float[N]; var outId = new int[N];
+        int[] ida = new int[N];
+        int[] idb = new int[N];
+        for (int i = 0; i < N; i++)
+        { ida[i] = i; idb[i] = i + 1_000_000; }
+
+        float[] outT = new float[N];
+        int[] outId = new int[N];
         StructKernels.NearestHit_Simd(ta, ida, tb, idb, outT, outId, N);
         for (int i = 0; i < N; i++)
         {
@@ -356,7 +371,7 @@ public class StructAndFunctionTests
     [Fact]
     public void FalloffArray_ComposesHelpers()
     {
-        var r = new Random(6);
+        Random r = new Random(6);
         float[] d = Rand(N, r), o = new float[N];
         float k = 4f;
         StructKernels.FalloffArray_Simd(d, o, k, N);
@@ -364,7 +379,7 @@ public class StructAndFunctionTests
         {
             // Relative tolerance, the generated kernel fuses '1 + d*d' into an FMA (single rounding),
             // so it differs from the naive scalar reference by ~1 ULP (decimal-place rounding is fragile).
-            float expected = 1f / (1f + d[i] * d[i]) * k;
+            float expected = 1f / (1f + (d[i] * d[i])) * k;
             Assert.True(MathF.Abs(o[i] - expected) <= 1e-4f * (1f + MathF.Abs(expected)),
                 $"i={i}: expected={expected}, actual={o[i]}");
         }
@@ -373,30 +388,32 @@ public class StructAndFunctionTests
     [Fact]
     public void ComplexMul_MatchesScalar()
     {
-        var r = new Random(2);
+        Random r = new Random(2);
         float[] ar = Rand(N, r), ai = Rand(N, r), br = Rand(N, r), bi = Rand(N, r);
         float[] or = new float[N], oi = new float[N];
         StructKernels.ComplexMul_Simd(ar, ai, br, bi, or, oi, N);
         for (int i = 0; i < N; i++)
         {
-            Assert.Equal(ar[i] * br[i] - ai[i] * bi[i], or[i], 3);
-            Assert.Equal(ar[i] * bi[i] + ai[i] * br[i], oi[i], 3);
+            Assert.Equal((ar[i] * br[i]) - (ai[i] * bi[i]), or[i], 3);
+            Assert.Equal((ar[i] * bi[i]) + (ai[i] * br[i]), oi[i], 3);
         }
     }
 
     [Fact]
     public void NormalizeBuffer_MatchesScalar()
     {
-        var r = new Random(4);
-        var pts = new Vec3[N];
-        for (int i = 0; i < N; i++) pts[i] = new Vec3 { X = (float)(r.NextDouble() + 0.1), Y = (float)(r.NextDouble() + 0.1), Z = (float)(r.NextDouble() + 0.1) };
-        var expected = new Vec3[N];
+        Random r = new Random(4);
+        Vec3[] pts = new Vec3[N];
+        for (int i = 0; i < N; i++)
+            pts[i] = new Vec3 { X = (float)(r.NextDouble() + 0.1), Y = (float)(r.NextDouble() + 0.1), Z = (float)(r.NextDouble() + 0.1) };
+        Vec3[] expected = new Vec3[N];
         for (int i = 0; i < N; i++)
         {
-            float len = MathF.Sqrt(pts[i].X * pts[i].X + pts[i].Y * pts[i].Y + pts[i].Z * pts[i].Z);
+            float len = MathF.Sqrt((pts[i].X * pts[i].X) + (pts[i].Y * pts[i].Y) + (pts[i].Z * pts[i].Z));
             float inv = 1f / len;
             expected[i] = new Vec3 { X = pts[i].X * inv, Y = pts[i].Y * inv, Z = pts[i].Z * inv };
         }
+
         StructKernels.NormalizeBuffer_Simd(pts, N);
         for (int i = 0; i < N; i++)
         {
@@ -409,24 +426,29 @@ public class StructAndFunctionTests
     [Fact]
     public void TranslateX_MatchesScalar()
     {
-        var r = new Random(5);
-        var pts = new Vec3[N];
-        for (int i = 0; i < N; i++) pts[i] = new Vec3 { X = (float)r.NextDouble(), Y = (float)r.NextDouble(), Z = (float)r.NextDouble() };
-        var expX = new float[N];
+        Random r = new Random(5);
+        Vec3[] pts = new Vec3[N];
+        for (int i = 0; i < N; i++)
+            pts[i] = new Vec3 { X = (float)r.NextDouble(), Y = (float)r.NextDouble(), Z = (float)r.NextDouble() };
+        float[] expX = new float[N];
         float dx = 3.5f;
-        for (int i = 0; i < N; i++) expX[i] = pts[i].X + dx;
+        for (int i = 0; i < N; i++)
+            expX[i] = pts[i].X + dx;
         StructKernels.TranslateX_Simd(pts, dx, N);
-        for (int i = 0; i < N; i++) Assert.Equal(expX[i], pts[i].X, 3);
+        for (int i = 0; i < N; i++)
+            Assert.Equal(expX[i], pts[i].X, 3);
     }
 
     [Fact]
     public void ScaleVectors_MatchesScalar()
     {
-        var r = new Random(3);
+        Random r = new Random(3);
         float[] x = Rand(N, r), y = Rand(N, r), z = Rand(N, r);
-        var (ex, ey, ez) = (new float[N], new float[N], new float[N]);
+        (float[]? ex, float[]? ey, float[]? ez) = (new float[N], new float[N], new float[N]);
         float s = 2.5f;
-        for (int i = 0; i < N; i++) { ex[i] = x[i] * s + 1f; ey[i] = y[i] * s; ez[i] = z[i] * s; }
+        for (int i = 0; i < N; i++)
+        { ex[i] = (x[i] * s) + 1f; ey[i] = y[i] * s; ez[i] = z[i] * s; }
+
         StructKernels.ScaleVectors_Simd(x, y, z, s, N);
         for (int i = 0; i < N; i++)
         {
@@ -439,12 +461,15 @@ public class StructAndFunctionTests
     [Fact]
     public void BumpHits_MixedFieldBuffer_MatchesScalar()
     {
-        var r = new Random(11);
-        var hits = new Hit[N];
-        for (int i = 0; i < N; i++) hits[i] = new Hit { T = (float)(r.NextDouble() * 10), Id = i };
-        var (expT, expId) = (new float[N], new int[N]);
+        Random r = new Random(11);
+        Hit[] hits = new Hit[N];
+        for (int i = 0; i < N; i++)
+            hits[i] = new Hit { T = (float)(r.NextDouble() * 10), Id = i };
+        (float[]? expT, int[]? expId) = (new float[N], new int[N]);
         float dt = 1.25f;
-        for (int i = 0; i < N; i++) { expT[i] = hits[i].T + dt; expId[i] = hits[i].Id + 1; }
+        for (int i = 0; i < N; i++)
+        { expT[i] = hits[i].T + dt; expId[i] = hits[i].Id + 1; }
+
         StructKernels.BumpHits_Simd(hits, dt, N);
         for (int i = 0; i < N; i++)
         {
@@ -456,12 +481,15 @@ public class StructAndFunctionTests
     [Fact]
     public void RetagHits_MixedFieldBuffer_SingleFieldAccess()
     {
-        var r = new Random(12);
-        var hits = new Hit[N];
-        for (int i = 0; i < N; i++) hits[i] = new Hit { T = (float)(r.NextDouble() * 4 - 2), Id = i * 3 };
-        var (expT, expId) = (new float[N], new int[N]);
+        Random r = new Random(12);
+        Hit[] hits = new Hit[N];
+        for (int i = 0; i < N; i++)
+            hits[i] = new Hit { T = (float)((r.NextDouble() * 4) - 2), Id = i * 3 };
+        (float[]? expT, int[]? expId) = (new float[N], new int[N]);
         int delta = 100;
-        for (int i = 0; i < N; i++) { expId[i] = hits[i].Id + delta; expT[i] = hits[i].T * 2f; }
+        for (int i = 0; i < N; i++)
+        { expId[i] = hits[i].Id + delta; expT[i] = hits[i].T * 2f; }
+
         StructKernels.RetagHits_Simd(hits, delta, N);
         for (int i = 0; i < N; i++)
         {
@@ -473,10 +501,11 @@ public class StructAndFunctionTests
     [Fact]
     public void Summarize_ReturnsStruct_MatchesScalar()
     {
-        var r = new Random(13);
+        Random r = new Random(13);
         float[] a = Rand(N, r);
         float sum = 0f, mn = float.MaxValue, mx = float.NegativeInfinity;
-        for (int i = 0; i < N; i++) { sum += a[i]; mn = MathF.Min(mn, a[i]); mx = MathF.Max(mx, a[i]); }
+        for (int i = 0; i < N; i++)
+        { sum += a[i]; mn = MathF.Min(mn, a[i]); mx = MathF.Max(mx, a[i]); }
 
         Stats s = StructKernels.Summarize_Simd(a, N);
         Assert.Equal(sum, s.Sum, 2);
@@ -494,13 +523,13 @@ public class StructAndFunctionTests
     [Fact]
     public void ApplyPoly_ArrayMembers_MatchesScalar()
     {
-        var r = new Random(21);
+        Random r = new Random(21);
         float[] c0 = Rand(N, r), c1 = Rand(N, r), c2 = Rand(N, r), bias = Rand(N, r), x = Rand(N, r), o = new float[N];
         StructKernels.ApplyPoly_Simd(c0, c1, c2, bias, x, o, N);
         for (int i = 0; i < N; i++)
         {
             // Helper fuses coef*x terms into FMAs (single rounding), so use a relative tolerance.
-            float e = c0[i] + c1[i] * x[i] + c2[i] * (x[i] * x[i]) + bias[i];
+            float e = c0[i] + (c1[i] * x[i]) + (c2[i] * (x[i] * x[i])) + bias[i];
             Assert.True(MathF.Abs(o[i] - e) <= 1e-4f * (1f + MathF.Abs(e)), $"i={i}: {o[i]} vs {e}");
         }
     }
@@ -508,14 +537,14 @@ public class StructAndFunctionTests
     [Fact]
     public void PolyTags_ArrayMemberWrites_MatchesScalar()
     {
-        var r = new Random(22);
+        Random r = new Random(22);
         float[] x = Rand(N, r), o = new float[N];
         int[] tag = new int[N];
         StructKernels.PolyTags_Simd(x, o, tag, N);
         for (int i = 0; i < N; i++)
         {
-            Assert.Equal(x[i] + x[i] * 2f, o[i], 3);
-            Assert.Equal(i + i * 2, tag[i]);
+            Assert.Equal(x[i] + (x[i] * 2f), o[i], 3);
+            Assert.Equal(i + (i * 2), tag[i]);
         }
     }
 }
