@@ -46,7 +46,7 @@ Install the Nuget Packages, IspcSharp & IspcSharp.Generators
 
 For the generator to work it must be like this:
 ```xml
-<PackageReference Include="IspcSharp.Generators" OutputItemType="Analyzer" ReferenceOutputAssembly="false" Version="x.x.x">
+<PackageReference Include="IspcSharp.Generators" OutputItemType="Analyzer" ReferenceOutputAssembly="false" Version="1.0.4">
 ```
 
 ## Usage
