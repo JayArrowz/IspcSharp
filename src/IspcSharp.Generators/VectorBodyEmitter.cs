@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using IspcSharp.Generators.Contexts;
+using IspcSharp.Generators.Exceptions;
+using IspcSharp.Generators.Models;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -24,10 +27,10 @@ namespace IspcSharp.Generators;
 internal sealed class VectorBodyEmitter
 {
     private readonly string _loopVar;
-    private readonly Dictionary<string, SpmdGenerator.ParamInfo> _params;
+    private readonly Dictionary<string, ParamInfo> _params;
     private readonly HashSet<string> _uniformPreLocals;
-    private readonly Dictionary<string, SpmdGenerator.Kind> _preLocalKinds;
-    private readonly Dictionary<string, SpmdGenerator.Kind> _locals = [];
+    private readonly Dictionary<string, Kind> _preLocalKinds;
+    private readonly Dictionary<string, Kind> _locals = [];
 
     /// <summary>
     /// Int lane locals that are affine functions of the loop variable with unit stride:
@@ -37,7 +40,7 @@ internal sealed class VectorBodyEmitter
     /// </summary>
     private readonly Dictionary<string, string> _affineOffset = [];
 
-    private readonly Dictionary<string, SpmdGenerator.ReductionInfo> _reductions;
+    private readonly Dictionary<string, ReductionInfo> _reductions;
     private readonly bool _d;                       // double-lane kernel (VDouble/VMaskD gangs)
     private readonly bool _l;                       // long-lane kernel (VLong/VMaskD gangs)
     private readonly bool _streaming;               // emit non-temporal stores ([Spmd(Streaming=true)])
@@ -50,7 +53,7 @@ internal sealed class VectorBodyEmitter
     private readonly IReadOnlyDictionary<string, StructInfo> _structs;
     private readonly IReadOnlyDictionary<string, FunctionInfo> _functions;
     private readonly Dictionary<string, string> _structLocals = [];
-    private SpmdGenerator.Kind _retKind;
+    private Kind _retKind;
     private string? _retStruct;
     private int _maskCounter;
     private readonly Stack<LoopContext> _loopStack = new();
@@ -71,17 +74,17 @@ internal sealed class VectorBodyEmitter
     private string MT => Wide ? "VMaskD" : "VMask";
     private string MTAll => Wide ? "VMaskD.All" : "VMask.All";
     private string MTNone => Wide ? "VMaskD.None" : "VMask.None";
-    private SpmdGenerator.Kind LaneFloatKind => _l ? SpmdGenerator.Kind.L : _d ? SpmdGenerator.Kind.D : SpmdGenerator.Kind.F;
+    private Kind LaneFloatKind => _l ? Kind.L : _d ? Kind.D : Kind.F;
     private string IntT => _l ? "VLong" : "VInt";
-    private string VType(SpmdGenerator.Kind k) => SpmdGenerator.VType(k, _d, _l);
-    private string SelectOf(SpmdGenerator.Kind k) => SpmdGenerator.VType(k, _d, _l) + ".Select";
+    private string VType(Kind k) => SpmdGenerator.VType(k, _d, _l);
+    private string SelectOf(Kind k) => SpmdGenerator.VType(k, _d, _l) + ".Select";
 
     public VectorBodyEmitter(
         string loopVar,
-        List<SpmdGenerator.ParamInfo> parameters,
+        List<ParamInfo> parameters,
         HashSet<string> uniformPreLocals,
-        Dictionary<string, SpmdGenerator.Kind> preLocalKinds,
-        List<SpmdGenerator.ReductionInfo> reductions,
+        Dictionary<string, Kind> preLocalKinds,
+        List<ReductionInfo> reductions,
         bool doubleMode,
         bool longMode,
         IReadOnlyDictionary<string, StructInfo> structs,
@@ -111,7 +114,7 @@ internal sealed class VectorBodyEmitter
     public VectorBodyEmitter(
         IReadOnlyDictionary<string, StructInfo> structs,
         IReadOnlyDictionary<string, FunctionInfo> functions,
-        Dictionary<string, SpmdGenerator.Kind> paramLocals,
+        Dictionary<string, Kind> paramLocals,
         Dictionary<string, string> paramStructs)
     {
         _loopVar = "";
@@ -168,7 +171,7 @@ internal sealed class VectorBodyEmitter
                     EmitFunctionStatement(inner, indent, sb);
                 return;
             default:
-                throw new SpmdGenerator.UnsupportedConstructException(
+                throw new UnsupportedConstructException(
                     $"statement '{Trunc(st)}' in a [SpmdFunction] (use locals, assignments, and a final 'return expr')", st.GetLocation());
         }
     }
@@ -309,7 +312,7 @@ internal sealed class VectorBodyEmitter
                 break;
 
             default:
-                throw new SpmdGenerator.UnsupportedConstructException(
+                throw new UnsupportedConstructException(
                     $"statement '{Trunc(st)}' ({st.Kind()})", st.GetLocation());
         }
     }
@@ -363,25 +366,25 @@ internal sealed class VectorBodyEmitter
 
         var kind = t switch
         {
-            "float" => SpmdGenerator.Kind.F,
-            "int" => SpmdGenerator.Kind.I,
-            "double" => SpmdGenerator.Kind.D,
-            "long" => SpmdGenerator.Kind.L,
-            "var" => throw new SpmdGenerator.UnsupportedConstructException(
+            "float" => Kind.F,
+            "int" => Kind.I,
+            "double" => Kind.D,
+            "long" => Kind.L,
+            "var" => throw new UnsupportedConstructException(
                 "'var' local (declare as float, int, double, long, or a [SpmdStruct] type)", decl.GetLocation()),
-            _ => throw new SpmdGenerator.UnsupportedConstructException(
+            _ => throw new UnsupportedConstructException(
                 $"local of type '{t}' (only float/int/double/long and [SpmdStruct] locals)", decl.GetLocation()),
         };
-        if (_l && kind != SpmdGenerator.Kind.L)
+        if (_l && kind != Kind.L)
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"'{t}' lane local in a long kernel (64-bit integer gang; declare it as long)",
                 decl.GetLocation());
         }
 
-        if (_d && kind != SpmdGenerator.Kind.D)
+        if (_d && kind != Kind.D)
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"'{t}' lane local in a double kernel (double gangs have a different lane count; declare it as double)",
                 decl.GetLocation());
         }
@@ -400,7 +403,7 @@ internal sealed class VectorBodyEmitter
             // Record affine-in-lane int locals declared unmasked, so uses as array indices
             // become contiguous loads/stores. (In a masked branch the initializer is blended
             // with 0 for inactive lanes, which breaks the affine property, so skip those.)
-            if (kind is SpmdGenerator.Kind.I or SpmdGenerator.Kind.L && mask == null &&
+            if (kind is Kind.I or Kind.L && mask == null &&
                 v.Initializer != null && TryClassifyAffine(v.Initializer.Value, out string? aoff))
             {
                 _affineOffset[v.Identifier.Text] = aoff;
@@ -477,7 +480,7 @@ internal sealed class VectorBodyEmitter
         if (asg.Left is IdentifierNameSyntax sid && _structLocals.TryGetValue(sid.Identifier.Text, out string? sst))
         {
             if (op != "=")
-                throw new SpmdGenerator.UnsupportedConstructException($"compound '{op}' on struct '{sid.Identifier.Text}'", asg.GetLocation());
+                throw new UnsupportedConstructException($"compound '{op}' on struct '{sid.Identifier.Text}'", asg.GetLocation());
             string rhs = VecStruct(asg.Right).Code;
             _ = sb.AppendLine(mask == null
                 ? $"{indent}{sid.Identifier.Text} = {rhs};"
@@ -520,9 +523,9 @@ internal sealed class VectorBodyEmitter
         if (asg.Left is ElementAccessExpressionSyntax sea && TryStructBufferField(sea, out string? sbuf, out string? sbs, out string? sbidx))
         {
             if (op != "=")
-                throw new SpmdGenerator.UnsupportedConstructException($"compound '{op}' on struct-buffer element '{sbuf}[...]'", asg.GetLocation());
+                throw new UnsupportedConstructException($"compound '{op}' on struct-buffer element '{sbuf}[...]'", asg.GetLocation());
             if (_structs[sbs].Fields.Count > 1)
-                Warn(SpmdGenerator.ScatterPerf, sea, sea.ToString());
+                Warn(Descriptors.ScatterPerf, sea, sea.ToString());
             string tmp = $"__sv{_maskCounter++}";
             _ = sb.AppendLine($"{indent}var {tmp} = {VecStruct(asg.Right).Code};");
             foreach (var f in _structs[sbs].Fields)
@@ -536,11 +539,11 @@ internal sealed class VectorBodyEmitter
             var rkind = rinfo.LaneKind;
             string sel = SelectOf(rkind);
 
-            if (rinfo.Op == SpmdGenerator.ReduceOp.Add)
+            if (rinfo.Op == ReduceOp.Add)
             {
                 if (op != "+=")
                 {
-                    throw new SpmdGenerator.UnsupportedConstructException(
+                    throw new UnsupportedConstructException(
                         $"reduction '{rname}' with operator '{op}' (this accumulator uses '+=')", asg.GetLocation());
                 }
                 // 'acc += x * y' on float/double lanes fuses into one FMA (matmul / dot product /
@@ -567,7 +570,7 @@ internal sealed class VectorBodyEmitter
                 !SpmdGenerator.IsMinMaxSelfCall(minMaxCall, rname, out var callOp) ||
                 callOp != rinfo.Op)
             {
-                throw new SpmdGenerator.UnsupportedConstructException(
+                throw new UnsupportedConstructException(
                     $"reduction '{rname}' accumulation (this accumulator uses '{rname} = Math.{rinfo.Op}({rname}, ...)')", asg.GetLocation());
             }
 
@@ -575,7 +578,7 @@ internal sealed class VectorBodyEmitter
                 .First(a => a.Expression is not IdentifierNameSyntax id || id.Identifier.Text != rname)
                 .Expression;
             string val = Coerce(Vec(otherArg), rkind, otherArg);
-            string fn = rinfo.Op == SpmdGenerator.ReduceOp.Min ? "Min" : "Max";
+            string fn = rinfo.Op == ReduceOp.Min ? "Min" : "Max";
             string identity = SpmdGenerator.VectorIdentity(rinfo, _d, _l);
             _ = sb.AppendLine(mask == null
                 ? $"{indent}__red_{rname} = VectorMath.{fn}(__red_{rname}, {val});"
@@ -588,7 +591,7 @@ internal sealed class VectorBodyEmitter
         {
             string name = id.Identifier.Text;
             // Reassignment can change (or destroy) the affine-in-lane property.
-            if (lkind == SpmdGenerator.Kind.I && op == "=" && mask == null &&
+            if (lkind == Kind.I && op == "=" && mask == null &&
                 TryClassifyAffine(asg.Right, out string? aoff))
             {
                 _affineOffset[name] = aoff;
@@ -618,9 +621,9 @@ internal sealed class VectorBodyEmitter
         if (asg.Left is ElementAccessExpressionSyntax ea && TryGetContiguousIndex(ea, out string? bufName, out string? storeIdx))
         {
             if (!_params.TryGetValue(bufName, out var p) || !p.IsBuffer)
-                throw new SpmdGenerator.UnsupportedConstructException($"store to unknown buffer '{bufName}'", asg.GetLocation());
+                throw new UnsupportedConstructException($"store to unknown buffer '{bufName}'", asg.GetLocation());
             if (p.IsReadOnly)
-                throw new SpmdGenerator.UnsupportedConstructException($"store to ReadOnlySpan '{bufName}'", asg.GetLocation());
+                throw new UnsupportedConstructException($"store to ReadOnlySpan '{bufName}'", asg.GetLocation());
 
             var ek = p.ElemKind;
             string vtype = VType(ek);
@@ -628,7 +631,7 @@ internal sealed class VectorBodyEmitter
             string rhs = CombineCompoundOnExpr(op, load, asg, ek);
             // Streaming: a full-gang, non-compound contiguous write to a float/double buffer can use a
             // non-temporal store (cache-bypassing). Masked/compound/other paths keep the ordinary store.
-            string store = _streaming && op == "=" && ek is SpmdGenerator.Kind.F or SpmdGenerator.Kind.D
+            string store = _streaming && op == "=" && ek is Kind.F or Kind.D
                 ? "StoreNonTemporal" : "Store";
             _ = mask == null
                 ? sb.AppendLine($"{indent}({rhs}).{store}({bufName}, {storeIdx});")
@@ -643,33 +646,33 @@ internal sealed class VectorBodyEmitter
         {
             if (scatterParam.IsReadOnly)
             {
-                throw new SpmdGenerator.UnsupportedConstructException(
+                throw new UnsupportedConstructException(
                     $"scatter to ReadOnlySpan '{scatterId.Identifier.Text}'", asg.GetLocation());
             }
 
             if (op != "=")
             {
-                throw new SpmdGenerator.UnsupportedConstructException(
+                throw new UnsupportedConstructException(
                     $"compound scatter '{op}' on '{scatterId.Identifier.Text}' (only '=' supported for indexed stores)", asg.GetLocation());
             }
 
-            Warn(SpmdGenerator.ScatterPerf, eaScatter, eaScatter.ToString());
+            Warn(Descriptors.ScatterPerf, eaScatter, eaScatter.ToString());
             // Lower: Memory.Scatter(buf, indices, values, mask).
             // Long kernels index with VLong directly; double kernels truncate to VLong.
             var ek = scatterParam.ElemKind;
             var idxExpr = eaScatter.ArgumentList.Arguments[0].Expression;
             string val = Coerce(Vec(asg.Right), ek, asg.Right);
             string idx = _l
-                ? Coerce(Vec(idxExpr), SpmdGenerator.Kind.L, idxExpr)
+                ? Coerce(Vec(idxExpr), Kind.L, idxExpr)
                 : _d
-                ? $"VLong.FromDoubleTruncate({Coerce(Vec(idxExpr), SpmdGenerator.Kind.D, idxExpr)})"
-                : Coerce(Vec(idxExpr), SpmdGenerator.Kind.I, idxExpr);
+                ? $"VLong.FromDoubleTruncate({Coerce(Vec(idxExpr), Kind.D, idxExpr)})"
+                : Coerce(Vec(idxExpr), Kind.I, idxExpr);
             string maskArg = mask ?? MTAll;
             _ = sb.AppendLine($"{indent}Memory.Scatter({scatterId.Identifier.Text}, {idx}, {val}, {maskArg});");
             return;
         }
 
-        throw new SpmdGenerator.UnsupportedConstructException($"assignment target '{Trunc(asg.Left)}'", asg.GetLocation());
+        throw new UnsupportedConstructException($"assignment target '{Trunc(asg.Left)}'", asg.GetLocation());
     }
 
     /// <summary>
@@ -685,14 +688,14 @@ internal sealed class VectorBodyEmitter
     {
         if (rs.Expression != null)
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 "'return <value>' inside the loop (value returns belong after the loop; use a bare 'return;' to retire the lane)",
                 rs.GetLocation());
         }
 
         if (_loopStack.Any(ctx => ctx.IsUniform))
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 "'return' inside a uniform for loop (per-lane returns can't exit a shared scalar loop; use a varying loop or restructure)",
                 rs.GetLocation());
         }
@@ -709,7 +712,7 @@ internal sealed class VectorBodyEmitter
     {
         if (operand is not IdentifierNameSyntax id || !_locals.TryGetValue(id.Identifier.Text, out var kind))
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"'{op}' on '{Trunc(operand)}' (only lane locals support ++/-- inside the loop body)", loc);
         }
 
@@ -717,9 +720,9 @@ internal sealed class VectorBodyEmitter
         _ = _affineOffset.Remove(name);   // ++/-- keeps affine-ness but conservatively drop it
         string one = kind switch
         {
-            SpmdGenerator.Kind.F => "new VFloat(1f)",
-            SpmdGenerator.Kind.D => $"new {VType(SpmdGenerator.Kind.D)}(1d)",
-            SpmdGenerator.Kind.L => $"new {VType(SpmdGenerator.Kind.L)}(1)",
+            Kind.F => "new VFloat(1f)",
+            Kind.D => $"new {VType(Kind.D)}(1d)",
+            Kind.L => $"new {VType(Kind.L)}(1)",
             _ => "new VInt(1)",
         };
         string rhs = $"({name} {(op == "++" ? "+" : "-")} {one})";
@@ -728,13 +731,13 @@ internal sealed class VectorBodyEmitter
             : $"{indent}{name} = {SelectOf(kind)}({mask}, {rhs}, {name});");
     }
 
-    private string CombineCompound(string op, string currentName, AssignmentExpressionSyntax asg, SpmdGenerator.Kind kind)
+    private string CombineCompound(string op, string currentName, AssignmentExpressionSyntax asg, Kind kind)
         => CombineCompoundOnExpr(op, currentName, asg, kind);
 
-    private string CombineCompoundOnExpr(string op, string current, AssignmentExpressionSyntax asg, SpmdGenerator.Kind kind)
+    private string CombineCompoundOnExpr(string op, string current, AssignmentExpressionSyntax asg, Kind kind)
     {
         string rhs = Coerce(Vec(asg.Right), kind, asg.Right);
-        bool isInt = kind is SpmdGenerator.Kind.I or SpmdGenerator.Kind.L;
+        bool isInt = kind is Kind.I or Kind.L;
         return op switch
         {
             "=" => rhs,
@@ -746,7 +749,7 @@ internal sealed class VectorBodyEmitter
             "&=" when isInt => $"({current} & {rhs})",
             "|=" when isInt => $"({current} | {rhs})",
             "^=" when isInt => $"({current} ^ {rhs})",
-            _ => throw new SpmdGenerator.UnsupportedConstructException(
+            _ => throw new UnsupportedConstructException(
                 $"assignment operator '{op}' on {kind} lanes", asg.GetLocation()),
         };
     }
@@ -889,7 +892,7 @@ internal sealed class VectorBodyEmitter
             string varType = fors.Declaration.Type.ToString();
             if (varType != "int")
             {
-                throw new SpmdGenerator.UnsupportedConstructException(
+                throw new UnsupportedConstructException(
                     $"for-loop variable of type '{varType}' (only 'int' uniform loop variables supported)",
                     fors.Declaration.GetLocation());
             }
@@ -898,7 +901,7 @@ internal sealed class VectorBodyEmitter
             {
                 _ = _uniformPreLocals.Add(v.Identifier.Text);
                 if (!_preLocalKinds.ContainsKey(v.Identifier.Text))
-                    _preLocalKinds[v.Identifier.Text] = SpmdGenerator.Kind.I;
+                    _preLocalKinds[v.Identifier.Text] = Kind.I;
             }
         }
 
@@ -1013,7 +1016,7 @@ internal sealed class VectorBodyEmitter
     {
         if (_loopStack.Count == 0)
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 "'break' outside of a loop", loc);
         }
 
@@ -1034,7 +1037,7 @@ internal sealed class VectorBodyEmitter
     {
         if (_loopStack.Count == 0)
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 "'continue' outside of a loop", loc);
         }
 
@@ -1121,7 +1124,7 @@ internal sealed class VectorBodyEmitter
         return false;
     }
 
-    private (string Code, SpmdGenerator.Kind Kind) Vec(ExpressionSyntax e) => e switch
+    private (string Code, Kind Kind) Vec(ExpressionSyntax e) => e switch
     {
         ParenthesizedExpressionSyntax p => WrapParen(Vec(p.Expression)),
 
@@ -1139,31 +1142,31 @@ internal sealed class VectorBodyEmitter
             => (id.Identifier.Text, k),
 
         IdentifierNameSyntax id when _uniformPreLocals.Contains(id.Identifier.Text)
-            => Broadcast(id.Identifier.Text, _l ? SpmdGenerator.Kind.L : _d ? SpmdGenerator.Kind.D : _preLocalKinds[id.Identifier.Text]),
+            => Broadcast(id.Identifier.Text, _l ? Kind.L : _d ? Kind.D : _preLocalKinds[id.Identifier.Text]),
 
         IdentifierNameSyntax id when _params.TryGetValue(id.Identifier.Text, out var p) &&
-                                     p.PKind is SpmdGenerator.ParamKind.UniformFloat
-                                             or SpmdGenerator.ParamKind.UniformInt
-                                             or SpmdGenerator.ParamKind.UniformDouble
-                                             or SpmdGenerator.ParamKind.UniformLong
+                                     p.PKind is ParamKind.UniformFloat
+                                             or ParamKind.UniformInt
+                                             or ParamKind.UniformDouble
+                                             or ParamKind.UniformLong
             => Broadcast(id.Identifier.Text, _l
-                    ? SpmdGenerator.Kind.L
+                    ? Kind.L
                     : _d
-                    ? SpmdGenerator.Kind.D
+                    ? Kind.D
                     : p.PKind switch
                     {
-                        SpmdGenerator.ParamKind.UniformInt => SpmdGenerator.Kind.I,
-                        SpmdGenerator.ParamKind.UniformDouble => SpmdGenerator.Kind.D,
-                        SpmdGenerator.ParamKind.UniformLong => SpmdGenerator.Kind.L,
-                        _ => SpmdGenerator.Kind.F,
+                        ParamKind.UniformInt => Kind.I,
+                        ParamKind.UniformDouble => Kind.D,
+                        ParamKind.UniformLong => Kind.L,
+                        _ => Kind.F,
                     }),
 
         IdentifierNameSyntax id when id.Identifier.Text == _loopVar
             => _l
-                ? ("(VLong.ProgramIndex + __i)", SpmdGenerator.Kind.L)
+                ? ("(VLong.ProgramIndex + __i)", Kind.L)
                 : _d
-                ? ("(VDouble.ProgramIndex + (double)__i)", SpmdGenerator.Kind.D)
-                : ("(VInt.ProgramIndex + __i)", SpmdGenerator.Kind.I),
+                ? ("(VDouble.ProgramIndex + (double)__i)", Kind.D)
+                : ("(VInt.ProgramIndex + __i)", Kind.I),
 
         // Struct array-member element: 's.field[k]' (constant k) → the backing gang 's.field_k'.
         ElementAccessExpressionSyntax sae when TryStructArrayElement(sae, out string? sag, out var sak) => (sag, sak),
@@ -1176,7 +1179,7 @@ internal sealed class VectorBodyEmitter
 
         // Uniform '.Length' on a buffer/array param → broadcast int.
         MemberAccessExpressionSyntax lma when lma.Name.Identifier.Text == "Length" && IsUniformExpression(lma)
-            => _d ? ($"new VDouble({lma})", SpmdGenerator.Kind.D) : ($"new VInt({lma})", SpmdGenerator.Kind.I),
+            => _d ? ($"new VDouble({lma})", Kind.D) : ($"new VInt({lma})", Kind.I),
 
         // 2-D array access a[i, j] on a float[,]/int[,]/double[,] param.
         ElementAccessExpressionSyntax ea2 when ea2.ArgumentList.Arguments.Count == 2 &&
@@ -1200,24 +1203,24 @@ internal sealed class VectorBodyEmitter
 
         InvocationExpressionSyntax call => VecCall(call),
 
-        _ => throw new SpmdGenerator.UnsupportedConstructException($"expression '{Trunc(e)}' ({e.Kind()})", e.GetLocation()),
+        _ => throw new UnsupportedConstructException($"expression '{Trunc(e)}' ({e.Kind()})", e.GetLocation()),
     };
 
-    private static (string, SpmdGenerator.Kind) WrapParen((string Code, SpmdGenerator.Kind Kind) inner)
+    private static (string, Kind) WrapParen((string Code, Kind Kind) inner)
         => ($"({inner.Code})", inner.Kind);
 
-    private static (string, SpmdGenerator.Kind) Neg((string Code, SpmdGenerator.Kind Kind) inner)
+    private static (string, Kind) Neg((string Code, Kind Kind) inner)
         => ($"(-{inner.Code})", inner.Kind);
 
-    private static (string, SpmdGenerator.Kind) BitNot((string Code, SpmdGenerator.Kind Kind) inner, SyntaxNode at)
-        => inner.Kind == SpmdGenerator.Kind.I
-            ? ($"(~{inner.Code})", SpmdGenerator.Kind.I)
-            : throw new SpmdGenerator.UnsupportedConstructException("'~' on non-int lanes", at.GetLocation());
+    private static (string, Kind) BitNot((string Code, Kind Kind) inner, SyntaxNode at)
+        => inner.Kind == Kind.I
+            ? ($"(~{inner.Code})", Kind.I)
+            : throw new UnsupportedConstructException("'~' on non-int lanes", at.GetLocation());
 
-    private (string, SpmdGenerator.Kind) Broadcast(string name, SpmdGenerator.Kind k)
+    private (string, Kind) Broadcast(string name, Kind k)
         => ($"new {VType(k)}({name})", k);
 
-    private (string, SpmdGenerator.Kind) LitExpr(LiteralExpressionSyntax lit)
+    private (string, Kind) LitExpr(LiteralExpressionSyntax lit)
     {
         string text = lit.Token.Text;
 
@@ -1226,11 +1229,11 @@ internal sealed class VectorBodyEmitter
         {
             if (text.EndsWith("f") || text.EndsWith("F") || text.EndsWith("d") || text.EndsWith("D") || text.Contains('.'))
             {
-                throw new SpmdGenerator.UnsupportedConstructException(
+                throw new UnsupportedConstructException(
                     $"floating literal '{text}' in a long kernel", lit.GetLocation());
             }
 
-            return ($"new VLong({text.TrimEnd('L', 'l', 'u', 'U')})", SpmdGenerator.Kind.L);
+            return ($"new VLong({text.TrimEnd('L', 'l', 'u', 'U')})", Kind.L);
         }
 
         // Hex/binary literals are always int lanes ("0xFF" ends in 'F' but is not a float).
@@ -1239,25 +1242,25 @@ internal sealed class VectorBodyEmitter
         if (isHexOrBinary)
         {
             return _d
-                ? ($"new VDouble({text})", SpmdGenerator.Kind.D)
-                : ($"new VInt({text})", SpmdGenerator.Kind.I);
+                ? ($"new VDouble({text})", Kind.D)
+                : ($"new VInt({text})", Kind.I);
         }
 
         if (_d)
-            return ($"new VDouble({text.TrimEnd('f', 'F', 'd', 'D')})", SpmdGenerator.Kind.D);
+            return ($"new VDouble({text.TrimEnd('f', 'F', 'd', 'D')})", Kind.D);
         // A 'd'-suffixed literal in a float/int kernel opts that expression into
         // double precision (VDouble2 pairs at full gang width).
         if (text.EndsWith("d") || text.EndsWith("D"))
-            return ($"new VDouble2({text.TrimEnd('d', 'D')})", SpmdGenerator.Kind.D);
+            return ($"new VDouble2({text.TrimEnd('d', 'D')})", Kind.D);
         // An 'L'-suffixed literal opts into 64-bit integers (VLong2 pairs at full gang width).
         if (text.EndsWith("L") || text.EndsWith("l"))
-            return ($"new VLong2({text.TrimEnd('u', 'U')})", SpmdGenerator.Kind.L);
+            return ($"new VLong2({text.TrimEnd('u', 'U')})", Kind.L);
         if (text.EndsWith("f") || text.EndsWith("F") || text.Contains('.'))
-            return ($"new VFloat({text.TrimEnd('f', 'F')}f)", SpmdGenerator.Kind.F);
-        return ($"new VInt({text})", SpmdGenerator.Kind.I);
+            return ($"new VFloat({text.TrimEnd('f', 'F')}f)", Kind.F);
+        return ($"new VInt({text})", Kind.I);
     }
 
-    private (string, SpmdGenerator.Kind) CastExpr(CastExpressionSyntax cast)
+    private (string, Kind) CastExpr(CastExpressionSyntax cast)
     {
         var inner = Vec(cast.Expression);
         string t = cast.Type.ToString();
@@ -1265,8 +1268,8 @@ internal sealed class VectorBodyEmitter
         {
             // Long kernel: (long)/(int) are identity on the 64-bit integer lane; no floats.
             if (t is "long" or "int")
-                return (inner.Code, SpmdGenerator.Kind.L);
-            throw new SpmdGenerator.UnsupportedConstructException(
+                return (inner.Code, Kind.L);
+            throw new UnsupportedConstructException(
                 $"cast to '{t}' in a long kernel (only (long)/(int) casts supported)", cast.GetLocation());
         }
 
@@ -1276,53 +1279,53 @@ internal sealed class VectorBodyEmitter
             // and (int)/(long) truncate toward zero, the double stays the carrier type
             // (used mostly as gather/scatter indices, where VLong truncation reapplies).
             if (t == "double")
-                return (inner.Code, SpmdGenerator.Kind.D);
+                return (inner.Code, Kind.D);
             if (t is "int" or "long")
             {
-                Warn(SpmdGenerator.DoubleConvertPerf, cast, cast.ToString());
-                return ($"VectorMath.Truncate({inner.Code})", SpmdGenerator.Kind.D);
+                Warn(Descriptors.DoubleConvertPerf, cast, cast.ToString());
+                return ($"VectorMath.Truncate({inner.Code})", Kind.D);
             }
 
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"cast to '{t}' in a double kernel (only (double)/(int)/(long) casts supported)", cast.GetLocation());
         }
         // Float/int kernels: cross-gang-width double conversions via VDouble2.
-        if (inner.Kind == SpmdGenerator.Kind.D)
+        if (inner.Kind == Kind.D)
         {
             if (t is "int" or "long")
-                Warn(SpmdGenerator.DoubleConvertPerf, cast, cast.ToString());
+                Warn(Descriptors.DoubleConvertPerf, cast, cast.ToString());
             return t switch
             {
-                "float" => ($"({inner.Code}).ToFloat()", SpmdGenerator.Kind.F),
-                "int" => ($"({inner.Code}).ToIntTruncate()", SpmdGenerator.Kind.I),
-                "double" => (inner.Code, SpmdGenerator.Kind.D),
-                _ => throw new SpmdGenerator.UnsupportedConstructException($"cast to '{t}'", cast.GetLocation()),
+                "float" => ($"({inner.Code}).ToFloat()", Kind.F),
+                "int" => ($"({inner.Code}).ToIntTruncate()", Kind.I),
+                "double" => (inner.Code, Kind.D),
+                _ => throw new UnsupportedConstructException($"cast to '{t}'", cast.GetLocation()),
             };
         }
         // ...and cross-gang-width long conversions via VLong2.
-        if (inner.Kind == SpmdGenerator.Kind.L)
+        if (inner.Kind == Kind.L)
         {
             return t switch
             {
-                "long" => (inner.Code, SpmdGenerator.Kind.L),
-                "int" => ($"({inner.Code}).ToInt()", SpmdGenerator.Kind.I),
-                "float" => ($"({inner.Code}).ToFloat()", SpmdGenerator.Kind.F),
-                "double" => ($"({inner.Code}).ToDouble2()", SpmdGenerator.Kind.D),
-                _ => throw new SpmdGenerator.UnsupportedConstructException($"cast to '{t}'", cast.GetLocation()),
+                "long" => (inner.Code, Kind.L),
+                "int" => ($"({inner.Code}).ToInt()", Kind.I),
+                "float" => ($"({inner.Code}).ToFloat()", Kind.F),
+                "double" => ($"({inner.Code}).ToDouble2()", Kind.D),
+                _ => throw new UnsupportedConstructException($"cast to '{t}'", cast.GetLocation()),
             };
         }
 
         return t switch
         {
-            "float" => (Coerce(inner, SpmdGenerator.Kind.F, cast), SpmdGenerator.Kind.F),
-            "int" => (Coerce(inner, SpmdGenerator.Kind.I, cast), SpmdGenerator.Kind.I),
-            "long" => (Coerce(inner, SpmdGenerator.Kind.L, cast), SpmdGenerator.Kind.L),
-            "double" => (Coerce(inner, SpmdGenerator.Kind.D, cast), SpmdGenerator.Kind.D),
-            _ => throw new SpmdGenerator.UnsupportedConstructException($"cast to '{t}'", cast.GetLocation()),
+            "float" => (Coerce(inner, Kind.F, cast), Kind.F),
+            "int" => (Coerce(inner, Kind.I, cast), Kind.I),
+            "long" => (Coerce(inner, Kind.L, cast), Kind.L),
+            "double" => (Coerce(inner, Kind.D, cast), Kind.D),
+            _ => throw new UnsupportedConstructException($"cast to '{t}'", cast.GetLocation()),
         };
     }
 
-    private (string, SpmdGenerator.Kind) BinExpr(BinaryExpressionSyntax bin)
+    private (string, Kind) BinExpr(BinaryExpressionSyntax bin)
     {
         string op = bin.OperatorToken.Text;
 
@@ -1332,9 +1335,9 @@ internal sealed class VectorBodyEmitter
         if (op is "<<" or ">>" or ">>>")
         {
             var (code, knd) = Vec(bin.Left);
-            if (knd is not (SpmdGenerator.Kind.I or SpmdGenerator.Kind.L))
+            if (knd is not (Kind.I or Kind.L))
             {
-                throw new SpmdGenerator.UnsupportedConstructException(
+                throw new UnsupportedConstructException(
                     $"shift '{op}' on non-integer lanes", bin.GetLocation());
             }
 
@@ -1350,18 +1353,18 @@ internal sealed class VectorBodyEmitter
                 };
             }
 
-            if (shKind == SpmdGenerator.Kind.L)
+            if (shKind == Kind.L)
             {
-                throw new SpmdGenerator.UnsupportedConstructException(
+                throw new UnsupportedConstructException(
                     "varying (per-lane) shift count on long lanes (only uniform shift counts on long)", bin.GetLocation());
             }
 
-            string counts = Coerce(Vec(bin.Right), SpmdGenerator.Kind.I, bin.Right);
+            string counts = Coerce(Vec(bin.Right), Kind.I, bin.Right);
             return op switch
             {
-                "<<" => ($"VInt.ShiftLeftVariable({code}, {counts})", SpmdGenerator.Kind.I),
-                ">>" => ($"VInt.ShiftRightArithmeticVariable({code}, {counts})", SpmdGenerator.Kind.I),
-                _ => ($"VInt.ShiftRightLogicalVariable({code}, {counts})", SpmdGenerator.Kind.I),
+                "<<" => ($"VInt.ShiftLeftVariable({code}, {counts})", Kind.I),
+                ">>" => ($"VInt.ShiftRightArithmeticVariable({code}, {counts})", Kind.I),
+                _ => ($"VInt.ShiftRightLogicalVariable({code}, {counts})", Kind.I),
             };
         }
 
@@ -1372,12 +1375,12 @@ internal sealed class VectorBodyEmitter
         var kind = Promote(l.Kind, r.Kind);
         string lc = CoerceCode(l, kind, bin.Left);
         string rc = CoerceCode(r, kind, bin.Right);
-        bool isInt = kind is SpmdGenerator.Kind.I or SpmdGenerator.Kind.L;
+        bool isInt = kind is Kind.I or Kind.L;
 
         // Integer / and % have no SIMD instruction, a per-lane scalar loop. Flag it unless the
         // divisor is a compile-time constant (the JIT can then strength-reduce; still note it).
         if (isInt && op is "/" or "%")
-            Warn(SpmdGenerator.IntDividePerf, bin, bin.ToString());
+            Warn(Descriptors.IntDividePerf, bin, bin.ToString());
 
         // 'a * b + c' on float/double lanes fuses into one FMA (higher throughput, single rounding).
         if (op == "+")
@@ -1396,10 +1399,10 @@ internal sealed class VectorBodyEmitter
             // inactive lanes so masked-off lanes can't raise DivideByZeroException.
             "/" => ($"{VType(kind)}.Divide({lc}, {GuardedDivisor(rc, kind)})", kind),
             "%" when isInt => ($"{VType(kind)}.Remainder({lc}, {GuardedDivisor(rc, kind)})", kind),
-            "%" => throw new SpmdGenerator.UnsupportedConstructException(
+            "%" => throw new UnsupportedConstructException(
                 "'%' on float/double lanes (use int/long lanes, or x - Floor(x/y)*y)", bin.GetLocation()),
             "&" or "|" or "^" when isInt => ($"({lc} {op} {rc})", kind),
-            _ => throw new SpmdGenerator.UnsupportedConstructException($"operator '{op}'", bin.GetLocation()),
+            _ => throw new UnsupportedConstructException($"operator '{op}'", bin.GetLocation()),
         };
     }
 
@@ -1408,10 +1411,10 @@ internal sealed class VectorBodyEmitter
     /// precision-changing coercion (both already the target kind), so <c>MulAdd</c> still tracks the
     /// scalar reference. Yields the two factor codes.
     /// </summary>
-    private bool TryFmaFactors(ExpressionSyntax e, SpmdGenerator.Kind target, out string a, out string b)
+    private bool TryFmaFactors(ExpressionSyntax e, Kind target, out string a, out string b)
     {
         a = b = "";
-        if (target is not (SpmdGenerator.Kind.F or SpmdGenerator.Kind.D))
+        if (target is not (Kind.F or Kind.D))
             return false;
         if (Unparen(e) is not BinaryExpressionSyntax { OperatorToken.Text: "*" } mul)
             return false;
@@ -1424,21 +1427,21 @@ internal sealed class VectorBodyEmitter
         return true;
     }
 
-    private string GuardedDivisor(string divisor, SpmdGenerator.Kind kind)
+    private string GuardedDivisor(string divisor, Kind kind)
         => _exprMask == null ? divisor : $"{VType(kind)}.Select({_exprMask}, {divisor}, {VType(kind)}.One)";
 
-    private static SpmdGenerator.Kind Promote(SpmdGenerator.Kind a, SpmdGenerator.Kind b)
+    private static Kind Promote(Kind a, Kind b)
     {
-        if (a == SpmdGenerator.Kind.D || b == SpmdGenerator.Kind.D)
-            return SpmdGenerator.Kind.D;
-        if (a == SpmdGenerator.Kind.F || b == SpmdGenerator.Kind.F)
-            return SpmdGenerator.Kind.F;
-        if (a == SpmdGenerator.Kind.L || b == SpmdGenerator.Kind.L)
-            return SpmdGenerator.Kind.L;
-        return SpmdGenerator.Kind.I;
+        if (a == Kind.D || b == Kind.D)
+            return Kind.D;
+        if (a == Kind.F || b == Kind.F)
+            return Kind.F;
+        if (a == Kind.L || b == Kind.L)
+            return Kind.L;
+        return Kind.I;
     }
 
-    private (string, SpmdGenerator.Kind) TernExpr(ConditionalExpressionSyntax tern)
+    private (string, Kind) TernExpr(ConditionalExpressionSyntax tern)
     {
         var t = Vec(tern.WhenTrue);
         var f = Vec(tern.WhenFalse);
@@ -1449,7 +1452,7 @@ internal sealed class VectorBodyEmitter
     /// <summary>
     /// Lane kind of a scalar struct field. Array members must be indexed (<c>f[k]</c>).
     /// </summary>
-    private SpmdGenerator.Kind FieldKind(string structType, string field, SyntaxNode at)
+    private Kind FieldKind(string structType, string field, SyntaxNode at)
     {
         if (_structs.TryGetValue(structType, out var si))
         {
@@ -1459,7 +1462,7 @@ internal sealed class VectorBodyEmitter
                 {
                     if (f.IsArray)
                     {
-                        throw new SpmdGenerator.UnsupportedConstructException(
+                        throw new UnsupportedConstructException(
                             $"array member '{field}' used without an index (write '{field}[k]' with a constant k)", at.GetLocation());
                     }
 
@@ -1468,7 +1471,7 @@ internal sealed class VectorBodyEmitter
             }
         }
 
-        throw new SpmdGenerator.UnsupportedConstructException($"field '{field}' on struct '{structType}'", at.GetLocation());
+        throw new UnsupportedConstructException($"field '{field}' on struct '{structType}'", at.GetLocation());
     }
 
     /// <summary>
@@ -1476,7 +1479,7 @@ internal sealed class VectorBodyEmitter
     /// <c>s</c> is a struct local, <c>field</c> is a <c>[SpmdArray]</c> member, and <c>k</c> is a
     /// compile-time integer literal. Yields the backing gang (<c>s.field_k</c>) and its lane kind.
     /// </summary>
-    private bool TryStructArrayElement(ElementAccessExpressionSyntax ea, out string gang, out SpmdGenerator.Kind kind)
+    private bool TryStructArrayElement(ElementAccessExpressionSyntax ea, out string gang, out Kind kind)
     {
         gang = "";
         kind = default;
@@ -1496,13 +1499,13 @@ internal sealed class VectorBodyEmitter
         var idxExpr = ea.ArgumentList.Arguments[0].Expression;
         if (idxExpr is not LiteralExpressionSyntax lit || !int.TryParse(lit.Token.ValueText, out int k))
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"array-member index '{Trunc(idxExpr)}' must be a compile-time integer literal (SoA-in-registers has no runtime-indexed lane)", ea.GetLocation());
         }
 
         if (k < 0 || k >= f.ArrayLength)
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"array-member index {k} out of range for '{f.Name}[{f.ArrayLength}]'", ea.GetLocation());
         }
 
@@ -1516,7 +1519,7 @@ internal sealed class VectorBodyEmitter
     /// <summary>
     /// Read of a struct field: <c>v.field</c> (struct local) or <c>buf[i].field</c> (struct buffer).
     /// </summary>
-    private bool TryStructFieldRead(MemberAccessExpressionSyntax ma, out (string, SpmdGenerator.Kind) result)
+    private bool TryStructFieldRead(MemberAccessExpressionSyntax ma, out (string, Kind) result)
     {
         result = default;
         string field = ma.Name.Identifier.Text;
@@ -1552,7 +1555,7 @@ internal sealed class VectorBodyEmitter
                 // Whole-struct read 'buf[i]' → construct the varying struct from each field's gang load.
                 var si = _structs[bs];
                 if (si.Fields.Count > 1)
-                    Warn(SpmdGenerator.GatherPerf, ea, ea.ToString());
+                    Warn(Descriptors.GatherPerf, ea, ea.ToString());
                 string fields = string.Join(", ", si.Fields.Select(f => StructFieldGather(bn, bs, f.Name, bidx)));
                 return ($"new {si.VName}({fields})", bs);
             }
@@ -1568,7 +1571,7 @@ internal sealed class VectorBodyEmitter
                 return ($"{VName(structType)}.Select({Mask(tern.Condition)}, {code}, {falseCode})", structType);
             }
             default:
-                throw new SpmdGenerator.UnsupportedConstructException(
+                throw new UnsupportedConstructException(
                     $"struct expression '{Trunc(e)}' (use a local, 'new S{{...}}', 'new S(...)', a helper call, or a ternary)", e.GetLocation());
         }
     }
@@ -1577,7 +1580,7 @@ internal sealed class VectorBodyEmitter
     {
         string type = oc.Type.ToString();
         if (!_structs.TryGetValue(type, out var si))
-            throw new SpmdGenerator.UnsupportedConstructException($"'new {type}' (not a [SpmdStruct])", oc.GetLocation());
+            throw new UnsupportedConstructException($"'new {type}' (not a [SpmdStruct])", oc.GetLocation());
         string vt = si.VName;
 
         // Zero-argument construction 'new S()' → all-zero gangs (same as 'default').
@@ -1591,9 +1594,9 @@ internal sealed class VectorBodyEmitter
             foreach (var ex in oc.Initializer.Expressions)
             {
                 if (ex is not AssignmentExpressionSyntax a || a.Left is not IdentifierNameSyntax fn)
-                    throw new SpmdGenerator.UnsupportedConstructException($"struct initializer '{Trunc(ex)}'", ex.GetLocation());
+                    throw new UnsupportedConstructException($"struct initializer '{Trunc(ex)}'", ex.GetLocation());
                 var field = si.Fields.FirstOrDefault(x => x.Name == fn.Identifier.Text)
-                    ?? throw new SpmdGenerator.UnsupportedConstructException($"field '{fn.Identifier.Text}' on struct '{type}'", ex.GetLocation());
+                    ?? throw new UnsupportedConstructException($"field '{fn.Identifier.Text}' on struct '{type}'", ex.GetLocation());
                 if (field.IsArray)
                 {
                     // 'arr = new float[N]' (sized, no initializer) → zero-filled; leave the gangs at
@@ -1616,14 +1619,14 @@ internal sealed class VectorBodyEmitter
         // Positional constructor: new S(a, b, ...), args map to fields in declaration order.
         if (si.HasArrayField)
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"positional 'new {type}(...)' isn't supported for a struct with array members (use an object initializer, e.g. 'new {type} {{ f = new float[]{{ ... }} }}')", oc.GetLocation());
         }
 
         var ctorArgs = oc.ArgumentList?.Arguments ?? default;
         if (ctorArgs.Count != si.Fields.Count)
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"'new {type}(...)' expects {si.Fields.Count} field args (or use 'new {type} {{ field = ... }}')", oc.GetLocation());
         }
 
@@ -1648,13 +1651,13 @@ internal sealed class VectorBodyEmitter
         };
         if (xs is null)
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"array-member initializer '{Trunc(e)}' (use 'new float[]{{ ... }}')", e.GetLocation());
         }
 
         if (xs.Count != n)
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"array-member initializer has {xs.Count} elements, expected {n}", e.GetLocation());
         }
 
@@ -1669,7 +1672,7 @@ internal sealed class VectorBodyEmitter
         var args = call.ArgumentList.Arguments;
         if (args.Count != fn.Parameters.Count)
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"call to '{fn.Name}' expects {fn.Parameters.Count} arguments", call.GetLocation());
         }
 
@@ -1721,7 +1724,7 @@ internal sealed class VectorBodyEmitter
         if (n == 1)
             return $"{VType(k)}.Load({flat}, {baseIdx})";
         string idxVec = $"(({IntT}.ProgramIndex + ({baseIdx})) * {n} + {fi})";
-        return k == SpmdGenerator.Kind.F
+        return k == Kind.F
             ? $"Memory.Gather({flat}, {idxVec})"
             : $"Memory.Gather({flat}, {idxVec}, VMask.All, 0)";
     }
@@ -1735,7 +1738,7 @@ internal sealed class VectorBodyEmitter
         var k = FieldKind(structType, field, asg);
         if (op != "=" && _structs[structType].Fields.Count > 1)
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"compound '{op}' on struct-buffer field '{field}' (only '=' supported for AoS scatter)", asg.GetLocation());
         }
 
@@ -1770,7 +1773,7 @@ internal sealed class VectorBodyEmitter
         _ = sb.AppendLine($"{indent}Memory.Scatter({flat}, {idxVec}, {valueCode}, {mask ?? MTAll});");
     }
 
-    private (string Code, SpmdGenerator.Kind Kind) VecCall(InvocationExpressionSyntax call)
+    private (string Code, Kind Kind) VecCall(InvocationExpressionSyntax call)
     {
         string callee = call.Expression.ToString().Replace(" ", "");
 
@@ -1779,7 +1782,7 @@ internal sealed class VectorBodyEmitter
         {
             if (_structs.ContainsKey(fnInfo.ReturnType))
             {
-                throw new SpmdGenerator.UnsupportedConstructException(
+                throw new UnsupportedConstructException(
                     $"struct-returning call '{fnInfo.Name}' used where a scalar is expected", call.GetLocation());
             }
 
@@ -1810,12 +1813,12 @@ internal sealed class VectorBodyEmitter
             "Math.Cbrt" or "MathF.Cbrt" => "Cbrt",
             "MathF.FusedMultiplyAdd" or "Math.FusedMultiplyAdd" => "!FMA",
             _ => null,
-        } ?? throw new SpmdGenerator.UnsupportedConstructException($"call to '{callee}' (no VectorMath mapping)", call.GetLocation());
+        } ?? throw new UnsupportedConstructException($"call to '{callee}' (no VectorMath mapping)", call.GetLocation());
 
         // Long kernels only have integer math, Min/Max/Abs (no transcendentals on 64-bit ints).
         if (_l && fn is not ("Min" or "Max" or "Abs"))
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"'{callee}' on long lanes (only Math.Min/Max/Abs are available for 64-bit integers)", call.GetLocation());
         }
 
@@ -1829,12 +1832,12 @@ internal sealed class VectorBodyEmitter
         // Min/Max/Abs over 64-bit integer lanes stay in long precision (VLong2), the same way
         // a double argument pins the call to double, VectorMath has matching VLong2 overloads.
         bool longIntCall = !_l && fn is "Min" or "Max" or "Abs" &&
-            vecArgs.Any(a => a.Value.Kind == SpmdGenerator.Kind.L) &&
-            vecArgs.All(a => a.Value.Kind is SpmdGenerator.Kind.L or SpmdGenerator.Kind.I);
-        var target = _d || vecArgs.Any(a => a.Value.Kind == SpmdGenerator.Kind.D)
-            ? SpmdGenerator.Kind.D
+            vecArgs.Any(a => a.Value.Kind == Kind.L) &&
+            vecArgs.All(a => a.Value.Kind is Kind.L or Kind.I);
+        var target = _d || vecArgs.Any(a => a.Value.Kind == Kind.D)
+            ? Kind.D
             : longIntCall
-            ? SpmdGenerator.Kind.L
+            ? Kind.L
             : LaneFloatKind;
         string[] args = [.. vecArgs.Select(a => CoerceCode(a.Value, target, a.Node))];
         string code = fn == "!FMA"
@@ -1848,7 +1851,7 @@ internal sealed class VectorBodyEmitter
         ParenthesizedExpressionSyntax p => $"({Mask(p.Expression)})",
         PrefixUnaryExpressionSyntax { OperatorToken.Text: "!" } not => $"(!{Mask(not.Operand)})",
         BinaryExpressionSyntax bin => MaskBin(bin),
-        _ => throw new SpmdGenerator.UnsupportedConstructException($"condition '{Trunc(e)}'", e.GetLocation()),
+        _ => throw new UnsupportedConstructException($"condition '{Trunc(e)}'", e.GetLocation()),
     };
 
     private string MaskBin(BinaryExpressionSyntax bin)
@@ -1871,39 +1874,39 @@ internal sealed class VectorBodyEmitter
             "<" or ">" or "<=" or ">=" => $"({lc} {op} {rc})",
             "==" => $"{vt}.Eq({lc}, {rc})",
             "!=" => $"{vt}.Neq({lc}, {rc})",
-            _ => throw new SpmdGenerator.UnsupportedConstructException($"condition operator '{op}'", bin.GetLocation()),
+            _ => throw new UnsupportedConstructException($"condition operator '{op}'", bin.GetLocation()),
         };
     }
 
-    private string Coerce((string Code, SpmdGenerator.Kind Kind) v, SpmdGenerator.Kind target, SyntaxNode at)
+    private string Coerce((string Code, Kind Kind) v, Kind target, SyntaxNode at)
         => CoerceCode(v, target, at);
 
-    private string CoerceCode((string Code, SpmdGenerator.Kind Kind) v, SpmdGenerator.Kind target, SyntaxNode at)
+    private string CoerceCode((string Code, Kind Kind) v, Kind target, SyntaxNode at)
     {
         if (v.Kind == target)
             return v.Code;
-        if (v.Kind == SpmdGenerator.Kind.I && target == SpmdGenerator.Kind.F)
+        if (v.Kind == Kind.I && target == Kind.F)
             return $"({v.Code}).ToFloat()";
         // float -> int requires an explicit cast in the source, which arrives via CastExpr.
-        if (v.Kind == SpmdGenerator.Kind.F && target == SpmdGenerator.Kind.I)
+        if (v.Kind == Kind.F && target == Kind.I)
             return $"VInt.FromFloatTruncate({v.Code})";
         // Implicit float/int -> double widening in float/int kernels (mirrors C#):
         // values become VDouble2 pairs at full gang width.
-        if (!_d && target == SpmdGenerator.Kind.D && v.Kind == SpmdGenerator.Kind.F)
+        if (!_d && target == Kind.D && v.Kind == Kind.F)
             return $"VDouble2.FromFloat({v.Code})";
-        if (!_d && target == SpmdGenerator.Kind.D && v.Kind == SpmdGenerator.Kind.I)
+        if (!_d && target == Kind.D && v.Kind == Kind.I)
             return $"VDouble2.FromInt({v.Code})";
         // int -> long widening in float/int kernels (mirrors C#): values become VLong2 pairs.
         // (float -> long only via an explicit cast; both flow through here.)
-        if (!_l && target == SpmdGenerator.Kind.L && v.Kind == SpmdGenerator.Kind.I)
+        if (!_l && target == Kind.L && v.Kind == Kind.I)
             return $"VLong2.FromInt({v.Code})";
-        if (!_l && target == SpmdGenerator.Kind.L && v.Kind == SpmdGenerator.Kind.F)
+        if (!_l && target == Kind.L && v.Kind == Kind.F)
             return $"VLong2.FromFloatTruncate({v.Code})";
         // long -> double widening in float/int kernels (mirrors C#).
-        if (!_d && !_l && target == SpmdGenerator.Kind.D && v.Kind == SpmdGenerator.Kind.L)
+        if (!_d && !_l && target == Kind.D && v.Kind == Kind.L)
             return $"({v.Code}).ToDouble2()";
         // double -> float/int and long -> float/int narrowing requires an explicit cast (CastExpr).
-        throw new SpmdGenerator.UnsupportedConstructException($"lane conversion at '{Trunc(at)}'", at.GetLocation());
+        throw new UnsupportedConstructException($"lane conversion at '{Trunc(at)}'", at.GetLocation());
     }
 
     /// <summary>
@@ -1999,46 +2002,46 @@ internal sealed class VectorBodyEmitter
     /// Lower buf[non-loop-index] to Memory.Gather(buf, indices).
     /// The index expression is evaluated as a VInt (per-lane indices), then gathered.
     /// </summary>
-    private (string Code, SpmdGenerator.Kind Kind) EmitGather(
-        ElementAccessExpressionSyntax ea, string bufName, SpmdGenerator.ParamInfo p)
+    private (string Code, Kind Kind) EmitGather(
+        ElementAccessExpressionSyntax ea, string bufName, ParamInfo p)
     {
         if (ea.ArgumentList.Arguments.Count != 1)
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"multi-dimensional gather from '{bufName}' (only single-index a[expr] supported)", ea.GetLocation());
         }
 
-        Warn(SpmdGenerator.GatherPerf, ea, ea.ToString());
+        Warn(Descriptors.GatherPerf, ea, ea.ToString());
         var idxExpr = ea.ArgumentList.Arguments[0].Expression;
 
         // Long kernels index with VLong directly (the lane expression is already 64-bit).
         if (_l)
         {
-            string idxL = Coerce(Vec(idxExpr), SpmdGenerator.Kind.L, idxExpr);
-            return ($"Memory.Gather({bufName}, {idxL})", SpmdGenerator.Kind.L);
+            string idxL = Coerce(Vec(idxExpr), Kind.L, idxExpr);
+            return ($"Memory.Gather({bufName}, {idxL})", Kind.L);
         }
 
         // Double kernels index with VLong (truncated from the double lane expression).
         if (_d)
         {
-            string idxD = Coerce(Vec(idxExpr), SpmdGenerator.Kind.D, idxExpr);
-            return ($"Memory.Gather({bufName}, VLong.FromDoubleTruncate({idxD}))", SpmdGenerator.Kind.D);
+            string idxD = Coerce(Vec(idxExpr), Kind.D, idxExpr);
+            return ($"Memory.Gather({bufName}, VLong.FromDoubleTruncate({idxD}))", Kind.D);
         }
 
-        string idx = Coerce(Vec(idxExpr), SpmdGenerator.Kind.I, idxExpr);
+        string idx = Coerce(Vec(idxExpr), Kind.I, idxExpr);
 
         // Memory.Gather(ReadOnlySpan<float>, VInt) → VFloat
         // Memory.Gather(ReadOnlySpan<int>, VInt, VMask, int) → VInt
-        if (p.ElemKind == SpmdGenerator.Kind.F)
-            return ($"Memory.Gather({bufName}, {idx})", SpmdGenerator.Kind.F);
+        if (p.ElemKind == Kind.F)
+            return ($"Memory.Gather({bufName}, {idx})", Kind.F);
         else
-            return ($"Memory.Gather({bufName}, {idx}, VMask.All, 0)", SpmdGenerator.Kind.I);
+            return ($"Memory.Gather({bufName}, {idx}, VMask.All, 0)", Kind.I);
     }
 
     /// <summary>
     /// Recognize a known scalar constant member (MathF.PI, float.MaxValue, int.MinValue, ...).
     /// </summary>
-    private bool TryConstMember(MemberAccessExpressionSyntax ma, out (string, SpmdGenerator.Kind) result)
+    private bool TryConstMember(MemberAccessExpressionSyntax ma, out (string, Kind) result)
     {
         result = default;
         string member = ma.Name.Identifier.Text;
@@ -2049,18 +2052,18 @@ internal sealed class VectorBodyEmitter
         }
 
         string full = ma.ToString().Replace(" ", "");
-        SpmdGenerator.Kind k;
+        Kind k;
         if (full.StartsWith("MathF.") || full.StartsWith("float."))
-            k = SpmdGenerator.Kind.F;
+            k = Kind.F;
         else if (full.StartsWith("Math.") || full.StartsWith("double."))
-            k = SpmdGenerator.Kind.D;
+            k = Kind.D;
         else if (full.StartsWith("int."))
-            k = SpmdGenerator.Kind.I;
+            k = Kind.I;
         else
             return false;
 
         if (_d)
-            k = SpmdGenerator.Kind.D;   // double kernel: everything is a VDouble lane
+            k = Kind.D;   // double kernel: everything is a VDouble lane
         result = ($"new {VType(k)}({ma})", k);
         return true;
     }
@@ -2068,28 +2071,28 @@ internal sealed class VectorBodyEmitter
     /// <summary>
     /// Lower a 2-D array read a[i, j] to a contiguous load (row-major) or a gather.
     /// </summary>
-    private (string Code, SpmdGenerator.Kind Kind) Emit2DLoad(ElementAccessExpressionSyntax ea, SpmdGenerator.ParamInfo p)
+    private (string Code, Kind Kind) Emit2DLoad(ElementAccessExpressionSyntax ea, ParamInfo p)
     {
         var idx0 = ea.ArgumentList.Arguments[0].Expression;
         var idx1 = ea.ArgumentList.Arguments[1].Expression;
         if (TryGet2DContiguous(idx0, idx1, p.ColsName, out string? flatBase))
             return ($"{VType(p.ElemKind)}.Load({p.FlatName}, {flatBase})", p.ElemKind);
 
-        Warn(SpmdGenerator.GatherPerf, ea, ea.ToString());
+        Warn(Descriptors.GatherPerf, ea, ea.ToString());
         string flatIdx = Build2DFlatIndex(idx0, idx1, p.ColsName);
         if (_l)
-            return ($"Memory.Gather({p.FlatName}, {flatIdx})", SpmdGenerator.Kind.L);
+            return ($"Memory.Gather({p.FlatName}, {flatIdx})", Kind.L);
         if (_d)
-            return ($"Memory.Gather({p.FlatName}, {flatIdx})", SpmdGenerator.Kind.D);
-        if (p.ElemKind == SpmdGenerator.Kind.F)
-            return ($"Memory.Gather({p.FlatName}, {flatIdx})", SpmdGenerator.Kind.F);
-        return ($"Memory.Gather({p.FlatName}, {flatIdx}, VMask.All, 0)", SpmdGenerator.Kind.I);
+            return ($"Memory.Gather({p.FlatName}, {flatIdx})", Kind.D);
+        if (p.ElemKind == Kind.F)
+            return ($"Memory.Gather({p.FlatName}, {flatIdx})", Kind.F);
+        return ($"Memory.Gather({p.FlatName}, {flatIdx}, VMask.All, 0)", Kind.I);
     }
 
     /// <summary>
     /// Lower a 2-D array store a[i, j] = ... to a contiguous store or a scatter.
     /// </summary>
-    private void Emit2DStore(ElementAccessExpressionSyntax ea, SpmdGenerator.ParamInfo p,
+    private void Emit2DStore(ElementAccessExpressionSyntax ea, ParamInfo p,
         AssignmentExpressionSyntax asg, string op, string? mask, string indent, StringBuilder sb)
     {
         var idx0 = ea.ArgumentList.Arguments[0].Expression;
@@ -2109,11 +2112,11 @@ internal sealed class VectorBodyEmitter
 
         if (op != "=")
         {
-            throw new SpmdGenerator.UnsupportedConstructException(
+            throw new UnsupportedConstructException(
                 $"compound scatter '{op}' on 2-D array '{p.Name}' (only '=' supported for non-contiguous stores)", asg.GetLocation());
         }
 
-        Warn(SpmdGenerator.ScatterPerf, ea, ea.ToString());
+        Warn(Descriptors.ScatterPerf, ea, ea.ToString());
         string flatIdx = Build2DFlatIndex(idx0, idx1, p.ColsName);
         string val = Coerce(Vec(asg.Right), ek, asg.Right);
         string maskArg = mask ?? MTAll;
@@ -2165,7 +2168,7 @@ internal sealed class VectorBodyEmitter
                 => Wide ? "(VLong.ProgramIndex + (long)__i)" : "(VInt.ProgramIndex + __i)",
             BinaryExpressionSyntax bin when bin.OperatorToken.Text is "+" or "-" or "*"
                 => $"({BuildIntIndex(bin.Left)} {bin.OperatorToken.Text} {BuildIntIndex(bin.Right)})",
-            _ => throw new SpmdGenerator.UnsupportedConstructException(
+            _ => throw new UnsupportedConstructException(
                 $"non-affine 2-D index '{Trunc(e)}' (indices must be affine in the loop variable and uniforms)", e.GetLocation()),
         };
     }
@@ -2174,36 +2177,5 @@ internal sealed class VectorBodyEmitter
     {
         string s = n.ToString();
         return s.Length > 60 ? s.Substring(0, 57) + "..." : s;
-    }
-
-    /// <summary>
-    /// Tracks break/continue state for the innermost loop being emitted.
-    /// For uniform loops (plain C# for), break/continue map to C# keywords.
-    /// For varying loops (mask iteration), break/continue manipulate masks.
-    /// </summary>
-    private readonly struct LoopContext
-    {
-        public readonly string BreakMask;
-        public readonly string ContinueMask;
-        public readonly string LoopMask;
-        public readonly bool IsUniform;
-
-        public LoopContext(string breakMask, string continueMask, string loopMask)
-        {
-            BreakMask = breakMask;
-            ContinueMask = continueMask;
-            LoopMask = loopMask;
-            IsUniform = false;
-        }
-
-        private LoopContext(bool isUniform)
-        {
-            BreakMask = "";
-            ContinueMask = "";
-            LoopMask = "";
-            IsUniform = isUniform;
-        }
-
-        public static LoopContext Uniform() => new(true);
     }
 }

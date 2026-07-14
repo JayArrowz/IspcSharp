@@ -5,7 +5,7 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
 
-namespace IspcSharp.Generators;
+namespace IspcSharp.Generators.Analyzers;
 
 /// <summary>
 /// Warns about Array-of-Structs access patterns inside SPMD kernels, the single most

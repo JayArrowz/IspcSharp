@@ -3,36 +3,14 @@ using System.Linq;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 
-namespace IspcSharp.Generators;
-
-/// <summary>
-/// One field of a blittable struct. <see cref="ArrayLength"/> is 0 for a scalar field,
-/// or the fixed element count for an ISPC-style array member (<c>[SpmdArray(N)] float[] f</c>).
-/// </summary>
-internal sealed class StructField(string name, SpmdGenerator.Kind kind, int arrayLength = 0)
-{
-    public readonly string Name = name;
-    public readonly SpmdGenerator.Kind Kind = kind;
-    public readonly int ArrayLength = arrayLength;
-
-    public bool IsArray => ArrayLength > 0;
-
-    /// <summary>
-    /// Gang name of element <paramref name="i"/> of an array member (<c>f_0</c>, <c>f_1</c>, …).
-    /// </summary>
-    public string GangName(int i) => Name + "_" + i;
-}
+namespace IspcSharp.Generators.Models;
 
 /// <summary>
 /// A <c>[SpmdStruct]</c> struct: name, namespace, and its primitive fields. Drives generation of
 /// the varying companion (<c>Name__V</c>, one gang-typed field each) and buffer gather/scatter.
 /// </summary>
-internal sealed class StructInfo(string name, string ns, List<StructField> fields)
+internal sealed record StructInfo(string Name, string Namespace, EquatableReadOnlyList<StructField> Fields)
 {
-    public readonly string Name = name;
-    public readonly string Namespace = ns;
-    public readonly List<StructField> Fields = fields;
-
     public string VName => Name + "__V";
 
     /// <summary>
@@ -47,9 +25,9 @@ internal sealed class StructInfo(string name, string ns, List<StructField> field
     /// fields would break the uniform element stride, so those stay locals/args only.
     /// </summary>
     public bool AllFields32Bit => Fields.Count > 0 &&
-        Fields.All(f => f.Kind is SpmdGenerator.Kind.F or SpmdGenerator.Kind.I);
+        Fields.All(f => f.Kind is Kind.F or Kind.I);
 
-    public SpmdGenerator.Kind FieldKind => Fields[0].Kind;
+    public Kind FieldKind => Fields[0].Kind;
 
     /// <summary>
     /// True when any field is an ISPC-style fixed-size array member. Such structs are
@@ -61,7 +39,7 @@ internal sealed class StructInfo(string name, string ns, List<StructField> field
     /// The companion's flattened gang fields: a scalar field yields one gang, an array
     /// member of length N yields N (<c>f_0 … f_{N-1}</c>). Drives companion emission and blends.
     /// </summary>
-    public IEnumerable<(string Name, SpmdGenerator.Kind Kind)> GangFields()
+    public IEnumerable<(string Name, Kind Kind)> GangFields()
     {
         foreach (var f in Fields)
         {
@@ -116,7 +94,7 @@ internal sealed class StructInfo(string name, string ns, List<StructField> field
 
         if (fields.Count == 0)
             return null;
-        return new StructInfo(s.Identifier.Text, NamespaceOf(s), fields);
+        return new StructInfo(s.Identifier.Text, NamespaceOf(s), new EquatableReadOnlyList<StructField>(fields));
     }
 
     /// <summary>
@@ -146,12 +124,12 @@ internal sealed class StructInfo(string name, string ns, List<StructField> field
         return 0;
     }
 
-    private static SpmdGenerator.Kind? KindOf(string t) => t switch
+    private static Kind? KindOf(string t) => t switch
     {
-        "float" => SpmdGenerator.Kind.F,
-        "int" => SpmdGenerator.Kind.I,
-        "double" => SpmdGenerator.Kind.D,
-        "long" => SpmdGenerator.Kind.L,
+        "float" => Kind.F,
+        "int" => Kind.I,
+        "double" => Kind.D,
+        "long" => Kind.L,
         _ => null,
     };
 
@@ -166,24 +144,5 @@ internal sealed class StructInfo(string name, string ns, List<StructField> field
         }
 
         return "";
-    }
-}
-
-/// <summary>
-/// A <c>[SpmdFunction]</c> helper: its declaration syntax and parsed signature.
-/// </summary>
-internal sealed class FunctionInfo(string name, MethodDeclarationSyntax syntax, List<(string Name, string Type)> ps, string ret)
-{
-    public readonly string Name = name;
-    public readonly MethodDeclarationSyntax Syntax = syntax;
-    public readonly List<(string Name, string Type)> Parameters = ps;
-    public readonly string ReturnType = ret;
-
-    public static FunctionInfo From(MethodDeclarationSyntax m)
-    {
-        var ps = m.ParameterList.Parameters
-            .Select(p => (p.Identifier.Text, p.Type?.ToString().Trim() ?? ""))
-            .ToList();
-        return new FunctionInfo(m.Identifier.Text, m, ps, m.ReturnType.ToString().Trim());
     }
 }
