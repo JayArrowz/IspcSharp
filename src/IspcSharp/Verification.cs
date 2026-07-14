@@ -41,15 +41,32 @@ namespace IspcSharp
     }
 
     /// <summary>
-    /// Marks a blittable struct (all fields <c>float</c>/<c>int</c>/<c>double</c>/<c>long</c>) as usable
-    /// inside <c>[Spmd]</c>/<c>[SpmdFunction]</c> bodies. The generator emits a varying companion whose
-    /// fields are the per-lane gang types (<c>VFloat</c>/<c>VInt</c>/…), so the struct can be a kernel
-    /// local, a helper argument/return, or, when every field shares one type, a Structure-of-Arrays
-    /// buffer element accessed as <c>buf[i].field</c>.
+    /// Marks a blittable struct as usable inside <c>[Spmd]</c>/<c>[SpmdFunction]</c> bodies. Fields are
+    /// <c>float</c>/<c>int</c>/<c>double</c>/<c>long</c>, or ISPC-style fixed-size array members declared
+    /// with <see cref="SpmdArrayAttribute"/>. The generator emits a varying companion whose fields are
+    /// the per-lane gang types (<c>VFloat</c>/<c>VInt</c>/…, one gang per array element), so the struct
+    /// can be a kernel local, a helper argument/return, or a Structure-of-Arrays buffer element accessed
+    /// as <c>buf[i].field</c> (buffers require same-width scalar fields and no array members).
     /// </summary>
     [AttributeUsage(AttributeTargets.Struct, AllowMultiple = false, Inherited = false)]
     public sealed class SpmdStructAttribute : Attribute
     {
+    }
+
+    /// <summary>
+    /// Declares a <c>float[]</c>/<c>int[]</c>/<c>double[]</c>/<c>long[]</c> field of a <c>[SpmdStruct]</c>
+    /// as an ISPC-style <b>fixed-size array member</b> of the given length. The varying companion expands
+    /// it into that many independent gangs held in registers (Structure-of-Arrays), so element access
+    /// <c>s.field[k]</c> resolves to a single gang. The index <c>k</c> must be a compile-time integer
+    /// literal (registers have no runtime-indexed lane), and such a struct is a local / helper argument /
+    /// return only, not a buffer element. Example: <c>[SpmdArray(4)] public float[] Weights;</c>.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Field, AllowMultiple = false, Inherited = false)]
+    public sealed class SpmdArrayAttribute : Attribute
+    {
+        /// <summary>Fixed element count of the array member (must be &gt; 0).</summary>
+        public int Length { get; }
+        public SpmdArrayAttribute(int length) { Length = length; }
     }
 
     /// <summary>One per-element mismatch found by <see cref="KernelVerifier"/>.</summary>

@@ -52,7 +52,7 @@ Every benchmark compares the generated SIMD implementation against the original 
 Then verify everything works on your machine:
 
 ```bash
-dotnet test tests/IspcSharp.Tests                                  # 249 tests
+dotnet test tests/IspcSharp.Tests                                  # 272 tests
 dotnet run -c Release --project samples/IspcSharp.Samples          # smoke-test samples
 ```
 
@@ -180,6 +180,65 @@ public static void MulSpectra(float[] ar, float[] ai, float[] br, float[] bi, fl
         cr[i] = c.Re; ci[i] = c.Im;
     }
 }
+
+// Return a struct of reductions (ISPC's "export a struct"): each field is one reduced accumulator,
+// built after the loop and returned by both _Simd and _ParallelSimd.
+[SpmdStruct] public struct Stats { public float Sum, Min, Max; }
+
+[Spmd]
+public static Stats Summarize(float[] a, int count)
+{
+    float sum = 0f, mn = float.MaxValue, mx = float.NegativeInfinity;
+    foreach (var i in Spmd.Range(count))
+    {
+        sum += a[i];                       // reduce_add
+        mn = Math.Min(mn, a[i]);           // reduce_min
+        mx = Math.Max(mx, a[i]);           // reduce_max
+    }
+    return new Stats { Sum = sum, Min = mn, Max = mx };   // trailing scalar C# over the reduced values
+}
+
+// Mixed-field struct buffer: fields differ in type but share a 32-bit width, so Hit[] is a valid
+// AoS buffer, T is gathered/scattered as float, Id as int, through their own typed views.
+[SpmdStruct] public struct Hit { public float T; public int Id; }
+
+[Spmd]
+public static void BumpHits(Hit[] hits, float dt, int count)
+{
+    foreach (var i in Spmd.Range(count))
+    {
+        Hit h = hits[i];                   // AoS gather of both fields (ISPC100/101, flagged)
+        h.T = h.T + dt;                    // float field
+        h.Id = h.Id + 1;                   // int field
+        hits[i] = h;                       // AoS scatter
+    }
+}
+
+// Fixed-size array members (ISPC's `float Coef[3]`): [SpmdArray(N)] expands each into N register
+// gangs. Element indices are compile-time literals; array members of different types are fine.
+[SpmdStruct]
+public struct Poly
+{
+    [SpmdArray(3)] public float[] Coef;    // 3 float gangs, held SoA in registers
+    [SpmdArray(2)] public int[]   Tag;     // 2 int gangs (a differently-typed array member)
+    public float Bias;                     // a plain scalar field alongside the arrays
+}
+
+[SpmdFunction]                             // helper indexing the array members by constant index
+public static float EvalPoly(Poly p, float x)
+    => p.Coef[0] + p.Coef[1] * x + p.Coef[2] * (x * x) + p.Bias;
+
+[Spmd]
+public static void ApplyPoly(float[] c0, float[] c1, float[] c2, float[] bias,
+                             float[] x, float[] o, int count)
+{
+    foreach (var i in Spmd.Range(count))
+    {
+        // object-initializer construction: `new float[]{...}` fills the gangs, `new int[2]` zero-fills
+        Poly p = new Poly { Coef = new float[] { c0[i], c1[i], c2[i] }, Tag = new int[2], Bias = bias[i] };
+        o[i] = EvalPoly(p, x[i]);
+    }
+}
 ```
 
 The `Spmd.Range` loop can sit inside `for`/`while`/`if` scaffolding, those statements (loop counters, `MathF.PI`, tuple swaps, `x ^= y`, `arr.Length`, …) run as ordinary scalar C#, and only the inner loop vectorizes. That's enough to write an iterative FFT or a matrix multiply as one `[Spmd]` method. Anything the generator can't vectorize is a **compile error with an `ISPC00x` diagnostic naming the construct**, never a silent scalar fallback, never silently wrong codegen. The scalar method always still compiles; only the `_Simd` companion is withheld.
@@ -259,6 +318,10 @@ KernelVerifier.AssertMatches(
 | `reduce_add/min/max` | `sum += x` / `m = Math.Min(m, x)` patterns in `[Spmd]`; `Reduce.Add/Min/Max` (masked overloads) |
 | gather / scatter | `a[expr]` / `a[expr] = x` in `[Spmd]`; `Memory.Gather` / `Memory.Scatter` (masked; float/int/double) |
 | 2-D arrays (`float m[][]`) | `float[,]`/`int[,]`/`double[,]` params in `[Spmd]` (`a[row, col]`, row-major flat view) |
+| `struct` + member functions | `[SpmdStruct]` + `[SpmdFunction]` (varying companion held SoA in registers) |
+| `struct` array members (`float c[3]`) | `[SpmdArray(3)] float[] c;` (N register gangs; `c[k]` with constant `k`; mixed element types) |
+| return / export a `struct` | `[Spmd]`/`[SpmdFunction]` returning a `[SpmdStruct]` (`return new Stats { … };`) |
+| array of structs (AoS) | `S[]` buffer param (`buf[i].field`; same-width fields, incl. mixed `float`+`int`) |
 | uniform scaffolding (FFT, matmul) | `Spmd.Range` loop nested in uniform `for`/`while`/`if`, scaffolding runs as scalar C# |
 | stdlib (`sin`, `exp`, `rsqrt`, ...) | `VectorMath`, branch-free approximations, float + double |
 | `shuffle` / `rotate` / `broadcast` / `shift` | `Lanes.Shuffle` / `Rotate` / `Broadcast` / `ShiftLanes` |
@@ -269,14 +332,14 @@ KernelVerifier.AssertMatches(
 The generator handles a deliberately constrained, verifiable subset. Kernel shape: optional pre-loop locals, one `foreach` over a `Spmd.Range*` marker, optional trailing statements (including `return`). The foreach may also be **nested inside uniform control flow**, `for`/`while`/`if` scaffolding whose statements (loop counters, swaps, `MathF.PI`, `j ^= bit`, `for (i += len)`, `arr.Length`, …) run as plain scalar C# around the vectorized loop. This is what lets an iterative FFT or a matrix multiply be a single `[Spmd]` method (see the matmul example above); only the innermost `Spmd.Range` loop is vectorized, so its body must still be per-lane parallel (no loop-carried recurrence).
 
 - **Types:** `float`, `int`, `double`, and `long` lane variables (locals declared in the loop body), parameters of `float[]`/`int[]`/`double[]`/`long[]`, `float[,]`/`int[,]`/`double[,]`/`long[,]` (2-D matrices), `Span<T>`/`ReadOnlySpan<T>` of those, and uniform `float`/`int`/`double`/`long`. Implicit int→float promotion; explicit `(float)`/`(int)`/`(double)` casts. **Wide (64-bit) kernels:** a kernel with `double` **buffers** becomes a `VDouble`/`VMaskD` gang; a kernel with `long` **buffers** becomes a `VLong`/`VMaskD` gang (64-bit integers: arithmetic, bitwise `& | ^ ~`, shifts, `/` `%`, `Math.Min/Max/Abs`, gather/scatter, reductions). Both are half the lane count of float/int, and a wide kernel can't mix in 32-bit buffers. In float/int kernels, `double` locals/uniforms/`d`-literals/`(double)` casts give **double-precision intermediates at full gang width** (`VDouble2` pairs), e.g. a `double` accumulator over float data; likewise `long` locals/`L`-literals/`(long)` casts give **64-bit integer intermediates at full gang width** (`VLong2` pairs), e.g. an exact `long` sum over `int` data, or an overflow-free `(long)a[i] * b[i]` widening multiply.
-- **Return values:** kernels may return `float`/`int`/`double`/`long`, reduce into a pre-loop local and `return` it after the loop; both `_Simd` and `_ParallelSimd` return it directly. (A `long` return from a 32-bit kernel is the natural home for a `VLong2` accumulator, an exact 64-bit sum over `int` data.)
+- **Return values:** kernels may return `float`/`int`/`double`/`long`, reduce into a pre-loop local and `return` it after the loop; both `_Simd` and `_ParallelSimd` return it directly. (A `long` return from a 32-bit kernel is the natural home for a `VLong2` accumulator, an exact 64-bit sum over `int` data.) A kernel may also **return a `[SpmdStruct]`** built from several reduced accumulators (`return new Stats { Sum = sum, Min = mn, Max = mx };`), ISPC's "export a struct" — the trailing `return` runs as scalar C# over the already-reduced scalars, so it works in both variants. (`[SpmdFunction]` helpers return structs too; see below.)
 - **Memory:** `a[i]` reads/writes indexed by the loop variable, including affine offsets `a[i + u1 + u2]` (uniform terms), this keeps `buf[y*width + x]` and an FFT's `buf[i + k + half]` contiguous loads. **Affine index locals** are tracked too: `int even = i + k; … real[even] = …` stays a contiguous load/store (the offset even propagates through `int odd = even + half`), so you don't have to inline the index arithmetic to keep the fast path. **2-D arrays** index as `a[row, col]` (viewed as a flat row-major span): contiguous when the last index is unit-stride in the lane (`a[row, k]`), a strided gather otherwise (`b[k, col]`). Any genuinely lane-varying index becomes a gather (`a[expr]`) or scatter (`a[expr] = x`) via `Memory.Gather`/`Scatter`; double kernels index with `VLong` through `table[(int)x]`-style casts.
 - **Constants:** `MathF.PI`/`Math.PI`, `.E`, `.Tau`, `float.MaxValue`/`int.MinValue`/`double.Epsilon`/`…` broadcast automatically inside vectorized expressions.
 - **Expressions:** `+ - * /`, integer `/` and `%` (per-lane loops; inactive-lane divisors are masked to 1 so masked-off zero divisors can't throw), unary `-` and `~`, shifts `<<` `>>` `>>>` with **uniform or per-lane counts** (per-lane uses AVX2 variable shifts where available; C#'s low-5-bits semantics), bitwise `& | ^` on int lanes, ternary `?:`, and `Math`/`MathF` calls with `VectorMath` equivalents: `Sqrt`, `Abs`, `Min`, `Max`, `Sin`, `Cos`, `Tan`, `Exp`, `Log`, `Pow`, `Tanh`, `Floor`, `Round`, `Clamp`, `Atan`, `Atan2`, `Asin`, `Acos`, `Cbrt`, `FusedMultiplyAdd` (double overloads resolve automatically for double arguments).
 - **Assignments:** `=`, `+=`, `-=`, `*=`, `/=`, compound bitwise `&=` `|=` `^=` (int lanes), and `++`/`--` statements on lane locals.
 - **Control flow:** `if`/`else if`/`else`, arbitrarily nested, with `< > <= >= == != && || !` conditions, lowered to masked selects; wrap a condition in `Spmd.Coherent(...)` to add an `Any()` guard so whole gangs skip branches no lane takes (ISPC's `cif`; identity function at runtime). Varying `while`/`for` loops lower to execution-mask iteration; uniform `for` loops emit as plain C#. `break`/`continue` work in both (per-lane masks in varying loops), including `continue` at the `foreach` top level. A bare `return;` **retires the lane** (ISPC semantics): the element exits every varying loop and skips the rest of its body, while other elements keep processing, see limitations for how this differs from scalar C#. Local declarations inside masked branches are auto-blended.
 - **Reductions:** a pre-loop local accumulated *only* via `x += expr` (add), `x = Math.Min(x, expr)`, or `x = Math.Max(x, expr)` becomes a vector accumulator, horizontally reduced after the loop. Multiple accumulators per loop are fine, one operator each. `_ParallelSimd` gives each chunk thread-local partials, combined deterministically afterward.
-- **Blittable structs (`[SpmdStruct]`):** a struct whose fields are all `float`/`int`/`double`/`long` can be a **lane local**, a helper argument/return, or, when every field shares one type, a **buffer element**. The generator emits a varying companion (`Name__V`, one gang per field, held Structure-of-Arrays in registers), so `Vec3 v = new Vec3 { X = a[i], … };`, field reads/writes `v.X`, whole-struct assignment `v = w;` (masked-blended in divergent branches), and construction (`new S { f = … }` or `new S(a, b, …)` in field order) all work. **Struct buffers** (`Vec3[] pts`) view the array as a flat SoA span: `pts[i].X` and `pts[i] = new Vec3 { … }` lower to contiguous loads (single-field structs) or strided gather/scatter (AoS, the `ISPC100` case), and make the kernel `_Simd`-only. Fields must be same-typed for a buffer (mixed-type structs are locals/args only, pass separate SoA arrays instead), and the struct keeps its default sequential layout.
+- **Blittable structs (`[SpmdStruct]`):** a struct whose fields are all `float`/`int`/`double`/`long` can be a **lane local**, a helper argument/return, or, when every field shares one type, a **buffer element**. The generator emits a varying companion (`Name__V`, one gang per field, held Structure-of-Arrays in registers), so `Vec3 v = new Vec3 { X = a[i], … };`, field reads/writes `v.X`, whole-struct assignment `v = w;` (masked-blended in divergent branches), and construction (`new S { f = … }` or `new S(a, b, …)` in field order) all work. **Struct buffers** (`Vec3[] pts`) view the array as a flat SoA span: `pts[i].X` and `pts[i] = new Vec3 { … }` lower to contiguous loads (single-field structs) or strided gather/scatter (AoS, the `ISPC100` case), and make the kernel `_Simd`-only. **Mixed-field buffers** are allowed when every field is 32-bit — `Hit { float T; int Id; }[]` works, each field gathered/scattered through its own correctly-typed flat view (`T` as `float`, `Id` as `int`). Mixing 32- and 64-bit fields in a buffer (e.g. `float` + `double`) would break the element stride, so those structs stay locals/args only; pass separate SoA arrays instead. The struct keeps its default sequential layout. **Fixed-size array members** (ISPC's `float x[4]`) are declared `[SpmdArray(N)] public float[] Coef;` — the companion expands each into N independent gangs (`Coef_0 … Coef_{N-1}`), so `p.Coef[k]` reads/writes one gang. The index `k` must be a **compile-time integer literal** (SoA-in-registers has no runtime-indexed lane), array members of differing element types are fine (`float[]` + `int[]`), and construction is by object initializer (`new Poly { Coef = new float[]{ a, b, c }, Tag = new int[2] }`, a sized-but-empty `new int[2]` zero-fills). An array-member struct is a **local / helper arg / return only**, never a buffer element.
 - **Vectorized helper functions (`[SpmdFunction]`):** a side-effect-free helper with primitive/struct arguments and return (ISPC's non-`export` function) gets a varying companion, each `float` becomes a `VFloat`, each struct its `__V` form. Any `[Spmd]` kernel or other `[SpmdFunction]` can call it (`o[i] = Lerp(a[i], b[i], t);`, `Complex c = CMul(a, b);`), so common math composes without inlining by hand. The body uses the same subset as a kernel but takes scalar values instead of buffers and has no `Spmd.Range` loop; it operates on the gang it is handed. No recursion or buffer parameters.
 - **Domains:** `Spmd.Range(n)`, `Spmd.Range(start, end)`, `Spmd.Range2D(w, h)` (rows of x-gangs, parallel over rows), `Spmd.Range2DTiled(w, h[, tileW, tileH])` (cache-blocked 64×64 tiles by default, parallel over tiles).
 
@@ -347,7 +410,7 @@ samples/IspcSharp.Samples/      Tonemap, reduction, Newton-sqrt (varying while),
 benchmarks/IspcSharp.Benchmarks BenchmarkDotNet suite on generated kernels: branchless, reductions,
                                 transcendental, divergent while, 2D Mandelbrot, FFT, matrix
                                 multiply, bandwidth-bound control, grid route finding
-tests/IspcSharp.Tests/          xUnit suite (249 tests) covering every feature above, in both
+tests/IspcSharp.Tests/          xUnit suite (272 tests) covering every feature above, in both
                                 hardware-SIMD and software-fallback modes
 .github/workflows/ci.yml        Test matrix: Linux/Windows x64 + macOS ARM64 (NEON), plus an
                                 on-demand benchmark job

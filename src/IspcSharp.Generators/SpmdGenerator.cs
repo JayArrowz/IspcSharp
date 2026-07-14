@@ -270,9 +270,18 @@ namespace IspcSharp.Generators
                 if (kind == ParamKind.Unsupported && t.EndsWith("[]") &&
                     structMap.TryGetValue(t.Substring(0, t.Length - 2), out var bufStruct))
                 {
-                    if (!bufStruct.AllSameKind)
+                    // Fixed-size array members expand to per-element gangs held in registers; there is
+                    // no flat buffer layout for them, so such structs are locals / args / returns only.
+                    if (bufStruct.HasArrayField)
                         throw new UnsupportedConstructException(
-                            $"struct buffer '{bufStruct.Name}[]' whose fields are not all the same type (use separate SoA arrays)", p.GetLocation());
+                            $"struct buffer '{bufStruct.Name}[]' has fixed-size array member fields (array-member structs are locals, helper args, or returns only; use separate SoA arrays for a buffer)", p.GetLocation());
+                    // A mixed-field struct[] buffer is allowed when every field is 32-bit (float/int):
+                    // the AoS array casts to one 4-byte element size, and each field is gathered/
+                    // scattered through its own correctly-typed flat view. Mixing 32- and 64-bit
+                    // fields would break the element stride, so those stay locals/args only.
+                    if (!bufStruct.AllSameKind && !bufStruct.AllFields32Bit)
+                        throw new UnsupportedConstructException(
+                            $"struct buffer '{bufStruct.Name}[]' mixes field widths; a mixed-field buffer needs all-32-bit (float/int) fields (make every field the same type, or use separate SoA arrays)", p.GetLocation());
                     kind = ParamKind.StructArray;
                     structElem = bufStruct.Name;
                 }
@@ -369,9 +378,13 @@ namespace IspcSharp.Generators
             }
 
             string returnType = method.ReturnType.ToString();
-            if (returnType is not ("void" or "float" or "int" or "double" or "long"))
+            // A [SpmdStruct] return is built after the loop from reduced scalar accumulators
+            // (e.g. 'return new Stats { Sum = sum, Min = mn };'), the trailing statements run as
+            // ordinary scalar C#, so the companion returns a plain struct just like ISPC's export.
+            if (returnType is not ("void" or "float" or "int" or "double" or "long") &&
+                !structMap.ContainsKey(returnType))
                 throw new UnsupportedConstructException(
-                    $"return type '{returnType}' (supported: void, float, int, double, long)", location);
+                    $"return type '{returnType}' (supported: void, float, int, double, long, or a [SpmdStruct])", location);
 
             var body = fe.Statement is BlockSyntax b ? b.Statements : SyntaxFactory.List(new[] { fe.Statement });
 
@@ -813,21 +826,23 @@ namespace IspcSharp.Generators
                 foreach (var s in nsGroup)
                 {
                     string vt = s.VName;
+                    // Array members are flattened to one gang per element (f_0, f_1, …), held SoA in registers.
+                    var gangs = s.GangFields().ToList();
                     src.AppendLine($"    /// <summary>Varying (per-lane) companion of <see cref=\"{s.Name}\"/>, one gang per field.</summary>");
                     src.AppendLine($"    public struct {vt}");
                     src.AppendLine("    {");
-                    foreach (var f in s.Fields)
-                        src.AppendLine($"        public {VType(f.Kind, false, false)} {f.Name};");
+                    foreach (var g in gangs)
+                        src.AppendLine($"        public {VType(g.Kind, false, false)} {g.Name};");
                     // Constructor.
-                    string ctorParams = string.Join(", ", s.Fields.Select(f => $"{VType(f.Kind, false, false)} {f.Name}"));
+                    string ctorParams = string.Join(", ", gangs.Select(g => $"{VType(g.Kind, false, false)} {g.Name}"));
                     src.AppendLine($"        public {vt}({ctorParams})");
                     src.AppendLine("        {");
-                    foreach (var f in s.Fields)
-                        src.AppendLine($"            this.{f.Name} = {f.Name};");
+                    foreach (var g in gangs)
+                        src.AppendLine($"            this.{g.Name} = {g.Name};");
                     src.AppendLine("        }");
                     // Per-lane blend.
                     src.AppendLine($"        public static {vt} Select(VMask __m, {vt} __t, {vt} __f)");
-                    string selArgs = string.Join(", ", s.Fields.Select(f => $"{VType(f.Kind, false, false)}.Select(__m, __t.{f.Name}, __f.{f.Name})"));
+                    string selArgs = string.Join(", ", gangs.Select(g => $"{VType(g.Kind, false, false)}.Select(__m, __t.{g.Name}, __f.{g.Name})"));
                     src.AppendLine($"            => new {vt}({selArgs});");
                     src.AppendLine("    }");
                     src.AppendLine();
@@ -919,6 +934,16 @@ namespace IspcSharp.Generators
             Kind.L => longMode ? "VLong" : "VLong2",
             _ => doubleMode ? "VDouble" : "VDouble2",
         };
+
+        /// <summary>Scalar element type name for a lane kind (the flat-view element type of a buffer).</summary>
+        internal static string ElemTypeName(Kind k) => k switch { Kind.I => "int", Kind.D => "double", Kind.L => "long", _ => "float" };
+
+        /// <summary>Flat SoA view name for a struct-buffer field. A homogeneous buffer shares one view
+        /// (<c>__flat_buf</c>); a mixed 32-bit buffer gets one correctly-typed view per distinct field
+        /// kind (<c>__flat_buf_f</c> / <c>__flat_buf_i</c>) so each field gathers through its real type.</summary>
+        internal static string StructFlatView(string bufName, Kind fieldKind, bool mixed)
+            => mixed ? $"__flat_{bufName}_{fieldKind switch { Kind.I => "i", Kind.D => "d", Kind.L => "l", _ => "f" }}"
+                     : "__flat_" + bufName;
 
         /// <summary>Vector-lane identity element for a reduction accumulator.</summary>
         internal static string VectorIdentity(ReductionInfo r, bool doubleMode, bool longMode)
@@ -1221,9 +1246,13 @@ namespace IspcSharp.Generators
             foreach (var p in paramInfos.Where(p => p.IsStructBuffer))
             {
                 var si = structs[p.StructType!];
-                string elem = si.FieldKind switch { Kind.I => "int", Kind.D => "double", Kind.L => "long", _ => "float" };
-                // View the AoS S[] as a flat elem[]: field f of element e sits at e*FieldCount + f.
-                src.AppendLine($"{indent}Span<{elem}> {p.FlatName} = System.Runtime.InteropServices.MemoryMarshal.Cast<{p.StructType}, {elem}>({p.Name}.AsSpan());");
+                bool mixed = !si.AllSameKind;
+                // View the AoS S[] as flat elem[] spans: field f of element e sits at e*FieldCount + f.
+                // Homogeneous → one view of the shared field type; mixed 32-bit → one correctly-typed
+                // view per distinct field kind (so an int field isn't loaded through a float span).
+                foreach (var k in (mixed ? si.Fields.Select(f => f.Kind).Distinct() : new[] { si.FieldKind }))
+                    src.AppendLine($"{indent}Span<{ElemTypeName(k)}> {StructFlatView(p.Name, k, mixed)} = "
+                        + $"System.Runtime.InteropServices.MemoryMarshal.Cast<{p.StructType}, {ElemTypeName(k)}>({p.Name}.AsSpan());");
             }
         }
 

@@ -327,10 +327,9 @@ namespace IspcSharp.Generators
                 foreach (var v in decl.Declaration.Variables)
                 {
                     _structLocals[v.Identifier.Text] = t;
-                    string init = v.Initializer != null
-                        ? VecStruct(v.Initializer.Value).Code
-                        : "default";
-                    if (mask != null && v.Initializer != null)
+                    bool isDefault = v.Initializer == null || IsDefaultExpr(v.Initializer.Value);
+                    string init = isDefault ? "default" : VecStruct(v.Initializer.Value).Code;
+                    if (mask != null && !isDefault)
                         sb.AppendLine($"{indent}{si.VName} {v.Identifier.Text} = {si.VName}.Select({mask}, {init}, default);");
                     else
                         sb.AppendLine($"{indent}{si.VName} {v.Identifier.Text} = {init};");
@@ -461,6 +460,16 @@ namespace IspcSharp.Generators
                     EmitStructFieldStore(bn, bs, fma.Name.Identifier.Text, bidx, asg, op, mask, indent, sb);
                     return;
                 }
+            }
+
+            // Struct array-member element assignment: 's.field[k] = e;' (constant k) → the backing gang.
+            if (asg.Left is ElementAccessExpressionSyntax saea && TryStructArrayElement(saea, out var sagang, out var sakind))
+            {
+                string rhs = CombineCompoundOnExpr(op, sagang, asg, sakind);
+                sb.AppendLine(mask == null
+                    ? $"{indent}{sagang} = {rhs};"
+                    : $"{indent}{sagang} = {SelectOf(sakind)}({mask}, {rhs}, {sagang});");
+                return;
             }
 
             // Whole-struct store to a buffer element: 'buf[i] = <struct expr>;'
@@ -1064,6 +1073,9 @@ namespace IspcSharp.Generators
                     ? ("(VDouble.ProgramIndex + (double)__i)", SpmdGenerator.Kind.D)
                     : ("(VInt.ProgramIndex + __i)", SpmdGenerator.Kind.I),
 
+            // Struct array-member element: 's.field[k]' (constant k) → the backing gang 's.field_k'.
+            ElementAccessExpressionSyntax sae when TryStructArrayElement(sae, out var sag, out var sak) => (sag, sak),
+
             // Struct field access: 'v.field' on a struct local, or 'buf[i].field' on a struct buffer.
             MemberAccessExpressionSyntax sfa when TryStructFieldRead(sfa, out var sfr) => sfr,
 
@@ -1312,13 +1324,44 @@ namespace IspcSharp.Generators
             return ($"{SelectOf(kind)}({Mask(tern.Condition)}, {CoerceCode(t, kind, tern.WhenTrue)}, {CoerceCode(f, kind, tern.WhenFalse)})", kind);
         }
 
-        /// <summary>Lane kind of a struct field.</summary>
+        /// <summary>Lane kind of a scalar struct field. Array members must be indexed (<c>f[k]</c>).</summary>
         private SpmdGenerator.Kind FieldKind(string structType, string field, SyntaxNode at)
         {
             if (_structs.TryGetValue(structType, out var si))
                 foreach (var f in si.Fields)
-                    if (f.Name == field) return f.Kind;
+                    if (f.Name == field)
+                    {
+                        if (f.IsArray)
+                            throw new SpmdGenerator.UnsupportedConstructException(
+                                $"array member '{field}' used without an index (write '{field}[k]' with a constant k)", at.GetLocation());
+                        return f.Kind;
+                    }
             throw new SpmdGenerator.UnsupportedConstructException($"field '{field}' on struct '{structType}'", at.GetLocation());
+        }
+
+        /// <summary>Recognize element access into a struct-local array member: <c>s.field[k]</c> where
+        /// <c>s</c> is a struct local, <c>field</c> is a <c>[SpmdArray]</c> member, and <c>k</c> is a
+        /// compile-time integer literal. Yields the backing gang (<c>s.field_k</c>) and its lane kind.</summary>
+        private bool TryStructArrayElement(ElementAccessExpressionSyntax ea, out string gang, out SpmdGenerator.Kind kind)
+        {
+            gang = ""; kind = default;
+            if (ea.Expression is not MemberAccessExpressionSyntax ma) return false;
+            if (ma.Expression is not IdentifierNameSyntax sid) return false;
+            if (!_structLocals.TryGetValue(sid.Identifier.Text, out var st)) return false;
+            if (!_structs.TryGetValue(st, out var si)) return false;
+            var f = si.Fields.FirstOrDefault(x => x.Name == ma.Name.Identifier.Text);
+            if (f is null || !f.IsArray) return false;
+            if (ea.ArgumentList.Arguments.Count != 1) return false;
+            var idxExpr = ea.ArgumentList.Arguments[0].Expression;
+            if (idxExpr is not LiteralExpressionSyntax lit || !int.TryParse(lit.Token.ValueText, out int k))
+                throw new SpmdGenerator.UnsupportedConstructException(
+                    $"array-member index '{Trunc(idxExpr)}' must be a compile-time integer literal (SoA-in-registers has no runtime-indexed lane)", ea.GetLocation());
+            if (k < 0 || k >= f.ArrayLength)
+                throw new SpmdGenerator.UnsupportedConstructException(
+                    $"array-member index {k} out of range for '{f.Name}[{f.ArrayLength}]'", ea.GetLocation());
+            gang = $"{sid.Identifier.Text}.{f.GangName(k)}";
+            kind = f.Kind;
+            return true;
         }
 
         private string VName(string structType) => _structs[structType].VName;
@@ -1383,7 +1426,11 @@ namespace IspcSharp.Generators
                 throw new SpmdGenerator.UnsupportedConstructException($"'new {type}' (not a [SpmdStruct])", oc.GetLocation());
             string vt = si.VName;
 
-            // Object initializer: new S { x = a, y = b, ... }
+            // Zero-argument construction 'new S()' → all-zero gangs (same as 'default').
+            if (oc.Initializer == null && (oc.ArgumentList == null || oc.ArgumentList.Arguments.Count == 0))
+                return ("default", type);
+
+            // Object initializer: new S { x = a, arr = new float[]{ e0, e1, ... }, ... }
             if (oc.Initializer != null)
             {
                 var sets = new List<string>();
@@ -1391,12 +1438,29 @@ namespace IspcSharp.Generators
                 {
                     if (ex is not AssignmentExpressionSyntax a || a.Left is not IdentifierNameSyntax fn)
                         throw new SpmdGenerator.UnsupportedConstructException($"struct initializer '{Trunc(ex)}'", ex.GetLocation());
-                    var k = FieldKind(type, fn.Identifier.Text, ex);
-                    sets.Add($"{fn.Identifier.Text} = {Coerce(Vec(a.Right), k, a.Right)}");
+                    var field = si.Fields.FirstOrDefault(x => x.Name == fn.Identifier.Text)
+                        ?? throw new SpmdGenerator.UnsupportedConstructException($"field '{fn.Identifier.Text}' on struct '{type}'", ex.GetLocation());
+                    if (field.IsArray)
+                    {
+                        // 'arr = new float[N]' (sized, no initializer) → zero-filled; leave the gangs at
+                        // their default (0), matching the scalar array's zero-init, and emit no sets.
+                        if (a.Right is ArrayCreationExpressionSyntax { Initializer: null }) continue;
+                        // 'arr = new float[]{ e0, e1 }' → gang assignments 'arr_0 = e0, arr_1 = e1'.
+                        var elems = ExtractArrayElements(a.Right, field.ArrayLength);
+                        for (int i = 0; i < field.ArrayLength; i++)
+                            sets.Add($"{field.GangName(i)} = {Coerce(Vec(elems[i]), field.Kind, elems[i])}");
+                    }
+                    else
+                    {
+                        sets.Add($"{field.Name} = {Coerce(Vec(a.Right), field.Kind, a.Right)}");
+                    }
                 }
                 return ($"new {vt} {{ {string.Join(", ", sets)} }}", type);
             }
             // Positional constructor: new S(a, b, ...), args map to fields in declaration order.
+            if (si.HasArrayField)
+                throw new SpmdGenerator.UnsupportedConstructException(
+                    $"positional 'new {type}(...)' isn't supported for a struct with array members (use an object initializer, e.g. 'new {type} {{ f = new float[]{{ ... }} }}')", oc.GetLocation());
             var ctorArgs = oc.ArgumentList?.Arguments ?? default;
             if (ctorArgs.Count != si.Fields.Count)
                 throw new SpmdGenerator.UnsupportedConstructException(
@@ -1405,6 +1469,26 @@ namespace IspcSharp.Generators
             for (int i = 0; i < ctorArgs.Count; i++)
                 ctor.Add(Coerce(Vec(ctorArgs[i].Expression), si.Fields[i].Kind, ctorArgs[i].Expression));
             return ($"new {vt}({string.Join(", ", ctor)})", type);
+        }
+
+        /// <summary>Pull the N element expressions from an array-member initializer:
+        /// <c>new float[]{ ... }</c>, <c>new[]{ ... }</c>, or a bare <c>{ ... }</c> initializer.</summary>
+        private List<ExpressionSyntax> ExtractArrayElements(ExpressionSyntax e, int n)
+        {
+            List<ExpressionSyntax>? xs = e switch
+            {
+                ArrayCreationExpressionSyntax { Initializer: { } init } => init.Expressions.ToList(),
+                ImplicitArrayCreationExpressionSyntax { Initializer: { } init2 } => init2.Expressions.ToList(),
+                InitializerExpressionSyntax init3 => init3.Expressions.ToList(),
+                _ => null,
+            };
+            if (xs is null)
+                throw new SpmdGenerator.UnsupportedConstructException(
+                    $"array-member initializer '{Trunc(e)}' (use 'new float[]{{ ... }}')", e.GetLocation());
+            if (xs.Count != n)
+                throw new SpmdGenerator.UnsupportedConstructException(
+                    $"array-member initializer has {xs.Count} elements, expected {n}", e.GetLocation());
+            return xs;
         }
 
         /// <summary>Coerce a call's arguments to the helper's parameter types (primitive or struct).</summary>
@@ -1447,7 +1531,7 @@ namespace IspcSharp.Generators
             int n = si.Fields.Count;
             int fi = si.Fields.FindIndex(f => f.Name == field);
             var k = si.Fields[fi].Kind;
-            string flat = "__flat_" + bufName;
+            string flat = SpmdGenerator.StructFlatView(bufName, k, !si.AllSameKind);
             if (n == 1)
                 return $"{VType(k)}.Load({flat}, {baseIdx})";
             string idxVec = $"(({IntT}.ProgramIndex + ({baseIdx})) * {n} + {fi})";
@@ -1479,7 +1563,7 @@ namespace IspcSharp.Generators
             int n = si.Fields.Count;
             int fi = si.Fields.FindIndex(f => f.Name == field);
             var k = si.Fields[fi].Kind;
-            string flat = "__flat_" + bufName;
+            string flat = SpmdGenerator.StructFlatView(bufName, k, !si.AllSameKind);
             string vt = VType(k);
             if (n == 1)
             {
@@ -1685,6 +1769,10 @@ namespace IspcSharp.Generators
 
         private static ExpressionSyntax Unparen(ExpressionSyntax e)
             => e is ParenthesizedExpressionSyntax p ? Unparen(p.Expression) : e;
+
+        /// <summary>True for a <c>default</c> / <c>default(T)</c> initializer (a zeroed struct).</summary>
+        private static bool IsDefaultExpr(ExpressionSyntax e)
+            => e.IsKind(SyntaxKind.DefaultLiteralExpression) || e is DefaultExpressionSyntax;
 
         /// <summary>
         /// Lower buf[non-loop-index] to Memory.Gather(buf, indices).

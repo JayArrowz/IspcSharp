@@ -30,6 +30,24 @@ public struct Hit
     public int Id;
 }
 
+/// <summary>Struct built from reduction accumulators and returned from a kernel (ISPC export-style).</summary>
+[SpmdStruct]
+public struct Stats
+{
+    public float Sum;
+    public float Min;
+    public float Max;
+}
+
+/// <summary>ISPC-style fixed-size array members ([SpmdArray(N)]), including differently-typed arrays.</summary>
+[SpmdStruct]
+public struct Poly
+{
+    [SpmdArray(3)] public float[] Coef;   // 3 float gangs held SoA in registers
+    [SpmdArray(2)] public int[] Tag;      // 2 int gangs (different element type)
+    public float Bias;                    // plain scalar field alongside the arrays
+}
+
 public static partial class StructKernels
 {
     /// <summary>
@@ -209,6 +227,91 @@ public static partial class StructKernels
             z[i] = v.Z;
         }
     }
+
+    /// <summary>
+    /// Kernel: mixed-field struct buffer (Hit { float T; int Id; }[]), whole-struct read + write.
+    /// The float and int fields are gathered/scattered through their own correctly-typed flat views.
+    /// </summary>
+    [Spmd]
+    public static void BumpHits(Hit[] hits, float dt, int count)
+    {
+        foreach (var i in Spmd.Range(count))
+        {
+            Hit h = hits[i];            // whole-struct gather (float T + int Id)
+            h.T = h.T + dt;             // float field arithmetic
+            h.Id = h.Id + 1;            // int field arithmetic
+            hits[i] = h;                // whole-struct scatter
+        }
+    }
+
+    /// <summary>
+    /// Kernel: mixed-field struct buffer, single-field access on each differently-typed field.
+    /// </summary>
+    [Spmd]
+    public static void RetagHits(Hit[] hits, int delta, int count)
+    {
+        foreach (var i in Spmd.Range(count))
+        {
+            hits[i].Id = hits[i].Id + delta;    // int field gather + scatter
+            hits[i].T = hits[i].T * 2f;         // float field gather + scatter
+        }
+    }
+
+    /// <summary>
+    /// Kernel returning a [SpmdStruct] built from three reduction accumulators after the loop
+    /// (sum / min / max), the ISPC 'export a struct' pattern.
+    /// </summary>
+    [Spmd]
+    public static Stats Summarize(float[] a, int count)
+    {
+        float sum = 0f;
+        float mn = float.MaxValue;
+        float mx = float.NegativeInfinity;
+        foreach (var i in Spmd.Range(count))
+        {
+            sum += a[i];
+            mn = Math.Min(mn, a[i]);
+            mx = Math.Max(mx, a[i]);
+        }
+        return new Stats { Sum = sum, Min = mn, Max = mx };
+    }
+
+    /// <summary>Helper reading a struct's fixed-size array members by constant index.</summary>
+    [SpmdFunction]
+    public static float EvalPoly(Poly p, float x)
+        => p.Coef[0] + p.Coef[1] * x + p.Coef[2] * (x * x) + p.Bias;
+
+    /// <summary>
+    /// Kernel: build a struct with array members (array + sized-empty initializers), pass it to a
+    /// helper that indexes the array members, ISPC's struct-with-array-members feature.
+    /// </summary>
+    [Spmd]
+    public static void ApplyPoly(float[] c0, float[] c1, float[] c2, float[] bias, float[] x, float[] o, int count)
+    {
+        foreach (var i in Spmd.Range(count))
+        {
+            Poly p = new Poly { Coef = new float[] { c0[i], c1[i], c2[i] }, Tag = new int[2], Bias = bias[i] };
+            o[i] = EvalPoly(p, x[i]);
+        }
+    }
+
+    /// <summary>
+    /// Kernel: allocate a struct with array members, write each element (float and int arrays), read back.
+    /// </summary>
+    [Spmd]
+    public static void PolyTags(float[] x, float[] o, int[] tag, int count)
+    {
+        foreach (var i in Spmd.Range(count))
+        {
+            Poly p = new Poly { Coef = new float[3], Tag = new int[2], Bias = 0f };
+            p.Coef[0] = x[i];
+            p.Coef[1] = x[i] * 2f;
+            p.Tag[0] = i;
+            p.Tag[1] = i * 2;
+            o[i] = p.Coef[0] + p.Coef[1];
+            tag[i] = p.Tag[0] + p.Tag[1];
+        }
+    }
 }
 
 public class StructAndFunctionTests
@@ -330,6 +433,89 @@ public class StructAndFunctionTests
             Assert.Equal(ex[i], x[i], 3);
             Assert.Equal(ey[i], y[i], 3);
             Assert.Equal(ez[i], z[i], 3);
+        }
+    }
+
+    [Fact]
+    public void BumpHits_MixedFieldBuffer_MatchesScalar()
+    {
+        var r = new Random(11);
+        var hits = new Hit[N];
+        for (int i = 0; i < N; i++) hits[i] = new Hit { T = (float)(r.NextDouble() * 10), Id = i };
+        var (expT, expId) = (new float[N], new int[N]);
+        float dt = 1.25f;
+        for (int i = 0; i < N; i++) { expT[i] = hits[i].T + dt; expId[i] = hits[i].Id + 1; }
+        StructKernels.BumpHits_Simd(hits, dt, N);
+        for (int i = 0; i < N; i++)
+        {
+            Assert.Equal(expT[i], hits[i].T, 3);
+            Assert.Equal(expId[i], hits[i].Id);
+        }
+    }
+
+    [Fact]
+    public void RetagHits_MixedFieldBuffer_SingleFieldAccess()
+    {
+        var r = new Random(12);
+        var hits = new Hit[N];
+        for (int i = 0; i < N; i++) hits[i] = new Hit { T = (float)(r.NextDouble() * 4 - 2), Id = i * 3 };
+        var (expT, expId) = (new float[N], new int[N]);
+        int delta = 100;
+        for (int i = 0; i < N; i++) { expId[i] = hits[i].Id + delta; expT[i] = hits[i].T * 2f; }
+        StructKernels.RetagHits_Simd(hits, delta, N);
+        for (int i = 0; i < N; i++)
+        {
+            Assert.Equal(expId[i], hits[i].Id);
+            Assert.Equal(expT[i], hits[i].T, 3);
+        }
+    }
+
+    [Fact]
+    public void Summarize_ReturnsStruct_MatchesScalar()
+    {
+        var r = new Random(13);
+        float[] a = Rand(N, r);
+        float sum = 0f, mn = float.MaxValue, mx = float.NegativeInfinity;
+        for (int i = 0; i < N; i++) { sum += a[i]; mn = MathF.Min(mn, a[i]); mx = MathF.Max(mx, a[i]); }
+
+        Stats s = StructKernels.Summarize_Simd(a, N);
+        Assert.Equal(sum, s.Sum, 2);
+        Assert.Equal(mn, s.Min, 4);
+        Assert.Equal(mx, s.Max, 4);
+
+        // Parallel variant reassociates the sum across chunks, so compare with a relative tolerance;
+        // min/max are order-independent and stay exact.
+        Stats p = StructKernels.Summarize_ParallelSimd(a, N);
+        Assert.True(MathF.Abs(p.Sum - sum) <= 1e-3f * (1f + MathF.Abs(sum)), $"sum: {p.Sum} vs {sum}");
+        Assert.Equal(mn, p.Min, 4);
+        Assert.Equal(mx, p.Max, 4);
+    }
+
+    [Fact]
+    public void ApplyPoly_ArrayMembers_MatchesScalar()
+    {
+        var r = new Random(21);
+        float[] c0 = Rand(N, r), c1 = Rand(N, r), c2 = Rand(N, r), bias = Rand(N, r), x = Rand(N, r), o = new float[N];
+        StructKernels.ApplyPoly_Simd(c0, c1, c2, bias, x, o, N);
+        for (int i = 0; i < N; i++)
+        {
+            // Helper fuses coef*x terms into FMAs (single rounding), so use a relative tolerance.
+            float e = c0[i] + c1[i] * x[i] + c2[i] * (x[i] * x[i]) + bias[i];
+            Assert.True(MathF.Abs(o[i] - e) <= 1e-4f * (1f + MathF.Abs(e)), $"i={i}: {o[i]} vs {e}");
+        }
+    }
+
+    [Fact]
+    public void PolyTags_ArrayMemberWrites_MatchesScalar()
+    {
+        var r = new Random(22);
+        float[] x = Rand(N, r), o = new float[N];
+        int[] tag = new int[N];
+        StructKernels.PolyTags_Simd(x, o, tag, N);
+        for (int i = 0; i < N; i++)
+        {
+            Assert.Equal(x[i] + x[i] * 2f, o[i], 3);
+            Assert.Equal(i + i * 2, tag[i]);
         }
     }
 }
