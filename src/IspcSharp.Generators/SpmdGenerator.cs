@@ -1288,16 +1288,6 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         return SyntaxFactory.List(statements.Select(s => (StatementSyntax)rewriter.Visit(s)));
     }
 
-    private sealed class ReturnToGotoRewriter : CSharpSyntaxRewriter
-    {
-        public override SyntaxNode? VisitReturnStatement(ReturnStatementSyntax node)
-            => node.Expression == null
-                ? SyntaxFactory.GotoStatement(
-                    SyntaxKind.GotoStatement,
-                    SyntaxFactory.IdentifierName("__tail_next"))
-                : base.VisitReturnStatement(node);
-    }
-
     /// <summary>
     /// Rewrite 2-D array accesses <c>arr[i, j]</c> on the given params to flat-span indexing
     /// <c>__flat_arr[(i) * __cols_arr + (j)]</c>, the same view the vector loop loads through.
