@@ -44,6 +44,11 @@ Every benchmark compares the generated SIMD implementation against the original 
 
 Install the Nuget Packages, IspcSharp & IspcSharp.Generators
 
+For the generator to work it must be like this:
+```xml
+<PackageReference Include="IspcSharp.Generators" OutputItemType="Analyzer" ReferenceOutputAssembly="false" Version="1.0.4">
+```
+
 ## Usage
 
 ### Style 1, `[Spmd]` source generator (write scalar, get SIMD)
