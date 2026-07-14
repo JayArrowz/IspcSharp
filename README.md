@@ -27,7 +27,7 @@ The .NET JIT auto-vectorizes almost nothing beyond trivial loops. Hardware intri
 
 
 ## Performance
-Benchmarks are run automatically on Linux x64 (AVX2), Windows x64 (AVX2), and macOS ARM64 (Apple Silicon / NEON) using GitHub Actions [here](https://github.com/JayArrowz/IspcSharp/actions/runs/29269156291/attempts/1#summary-86884172028).
+Benchmarks are run automatically on Linux x64 (AVX2), Windows x64 (AVX2), and macOS ARM64 (Apple Silicon / NEON) using GitHub Actions [here](https://github.com/JayArrowz/IspcSharp/actions/runs/29326842215/attempts/2#summary-87066998054).
 
 Across the benchmark suite:
 
