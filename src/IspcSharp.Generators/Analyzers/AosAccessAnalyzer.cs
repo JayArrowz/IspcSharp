@@ -19,16 +19,8 @@ namespace IspcSharp.Generators.Analyzers;
 [DiagnosticAnalyzer(LanguageNames.CSharp)]
 public sealed class AosAccessAnalyzer : DiagnosticAnalyzer
 {
-    public static readonly DiagnosticDescriptor AosAccess = new(
-        "ISPC100",
-        "Array-of-Structs access in SPMD kernel",
-        "'{0}' accesses a field through an indexed element, an AoS pattern that becomes a per-lane gather. Restructure to Structure-of-Arrays (separate float[] per field, or SoaFloat2/SoaFloat3) for contiguous vector loads.",
-        "IspcSharp.Performance",
-        DiagnosticSeverity.Warning,
-        isEnabledByDefault: true);
-
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics
-        => ImmutableArray.Create(AosAccess);
+        => [Descriptors.AosAccess];
 
     public override void Initialize(AnalysisContext context)
     {

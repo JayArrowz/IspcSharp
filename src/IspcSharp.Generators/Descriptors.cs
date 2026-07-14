@@ -4,7 +4,6 @@ namespace IspcSharp.Generators;
 
 internal static class Descriptors
 {
-
     internal static readonly DiagnosticDescriptor NotPartial = new(
         "ISPC001", "Containing type must be partial",
         "[Spmd] method '{0}': the containing type must be declared 'partial' so generated code can be added",
@@ -49,4 +48,12 @@ internal static class Descriptors
         "ISPC104", "Double↔integer conversion in SPMD kernel",
         "'{0}' converts between double and 64-bit integer lanes ((int)/(long) cast), which has no encoding before AVX-512DQ and runs per-lane on AVX2 (Zen 1–3, Haswell–Comet Lake). Keep the value in double, or move the conversion out of the hot loop.",
         "IspcSharp.Performance", DiagnosticSeverity.Warning, true);
+
+    internal static readonly DiagnosticDescriptor AosAccess = new(
+        "ISPC100",
+        "Array-of-Structs access in SPMD kernel",
+        "'{0}' accesses a field through an indexed element, an AoS pattern that becomes a per-lane gather. Restructure to Structure-of-Arrays (separate float[] per field, or SoaFloat2/SoaFloat3) for contiguous vector loads.",
+        "IspcSharp.Performance",
+        DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
 }

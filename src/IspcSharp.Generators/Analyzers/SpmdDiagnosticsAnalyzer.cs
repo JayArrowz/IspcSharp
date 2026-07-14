@@ -17,7 +17,7 @@ namespace IspcSharp.Generators.Analyzers;
 [DiagnosticAnalyzer(LanguageNames.CSharp)]
 public sealed class SpmdDiagnosticsAnalyzer : DiagnosticAnalyzer
 {
-    public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics => ImmutableArray.Create(
+    public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics => [
         Descriptors.NotPartial,
         Descriptors.BadShape,
         Descriptors.Unsupported,
@@ -26,7 +26,8 @@ public sealed class SpmdDiagnosticsAnalyzer : DiagnosticAnalyzer
         Descriptors.GatherPerf,
         Descriptors.ScatterPerf,
         Descriptors.IntDividePerf,
-        Descriptors.DoubleConvertPerf);
+        Descriptors.DoubleConvertPerf
+    ];
 
     public override void Initialize(AnalysisContext context)
     {
