@@ -3,6 +3,10 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
 using System.Text;
+using IspcSharp.Generators.Contexts;
+using IspcSharp.Generators.Exceptions;
+using IspcSharp.Generators.Models;
+using IspcSharp.Generators.Rewriters;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -27,111 +31,111 @@ namespace IspcSharp.Generators;
 public sealed class SpmdGenerator : IIncrementalGenerator
 {
     private const string AttributeFullName = "IspcSharp.SpmdAttribute";
-
-    private static readonly DiagnosticDescriptor NotPartial = new(
-        "ISPC001", "Containing type must be partial",
-        "[Spmd] method '{0}': the containing type must be declared 'partial' so generated code can be added",
-        "IspcSharp", DiagnosticSeverity.Error, true);
-
-    private static readonly DiagnosticDescriptor BadShape = new(
-        "ISPC002", "Unsupported [Spmd] method shape",
-        "[Spmd] method '{0}': body must be [optional float/int/double locals], one 'foreach (var i in Spmd.Range(...))' or 'foreach (var (x, y) in Spmd.Range2D(...))' loop, then [optional trailing statements]",
-        "IspcSharp", DiagnosticSeverity.Error, true);
-
-    private static readonly DiagnosticDescriptor Unsupported = new(
-        "ISPC003", "Construct not vectorizable",
-        "[Spmd] method '{0}': {1} is not supported by the SPMD vectorizer (v0.2 subset). Rewrite it, or use the IspcSharp runtime API directly for full control.",
-        "IspcSharp", DiagnosticSeverity.Error, true);
-
-    private static readonly DiagnosticDescriptor BadParam = new(
-        "ISPC004", "Unsupported parameter type",
-        "[Spmd] method '{0}': parameter '{1}' has unsupported type '{2}'. Supported: float[]/int[]/double[], Span<T>/ReadOnlySpan<T> of float/int/double, and uniform float/int/double.",
-        "IspcSharp", DiagnosticSeverity.Error, true);
-
-    private static readonly DiagnosticDescriptor NoParallel = new(
-        "ISPC005", "Parallel variant skipped",
-        "[Spmd] method '{0}': {0}_ParallelSimd was not generated: {1}",
-        "IspcSharp", DiagnosticSeverity.Info, true);
-
-    internal static readonly DiagnosticDescriptor GatherPerf = new(
-        "ISPC101", "Gather (non-contiguous load) in SPMD kernel",
-        "'{0}' uses a lane-varying index, lowered to a per-lane gather (Memory.Gather), not a contiguous vector load. Make it contiguous (loop-variable/affine index, a transposed or SoA layout, or presorted indices) to avoid the gather.",
-        "IspcSharp.Performance", DiagnosticSeverity.Warning, true);
-
-    internal static readonly DiagnosticDescriptor ScatterPerf = new(
-        "ISPC102", "Scatter (non-contiguous store) in SPMD kernel",
-        "'{0}' is a lane-varying indexed store, lowered to a per-active-lane scatter (Memory.Scatter); .NET has no hardware scatter instruction. Restructure to a contiguous write where possible.",
-        "IspcSharp.Performance", DiagnosticSeverity.Warning, true);
-
-    internal static readonly DiagnosticDescriptor IntDividePerf = new(
-        "ISPC103", "Per-lane integer divide in SPMD kernel",
-        "integer '{0}' has no SIMD instruction and runs as a per-lane scalar loop. Expect scalar-ish throughput here; if the divisor is a constant power of two use a shift/mask instead.",
-        "IspcSharp.Performance", DiagnosticSeverity.Warning, true);
-
-    internal static readonly DiagnosticDescriptor DoubleConvertPerf = new(
-        "ISPC104", "Double↔integer conversion in SPMD kernel",
-        "'{0}' converts between double and 64-bit integer lanes ((int)/(long) cast), which has no encoding before AVX-512DQ and runs per-lane on AVX2 (Zen 1–3, Haswell–Comet Lake). Keep the value in double, or move the conversion out of the hot loop.",
-        "IspcSharp.Performance", DiagnosticSeverity.Warning, true);
+    private const string StructAttributeFullName = "IspcSharp.SpmdStructAttribute";
+    private const string FunctionAttributeFullName = "IspcSharp.SpmdFunctionAttribute";
 
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
         // Blittable [SpmdStruct] structs (parsed to name + primitive fields).
-        var structs = context.SyntaxProvider.CreateSyntaxProvider(
-            predicate: static (node, _) => node is StructDeclarationSyntax s && HasAttribute(s.AttributeLists, "SpmdStruct"),
-            transform: static (ctx, _) => StructInfo.From((StructDeclarationSyntax)ctx.Node))
+        var structs = context.SyntaxProvider.ForAttributeWithMetadataName(
+            StructAttributeFullName,
+            predicate: static (node, _) => node is StructDeclarationSyntax,
+            transform: static (ctx, _) => StructInfo.From((StructDeclarationSyntax)ctx.TargetNode))
             .Where(static s => s is not null)
             .Select(static (s, _) => s!)
-            .Collect();
+            .WithTrackingName("SpmdStructs");
 
         // [SpmdFunction] helpers.
-        var functions = context.SyntaxProvider.CreateSyntaxProvider(
-            predicate: static (node, _) => node is MethodDeclarationSyntax m && HasAttribute(m.AttributeLists, "SpmdFunction"),
-            transform: static (ctx, _) => FunctionInfo.From((MethodDeclarationSyntax)ctx.Node))
-            .Collect();
+        var functions = context.SyntaxProvider.ForAttributeWithMetadataName(
+            FunctionAttributeFullName,
+            predicate: static (node, _) => node is MethodDeclarationSyntax,
+            transform: static (ctx, _) => FunctionInfo.From((MethodDeclarationSyntax)ctx.TargetNode))
+            .WithTrackingName("SpmdFunctions");
 
-        var methods = context.SyntaxProvider.ForAttributeWithMetadataName(
+        // [Spmd] kernels.
+        var kernels = context.SyntaxProvider.ForAttributeWithMetadataName(
             AttributeFullName,
             predicate: static (node, _) => node is MethodDeclarationSyntax,
-            transform: static (ctx, _) => (MethodDeclarationSyntax)ctx.TargetNode);
+            transform: static (ctx, _) => KernelInfo.From((MethodDeclarationSyntax)ctx.TargetNode))
+            .WithTrackingName("SpmdKernels");
 
-        var tables = structs.Combine(functions);
+        var structTable = structs.Collect()
+            .Select(static (arr, _) => new EquatableReadOnlyList<StructInfo>(
+                [.. arr.OrderBy(s => s.Name, StringComparer.Ordinal)]))
+            .WithTrackingName("SpmdStructTable");
+        var functionTable = functions.Collect()
+            .Select(static (arr, _) => new EquatableReadOnlyList<FunctionInfo>(
+                [.. arr.OrderBy(f => f.Name, StringComparer.Ordinal)]))
+            .WithTrackingName("SpmdFunctionTable");
+
+        var tables = structTable.Combine(functionTable);
 
         // Varying companions for the blittable structs (one source file for all of them).
-        context.RegisterSourceOutput(structs, static (spc, all) => EmitStructCompanions(spc, all));
+        context.RegisterSourceOutput(structTable, static (spc, all) =>
+        {
+            string? src = EmitStructCompanions(all);
+            if (src != null)
+                spc.AddSource("__SpmdStructs.g.cs", SourceText.From(src, Encoding.UTF8));
+        });
 
         // Varying companions for the [SpmdFunction] helpers.
-        context.RegisterSourceOutput(functions.Combine(tables), static (spc, pair) =>
+        context.RegisterSourceOutput(tables, static (spc, pair) =>
         {
-            foreach (var fn in pair.Left)
+            var structMap = BuildStructMap(pair.Left);
+            var fnMap = BuildFunctionMap(pair.Right);
+            foreach (var fn in fnMap.Values)
             {
                 try
                 {
-                    EmitFunctionCompanion(spc, fn, pair.Right.Left, pair.Right.Right);
+                    var method = ParseMethod(fn.DeclarationText);
+                    if (method is null)
+                        continue;
+                    string? src = GenerateFunctionSource(fn, method, structMap, fnMap, DropDiagnostic);
+                    if (src != null)
+                        spc.AddSource($"{fn.Name}_SpmdFn.g.cs", SourceText.From(src, Encoding.UTF8));
                 }
-                catch (UnsupportedConstructException ex)
+                catch (UnsupportedConstructException)
                 {
-                    spc.ReportDiagnostic(Diagnostic.Create(
-                        Unsupported, ex.Location ?? fn.Syntax.GetLocation(), fn.Name, ex.What));
+                    // Reported (with a real location) by SpmdDiagnosticsAnalyzer.
                 }
             }
         });
 
         // [Spmd] kernels, with access to the struct/function tables.
-        context.RegisterSourceOutput(methods.Combine(tables), static (spc, pair) =>
+        context.RegisterSourceOutput(kernels.Combine(tables), static (spc, pair) =>
         {
-            var method = pair.Left;
+            var kernel = pair.Left;
             try
             {
-                Generate(spc, method, pair.Right.Left, pair.Right.Right);
+                var method = ParseMethod(kernel.MethodText);
+                if (method is null)
+                    return;
+                var structMap = BuildStructMap(pair.Right.Left);
+                var fnMap = BuildFunctionMap(pair.Right.Right);
+                string? src = GenerateKernelSource(kernel, method, structMap, fnMap, DropDiagnostic);
+                if (src != null)
+                    spc.AddSource($"{kernel.Name}_Spmd.g.cs", SourceText.From(src, Encoding.UTF8));
             }
-            catch (UnsupportedConstructException ex)
+            catch (UnsupportedConstructException)
             {
-                spc.ReportDiagnostic(Diagnostic.Create(
-                    Unsupported, ex.Location ?? method.GetLocation(),
-                    method.Identifier.Text, ex.What));
+                // Reported (with a real location) by SpmdDiagnosticsAnalyzer.
             }
         });
     }
+
+    /// <summary>
+    /// Diagnostic sink for generator-side runs: the analyzer owns reporting, so the
+    /// generation pass discards what the engine surfaces.
+    /// </summary>
+    private static void DropDiagnostic(Diagnostic _)
+    {
+    }
+
+    /// <summary>
+    /// Re-parse a pipeline model's declaration text back to a method node for emission.
+    /// </summary>
+    private static MethodDeclarationSyntax? ParseMethod(string declarationText)
+        => SyntaxFactory.ParseMemberDeclaration(declarationText) as MethodDeclarationSyntax;
 
     /// <summary>
     /// Read a <c>bool</c> named argument from the method's <c>[Spmd(...)]</c> attribute.
@@ -162,7 +166,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
     /// <summary>
     /// Syntactic attribute check (matches "Name" or "NameAttribute").
     /// </summary>
-    private static bool HasAttribute(SyntaxList<AttributeListSyntax> lists, string name)
+    internal static bool HasAttribute(SyntaxList<AttributeListSyntax> lists, string name)
     {
         foreach (var list in lists)
         {
@@ -180,94 +184,23 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         return false;
     }
 
-    internal enum Kind { F, I, D, L }
-    internal enum ParamKind
+    /// <summary>
+    /// The shared kernel engine: validates the [Spmd] method and emits its vectorized
+    /// companion source, surfacing diagnostics through <paramref name="report"/>. The
+    /// generator calls this with a discarding sink; SpmdDiagnosticsAnalyzer calls it with
+    /// the real method syntax and reports what it surfaces.
+    /// </summary>
+    internal static string? GenerateKernelSource(KernelInfo kernel, MethodDeclarationSyntax method,
+        Dictionary<string, StructInfo> structMap, Dictionary<string, FunctionInfo> fnMap,
+        Action<Diagnostic> report)
     {
-        FloatArray, FloatSpan, FloatReadOnlySpan,
-        IntArray, IntSpan, IntReadOnlySpan,
-        DoubleArray, DoubleSpan, DoubleReadOnlySpan,
-        LongArray, LongSpan, LongReadOnlySpan,
-        FloatArray2D, IntArray2D, DoubleArray2D, LongArray2D,
-        UniformFloat, UniformInt, UniformDouble, UniformLong, StructArray, Unsupported
-    }
-
-    internal readonly struct ParamInfo(string name, ParamKind kind, string typeText, string? structType = null)
-    {
-        public readonly string Name = name;
-        public readonly ParamKind PKind = kind;
-        public readonly string TypeText = typeText;
-
-        /// <summary>
-        /// Element struct type name for a <see cref="ParamKind.StructArray"/> parameter.
-        /// </summary>
-        public readonly string? StructType = structType;
-
-        public bool IsStructBuffer => PKind == ParamKind.StructArray;
-
-        public bool Is2D => PKind is ParamKind.FloatArray2D or ParamKind.IntArray2D or ParamKind.DoubleArray2D or ParamKind.LongArray2D;
-
-        public bool IsBuffer => PKind is ParamKind.FloatArray or ParamKind.FloatSpan or ParamKind.FloatReadOnlySpan
-                                      or ParamKind.IntArray or ParamKind.IntSpan or ParamKind.IntReadOnlySpan
-                                      or ParamKind.DoubleArray or ParamKind.DoubleSpan or ParamKind.DoubleReadOnlySpan
-                                      or ParamKind.LongArray or ParamKind.LongSpan or ParamKind.LongReadOnlySpan
-                                      or ParamKind.FloatArray2D or ParamKind.IntArray2D or ParamKind.DoubleArray2D or ParamKind.LongArray2D;
-
-        public bool IsReadOnly => PKind is ParamKind.FloatReadOnlySpan or ParamKind.IntReadOnlySpan or ParamKind.DoubleReadOnlySpan or ParamKind.LongReadOnlySpan;
-
-        public bool IsSpan => PKind is ParamKind.FloatSpan or ParamKind.FloatReadOnlySpan
-                                    or ParamKind.IntSpan or ParamKind.IntReadOnlySpan
-                                    or ParamKind.DoubleSpan or ParamKind.DoubleReadOnlySpan
-                                    or ParamKind.LongSpan or ParamKind.LongReadOnlySpan;
-
-        public Kind ElemKind => PKind switch
-        {
-            ParamKind.IntArray or ParamKind.IntSpan or ParamKind.IntReadOnlySpan or ParamKind.IntArray2D => Kind.I,
-            ParamKind.DoubleArray or ParamKind.DoubleSpan or ParamKind.DoubleReadOnlySpan or ParamKind.DoubleArray2D => Kind.D,
-            ParamKind.LongArray or ParamKind.LongSpan or ParamKind.LongReadOnlySpan or ParamKind.LongArray2D => Kind.L,
-            _ => Kind.F,
-        };
-
-        /// <summary>
-        /// The flat 1-D span name used to view a 2-D array's row-major storage.
-        /// </summary>
-        public string FlatName => "__flat_" + Name;
-
-        /// <summary>
-        /// The local holding the 2-D array's column count (GetLength(1)).
-        /// </summary>
-        public string ColsName => "__cols_" + Name;
-    }
-
-    internal enum ReduceOp { Add, Min, Max }
-
-    internal sealed class ReductionInfo
-    {
-        public string Name { get; set; } = "";
-        public Kind LaneKind { get; set; }
-        public ReduceOp Op { get; set; }
-    }
-
-    internal sealed class UnsupportedConstructException(string what, Location? loc = null) : Exception
-    {
-        public string What { get; } = what;
-        public Location? Location { get; } = loc;
-    }
-
-    private static void Generate(SourceProductionContext spc, MethodDeclarationSyntax method,
-        ImmutableArray<StructInfo> structsArr, ImmutableArray<FunctionInfo> functionsArr)
-    {
-        string name = method.Identifier.Text;
+        string name = kernel.Name;
         var location = method.GetLocation();
-        var structMap = BuildStructMap(structsArr);
-        var fnMap = functionsArr.IsDefaultOrEmpty
-            ? []
-            : functionsArr.GroupBy(f => f.Name).ToDictionary(g => g.Key, g => g.First());
 
-        if (method.Parent is not TypeDeclarationSyntax type ||
-            !type.Modifiers.Any(SyntaxKind.PartialKeyword))
+        if (!kernel.TypeIsPartial)
         {
-            spc.ReportDiagnostic(Diagnostic.Create(NotPartial, location, name));
-            return;
+            report(Diagnostic.Create(Descriptors.NotPartial, location, name));
+            return null;
         }
 
         var paramInfos = new List<ParamInfo>();
@@ -327,8 +260,8 @@ public sealed class SpmdGenerator : IIncrementalGenerator
 
             if (kind == ParamKind.Unsupported)
             {
-                spc.ReportDiagnostic(Diagnostic.Create(BadParam, p.GetLocation(), name, p.Identifier.Text, t));
-                return;
+                report(Diagnostic.Create(Descriptors.BadParam, p.GetLocation(), name, p.Identifier.Text, t));
+                return null;
             }
 
             paramInfos.Add(new ParamInfo(p.Identifier.Text, kind, p.Type!.ToString(), structElem));
@@ -336,8 +269,8 @@ public sealed class SpmdGenerator : IIncrementalGenerator
 
         if (method.Body is null)
         {
-            spc.ReportDiagnostic(Diagnostic.Create(BadShape, location, name));
-            return;
+            report(Diagnostic.Create(Descriptors.BadShape, location, name));
+            return null;
         }
 
         // Find the single Spmd.Range* loop, it may be nested inside uniform control flow
@@ -347,8 +280,8 @@ public sealed class SpmdGenerator : IIncrementalGenerator
             .ToList();
         if (spmdForeaches.Count == 0)
         {
-            spc.ReportDiagnostic(Diagnostic.Create(BadShape, location, name));
-            return;
+            report(Diagnostic.Create(Descriptors.BadShape, location, name));
+            return null;
         }
 
         if (spmdForeaches.Count > 1)
@@ -432,8 +365,8 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         }
         else
         {
-            spc.ReportDiagnostic(Diagnostic.Create(BadShape, location, name));
-            return;
+            report(Diagnostic.Create(Descriptors.BadShape, location, name));
+            return null;
         }
 
         string returnType = method.ReturnType.ToString();
@@ -535,7 +468,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         var emitter = new VectorBodyEmitter(loopVar, paramInfos, uniformPreLocals, preLocals, reductions, doubleMode, longMode, structMap, fnMap, streaming);
         string vectorBody = emitter.EmitStatements(body, maskExpr: null, indent: "            ");
         foreach (var diag in emitter.Diagnostics)
-            spc.ReportDiagnostic(diag);
+            report(diag);
 
         // Per-lane 'return' retires one element. In the scalar tail that must advance to
         // the NEXT element (not exit the method), so bare returns become 'goto __tail_next;'
@@ -553,11 +486,12 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         bool hasSpanParams = paramInfos.Any(p => p.IsSpan);
         string paramDecl = string.Join(", ", paramInfos.Select(p => $"{p.TypeText} {p.Name}"));
         string paramPass = string.Join(", ", paramInfos.Select(p => p.Name));
-        string ns = GetNamespace(type);
-        string typeHeader = $"{type.Modifiers} {type.Keyword.Text} {type.Identifier.Text}";
+        string ns = kernel.Namespace;
+        string typeHeader = kernel.TypeHeader;
 
         var src = new StringBuilder();
         _ = src.AppendLine("// <auto-generated by IspcSharp.Generators, do not edit>");
+        _ = src.AppendLine("#pragma warning disable 1591, 0419   // generated companions carry no full xmldoc");
         _ = src.AppendLine("using System;");
         _ = src.AppendLine("using IspcSharp;");
         _ = src.AppendLine();
@@ -634,22 +568,22 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         bool wantParallel = WantsParallel(method);
         if (!simpleShape)
         {
-            spc.ReportDiagnostic(Diagnostic.Create(NoParallel, location, name,
+            report(Diagnostic.Create(Descriptors.NoParallel, location, name,
                 "the vectorized loop is nested in uniform control flow; only _Simd is generated (parallelize the outer loop yourself)"));
         }
         else if (paramInfos.Any(p => p.Is2D))
         {
-            spc.ReportDiagnostic(Diagnostic.Create(NoParallel, location, name,
+            report(Diagnostic.Create(Descriptors.NoParallel, location, name,
                 "2D-array buffers use a flat-span view that cannot be captured across threads; only _Simd is generated"));
         }
         else if (paramInfos.Any(p => p.IsStructBuffer))
         {
-            spc.ReportDiagnostic(Diagnostic.Create(NoParallel, location, name,
+            report(Diagnostic.Create(Descriptors.NoParallel, location, name,
                 "struct buffers use a flat-span view that cannot be captured across threads; only _Simd is generated (parallelize the outer loop yourself)"));
         }
         else if (wantParallel && hasSpanParams)
         {
-            spc.ReportDiagnostic(Diagnostic.Create(NoParallel, location, name,
+            report(Diagnostic.Create(Descriptors.NoParallel, location, name,
                 "Span parameters cannot be captured across threads; use float[]/int[]"));
         }
         else if (wantParallel)
@@ -773,7 +707,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         if (ns.Length > 0)
             _ = src.AppendLine("}");
 
-        spc.AddSource($"{name}_Spmd.g.cs", SourceText.From(src.ToString(), Encoding.UTF8));
+        return src.ToString();
     }
 
     private static void EmitLoopCore(StringBuilder src, string ind, string startExpr, string endExpr,
@@ -936,14 +870,15 @@ public sealed class SpmdGenerator : IIncrementalGenerator
     /// <summary>
     /// Emit the varying companion struct (<c>Name__V</c>) for every blittable struct.
     /// </summary>
-    private static void EmitStructCompanions(SourceProductionContext spc, ImmutableArray<StructInfo> structs)
+    internal static string? EmitStructCompanions(IReadOnlyList<StructInfo> structs)
     {
-        if (structs.IsDefaultOrEmpty)
-            return;
+        if (structs.Count == 0)
+            return null;
         var byName = structs.GroupBy(s => s.Name).Select(g => g.First()).ToList();
 
         var src = new StringBuilder();
         _ = src.AppendLine("// <auto-generated by IspcSharp.Generators, do not edit>");
+        _ = src.AppendLine("#pragma warning disable 1591, 0419   // generated companions carry no full xmldoc");
         _ = src.AppendLine("using System;");
         _ = src.AppendLine("using IspcSharp;");
         _ = src.AppendLine();
@@ -986,25 +921,23 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 _ = src.AppendLine("}");
         }
 
-        spc.AddSource("__SpmdStructs.g.cs", SourceText.From(src.ToString(), Encoding.UTF8));
+        return src.ToString();
     }
 
     /// <summary>
-    /// Emit the varying companion of one <c>[SpmdFunction]</c> helper.
+    /// Emit the varying companion of one <c>[SpmdFunction]</c> helper. Same dual-caller
+    /// contract as <see cref="GenerateKernelSource"/>: the generator discards diagnostics,
+    /// the analyzer reports them.
     /// </summary>
-    private static void EmitFunctionCompanion(SourceProductionContext spc, FunctionInfo fn,
-        ImmutableArray<StructInfo> structs, ImmutableArray<FunctionInfo> functions)
+    internal static string? GenerateFunctionSource(FunctionInfo fn, MethodDeclarationSyntax method,
+        Dictionary<string, StructInfo> structMap, Dictionary<string, FunctionInfo> fnMap,
+        Action<Diagnostic> report)
     {
-        var method = fn.Syntax;
-        if (method.Parent is not TypeDeclarationSyntax type ||
-            !type.Modifiers.Any(SyntaxKind.PartialKeyword))
+        if (!fn.TypeIsPartial)
         {
-            spc.ReportDiagnostic(Diagnostic.Create(NotPartial, method.GetLocation(), fn.Name));
-            return;
+            report(Diagnostic.Create(Descriptors.NotPartial, method.GetLocation(), fn.Name));
+            return null;
         }
-
-        var structMap = BuildStructMap(structs);
-        var fnMap = functions.GroupBy(f => f.Name).ToDictionary(g => g.Key, g => g.First());
 
         if (method.Body is null && method.ExpressionBody is null)
             throw new UnsupportedConstructException("[SpmdFunction] with no body", method.GetLocation());
@@ -1030,11 +963,12 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         var emitter = new VectorBodyEmitter(structMap, fnMap, paramLocals, paramStructs);
         string body = emitter.EmitFunctionBody(method, "            ");
         foreach (var diag in emitter.Diagnostics)
-            spc.ReportDiagnostic(diag);
+            report(diag);
 
-        string ns = GetNamespace(type);
+        string ns = fn.Namespace;
         var src = new StringBuilder();
         _ = src.AppendLine("// <auto-generated by IspcSharp.Generators, do not edit>");
+        _ = src.AppendLine("#pragma warning disable 1591, 0419   // generated companions carry no full xmldoc");
         _ = src.AppendLine("using System;");
         _ = src.AppendLine("using IspcSharp;");
         _ = src.AppendLine();
@@ -1044,7 +978,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
             _ = src.AppendLine("{");
         }
 
-        _ = src.AppendLine($"{type.Modifiers} {type.Keyword.Text} {type.Identifier.Text}");
+        _ = src.AppendLine(fn.TypeHeader);
         _ = src.AppendLine("{");
         _ = src.AppendLine($"    /// <summary>Varying companion of <see cref=\"{fn.Name}\"/> (generated).</summary>");
         _ = src.AppendLine($"    public static {vret} {fn.Name}({vparams})");
@@ -1055,13 +989,14 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         if (ns.Length > 0)
             _ = src.AppendLine("}");
 
-        spc.AddSource($"{fn.Name}_SpmdFn.g.cs", SourceText.From(src.ToString(), Encoding.UTF8));
+        return src.ToString();
     }
 
-    internal static Dictionary<string, StructInfo> BuildStructMap(ImmutableArray<StructInfo> structs)
-        => structs.IsDefaultOrEmpty
-            ? []
-            : structs.GroupBy(s => s.Name).ToDictionary(g => g.Key, g => g.First());
+    internal static Dictionary<string, StructInfo> BuildStructMap(IEnumerable<StructInfo> structs)
+        => structs.GroupBy(s => s.Name).ToDictionary(g => g.Key, g => g.First());
+
+    internal static Dictionary<string, FunctionInfo> BuildFunctionMap(IEnumerable<FunctionInfo> functions)
+        => functions.GroupBy(f => f.Name).ToDictionary(g => g.Key, g => g.First());
 
     internal static Kind KindOfScalar(string t, Location loc) => t switch
     {
@@ -1287,18 +1222,6 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         return true;
     }
 
-    private static string GetNamespace(SyntaxNode node)
-    {
-        var parts = new List<string>();
-        for (var n = node.Parent; n != null; n = n.Parent)
-        {
-            if (n is BaseNamespaceDeclarationSyntax nds)
-                parts.Insert(0, nds.Name.ToString());
-        }
-
-        return string.Join(".", parts);
-    }
-
     private static string Reindent(SyntaxList<StatementSyntax> statements, string indent)
     {
         var sb = new StringBuilder();
@@ -1386,27 +1309,6 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         return SyntaxFactory.List(statements.Select(s => (StatementSyntax)rewriter.Visit(s)));
     }
 
-    private sealed class TwoDToFlatRewriter(Dictionary<string, (string Flat, string Cols)> map) : CSharpSyntaxRewriter
-    {
-        private readonly Dictionary<string, (string Flat, string Cols)> _map = map;
-
-        public override SyntaxNode? VisitElementAccessExpression(ElementAccessExpressionSyntax node)
-        {
-            var visited = (ElementAccessExpressionSyntax)base.VisitElementAccessExpression(node)!;
-            if (visited.Expression is IdentifierNameSyntax id &&
-                _map.TryGetValue(id.Identifier.Text, out var m) &&
-                visited.ArgumentList.Arguments.Count == 2)
-            {
-                var row = visited.ArgumentList.Arguments[0].Expression;
-                var col = visited.ArgumentList.Arguments[1].Expression;
-                return SyntaxFactory.ParseExpression($"{m.Flat}[({row}) * {m.Cols} + ({col})]")
-                    .WithTriviaFrom(visited);
-            }
-
-            return visited;
-        }
-    }
-
     /// <summary>
     /// Rewrite every occurrence of the given identifiers to '{prefix}{name}'.
     /// </summary>
@@ -1415,17 +1317,6 @@ public sealed class SpmdGenerator : IIncrementalGenerator
     {
         var rewriter = new IdentifierRenameRewriter([.. names], prefix);
         return SyntaxFactory.List(statements.Select(s => (StatementSyntax)rewriter.Visit(s)));
-    }
-
-    private sealed class IdentifierRenameRewriter(HashSet<string> names, string prefix) : CSharpSyntaxRewriter
-    {
-        private readonly HashSet<string> _names = names;
-        private readonly string _prefix = prefix;
-
-        public override SyntaxNode? VisitIdentifierName(IdentifierNameSyntax node)
-            => _names.Contains(node.Identifier.Text)
-                ? node.WithIdentifier(SyntaxFactory.Identifier(_prefix + node.Identifier.Text))
-                : base.VisitIdentifierName(node);
     }
 
     private static bool IsSpmdRangeCallee(InvocationExpressionSyntax inv)
@@ -1495,34 +1386,6 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                     + $"System.Runtime.InteropServices.MemoryMarshal.Cast<{p.StructType}, {ElemTypeName(k)}>({p.Name}.AsSpan());");
             }
         }
-    }
-
-    private sealed class ScaffoldContext(
-        CommonForEachStatementSyntax fe,
-        string loopVar,
-        string startExpr,
-        string endExpr,
-        string vectorBody,
-        string scalarBody,
-        List<ReductionInfo> reductions,
-        string laneCountExpr,
-        bool doubleMode,
-        bool longMode,
-        int unroll,
-        bool hasLaneReturns)
-    {
-        public readonly CommonForEachStatementSyntax Fe = fe;
-        public readonly string LoopVar = loopVar;
-        public readonly string StartExpr = startExpr;
-        public readonly string EndExpr = endExpr;
-        public readonly string VectorBody = vectorBody;
-        public readonly string ScalarBody = scalarBody;
-        public readonly string LaneCountExpr = laneCountExpr;
-        public readonly List<ReductionInfo> Reductions = reductions;
-        public readonly bool DoubleMode = doubleMode;
-        public readonly bool LongMode = longMode;
-        public readonly bool HasLaneReturns = hasLaneReturns;
-        public readonly int Unroll = unroll;
     }
 
     private static void EmitScaffold(StringBuilder src, IEnumerable<StatementSyntax> statements, string indent, ScaffoldContext ctx)
