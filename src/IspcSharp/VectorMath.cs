@@ -328,9 +328,17 @@ namespace IspcSharp
         }
 
         /// <summary>
-        /// Per-lane e^x. Cephes-style: range-reduced (x = k*ln2 + r, split-constant subtraction)
-        /// + rational P/Q approximation + exponent bit assembly. Accurate to ~1-2 ulp for
-        /// x in [-708, 709]; clamps outside to avoid Inf/denormal bit tricks.
+        /// Per-lane e^x. Range-reduced (x = k*ln2 + r, split-constant subtraction) + a divide-free
+        /// degree-11 Taylor polynomial for exp(r) + exponent bit assembly. Accurate to ~1e-14 relative
+        /// (a few ulp) for x in [-708, 709]; clamps outside to avoid Inf/denormal bit tricks.
+        ///
+        /// The reduced-argument evaluation is a polynomial, not a Cephes P/Q rational: the rational
+        /// form needed a vector divide (the slowest lane op, and only 2-4 lanes wide for doubles),
+        /// which made the double exp — and everything built on it (Sigmoid, Tanh, Pow, Tonemap) —
+        /// throughput-bound on the divide unit. Two independent Horner chains in r² (even/odd powers)
+        /// keep the dependency chain short and use both FMA ports, matching the float exp's shape.
+        /// Degree 11 (not 13) is the throughput sweet spot: it holds ~1e-14 relative here (well inside
+        /// the 1e-13 double contract) while the two extra terms of degree 13 only cost FMA throughput.
         /// </summary>
         public static VDouble Exp(VDouble x)
         {
@@ -345,17 +353,22 @@ namespace IspcSharp
             var ki = (Vector.AsVectorInt64(t.V) - s_roundMagicBits) + new Vector<long>(1023L);
             var r = x - k * new VDouble(LnTwoHiD) - k * new VDouble(LnTwoLoD); // r in [-ln2/2, ln2/2]
 
-            // exp(r) = 1 + 2r·P(r²) / (Q(r²) − r·P(r²))   (Cephes rational approximation)
+            // exp(r) = Σ r^n/n! to degree 11 (truncation ~6e-15 over |r| <= ln2/2, well under the
+            // 1e-13 double contract). Evaluated as even(r²) + r·odd(r²), two independent chains.
             var r2 = r * r;
-            var p = new VDouble(1.26177193074810590878e-4);
-            p = VDouble.MulAdd(p, r2, new VDouble(3.02994407707441961300e-2));
-            p = VDouble.MulAdd(p, r2, new VDouble(9.99999999999999999910e-1));
-            var px = r * p;
-            var q = new VDouble(3.00198505138664455042e-6);
-            q = VDouble.MulAdd(q, r2, new VDouble(2.52448340349684104192e-3));
-            q = VDouble.MulAdd(q, r2, new VDouble(2.27265548208155028766e-1));
-            q = VDouble.MulAdd(q, r2, new VDouble(2.00000000000000000005));
-            var expR = VDouble.One + (px + px) / (q - px);
+            var po = new VDouble(1.0 / 39916800.0);                // 1/11!
+            po = VDouble.MulAdd(po, r2, new VDouble(1.0 / 362880.0));     // 1/9!
+            po = VDouble.MulAdd(po, r2, new VDouble(1.0 / 5040.0));       // 1/7!
+            po = VDouble.MulAdd(po, r2, new VDouble(1.0 / 120.0));        // 1/5!
+            po = VDouble.MulAdd(po, r2, new VDouble(1.0 / 6.0));          // 1/3!
+            po = VDouble.MulAdd(po, r2, VDouble.One);                     // 1/1!
+            var pe = new VDouble(1.0 / 3628800.0);                 // 1/10!
+            pe = VDouble.MulAdd(pe, r2, new VDouble(1.0 / 40320.0));      // 1/8!
+            pe = VDouble.MulAdd(pe, r2, new VDouble(1.0 / 720.0));        // 1/6!
+            pe = VDouble.MulAdd(pe, r2, new VDouble(1.0 / 24.0));         // 1/4!
+            pe = VDouble.MulAdd(pe, r2, new VDouble(0.5));                // 1/2!
+            pe = VDouble.MulAdd(pe, r2, VDouble.One);                     // 1/0!
+            var expR = VDouble.MulAdd(r, po, pe);                         // even(r²) + r·odd(r²)
 
             // 2^k via IEEE754 bits: (k + 1023) << 52.
 #if NET8_0_OR_GREATER
