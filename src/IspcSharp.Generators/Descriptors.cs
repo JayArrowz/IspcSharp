@@ -21,7 +21,7 @@ internal static class Descriptors
 
     internal static readonly DiagnosticDescriptor BadParam = new(
         "ISPC004", "Unsupported parameter type",
-        "[Spmd] method '{0}': parameter '{1}' has unsupported type '{2}'. Supported: float[]/int[]/double[], Span<T>/ReadOnlySpan<T> of float/int/double, and uniform float/int/double.",
+        "[Spmd] method '{0}': parameter '{1}' has unsupported type '{2}'. Supported: float[]/int[]/double[]/long[]/byte[]/short[], Span<T>/ReadOnlySpan<T> of those, and uniform float/int/double/long/byte/short.",
         "IspcSharp", DiagnosticSeverity.Error, true);
 
     internal static readonly DiagnosticDescriptor NoParallel = new(

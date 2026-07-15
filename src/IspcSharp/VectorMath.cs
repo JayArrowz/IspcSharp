@@ -35,6 +35,9 @@ public static class VectorMath
     public static VFloat Clamp(VFloat x, VFloat lo, VFloat hi) => Min(Max(x, lo), hi);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VInt Clamp(VInt x, VInt lo, VInt hi) => Min(Max(x, lo), hi);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VFloat Lerp(VFloat a, VFloat b, VFloat t) => a + ((b - a) * t);
 
     /// <summary>

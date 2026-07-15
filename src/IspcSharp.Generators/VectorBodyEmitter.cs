@@ -370,10 +370,11 @@ internal sealed class VectorBodyEmitter
             "int" => Kind.I,
             "double" => Kind.D,
             "long" => Kind.L,
+            "byte" or "sbyte" or "short" or "ushort" => Kind.I,
             "var" => throw new UnsupportedConstructException(
-                "'var' local (declare as float, int, double, long, or a [SpmdStruct] type)", decl.GetLocation()),
+                "'var' local (declare as float, int, double, long, byte, short, or a [SpmdStruct] type)", decl.GetLocation()),
             _ => throw new UnsupportedConstructException(
-                $"local of type '{t}' (only float/int/double/long and [SpmdStruct] locals)", decl.GetLocation()),
+                $"local of type '{t}' (only float/int/double/long/byte/short and [SpmdStruct] locals)", decl.GetLocation()),
         };
         if (_l && kind != Kind.L)
         {
@@ -626,16 +627,21 @@ internal sealed class VectorBodyEmitter
                 throw new UnsupportedConstructException($"store to ReadOnlySpan '{bufName}'", asg.GetLocation());
 
             var ek = p.ElemKind;
-            string vtype = VType(ek);
-            string load = $"{vtype}.Load({bufName}, {storeIdx})";
-            string rhs = CombineCompoundOnExpr(op, load, asg, ek);
+            bool narrowStore = ek is Kind.B or Kind.S;
+            var laneKind = narrowStore ? Kind.I : ek;
+            string vtype = VType(laneKind);
+            string load = LoadBuffer(p, bufName, storeIdx).Item1;
+            string rhs = CombineCompoundOnExpr(op, load, asg, laneKind);
             // Streaming: a full-gang, non-compound contiguous write to a float/double buffer can use a
             // non-temporal store (cache-bypassing). Masked/compound/other paths keep the ordinary store.
-            string store = _streaming && op == "=" && ek is Kind.F or Kind.D
+            string store = narrowStore
+                ? "StoreNarrow"
+                : _streaming && op == "=" && ek is Kind.F or Kind.D
                 ? "StoreNonTemporal" : "Store";
+            string maskedStore = narrowStore ? "StoreNarrow" : "Store";
             _ = mask == null
                 ? sb.AppendLine($"{indent}({rhs}).{store}({bufName}, {storeIdx});")
-                : sb.AppendLine($"{indent}{vtype}.Select({mask}, {rhs}, {load}).Store({bufName}, {storeIdx});");
+                : sb.AppendLine($"{indent}{vtype}.Select({mask}, {rhs}, {load}).{maskedStore}({bufName}, {storeIdx});");
             return;
         }
 
@@ -654,6 +660,13 @@ internal sealed class VectorBodyEmitter
             {
                 throw new UnsupportedConstructException(
                     $"compound scatter '{op}' on '{scatterId.Identifier.Text}' (only '=' supported for indexed stores)", asg.GetLocation());
+            }
+
+            if (scatterParam.ElemKind is Kind.B or Kind.S)
+            {
+                throw new UnsupportedConstructException(
+                    $"lane-varying indexed store into byte/short buffer '{scatterId.Identifier.Text}' (no 8/16-bit scatter; stage through an int[] or restructure to contiguous writes)",
+                    eaScatter.GetLocation());
             }
 
             Warn(Descriptors.ScatterPerf, eaScatter, eaScatter.ToString());
@@ -1149,13 +1162,15 @@ internal sealed class VectorBodyEmitter
                                              or ParamKind.UniformInt
                                              or ParamKind.UniformDouble
                                              or ParamKind.UniformLong
+                                             or ParamKind.UniformByte
+                                             or ParamKind.UniformShort
             => Broadcast(id.Identifier.Text, _l
                     ? Kind.L
                     : _d
                     ? Kind.D
                     : p.PKind switch
                     {
-                        ParamKind.UniformInt => Kind.I,
+                        ParamKind.UniformInt or ParamKind.UniformByte or ParamKind.UniformShort => Kind.I,
                         ParamKind.UniformDouble => Kind.D,
                         ParamKind.UniformLong => Kind.L,
                         _ => Kind.F,
@@ -1189,7 +1204,7 @@ internal sealed class VectorBodyEmitter
 
         ElementAccessExpressionSyntax ea when TryGetContiguousIndex(ea, out string? buf, out string? idx) &&
                                               _params.TryGetValue(buf, out var p) && p.IsBuffer
-            => ($"{VType(p.ElemKind)}.Load({buf}, {idx})", p.ElemKind),
+            => LoadBuffer(p, buf, idx),
 
         // Gather: buf[non-loop-index], lowered to Memory.Gather(buf, indices).
         ElementAccessExpressionSyntax eaGather when
@@ -1204,6 +1219,13 @@ internal sealed class VectorBodyEmitter
         InvocationExpressionSyntax call => VecCall(call),
 
         _ => throw new UnsupportedConstructException($"expression '{Trunc(e)}' ({e.Kind()})", e.GetLocation()),
+    };
+
+    private (string, Kind) LoadBuffer(ParamInfo p, string buf, string idx) => p.ElemKind switch
+    {
+        Kind.B => ($"VInt.LoadZeroExtend({buf}, {idx})", Kind.I),
+        Kind.S => ($"VInt.LoadSignExtend({buf}, {idx})", Kind.I),
+        _ => ($"{VType(p.ElemKind)}.Load({buf}, {idx})", p.ElemKind),
     };
 
     private static (string, Kind) WrapParen((string Code, Kind Kind) inner)
@@ -1299,6 +1321,10 @@ internal sealed class VectorBodyEmitter
                 "float" => ($"({inner.Code}).ToFloat()", Kind.F),
                 "int" => ($"({inner.Code}).ToIntTruncate()", Kind.I),
                 "double" => (inner.Code, Kind.D),
+                "byte" => ($"((({inner.Code}).ToIntTruncate()) & new VInt(0xFF))", Kind.I),
+                "ushort" => ($"((({inner.Code}).ToIntTruncate()) & new VInt(0xFFFF))", Kind.I),
+                "sbyte" => ($"(((({inner.Code}).ToIntTruncate()) << 24) >> 24)", Kind.I),
+                "short" => ($"(((({inner.Code}).ToIntTruncate()) << 16) >> 16)", Kind.I),
                 _ => throw new UnsupportedConstructException($"cast to '{t}'", cast.GetLocation()),
             };
         }
@@ -1311,6 +1337,10 @@ internal sealed class VectorBodyEmitter
                 "int" => ($"({inner.Code}).ToInt()", Kind.I),
                 "float" => ($"({inner.Code}).ToFloat()", Kind.F),
                 "double" => ($"({inner.Code}).ToDouble2()", Kind.D),
+                "byte" => ($"((({inner.Code}).ToInt()) & new VInt(0xFF))", Kind.I),
+                "ushort" => ($"((({inner.Code}).ToInt()) & new VInt(0xFFFF))", Kind.I),
+                "sbyte" => ($"(((({inner.Code}).ToInt()) << 24) >> 24)", Kind.I),
+                "short" => ($"(((({inner.Code}).ToInt()) << 16) >> 16)", Kind.I),
                 _ => throw new UnsupportedConstructException($"cast to '{t}'", cast.GetLocation()),
             };
         }
@@ -1321,6 +1351,10 @@ internal sealed class VectorBodyEmitter
             "int" => (Coerce(inner, Kind.I, cast), Kind.I),
             "long" => (Coerce(inner, Kind.L, cast), Kind.L),
             "double" => (Coerce(inner, Kind.D, cast), Kind.D),
+            "byte" => ($"(({Coerce(inner, Kind.I, cast)}) & new VInt(0xFF))", Kind.I),
+            "ushort" => ($"(({Coerce(inner, Kind.I, cast)}) & new VInt(0xFFFF))", Kind.I),
+            "sbyte" => ($"((({Coerce(inner, Kind.I, cast)}) << 24) >> 24)", Kind.I),
+            "short" => ($"((({Coerce(inner, Kind.I, cast)}) << 16) >> 16)", Kind.I),
             _ => throw new UnsupportedConstructException($"cast to '{t}'", cast.GetLocation()),
         };
     }
@@ -1834,10 +1868,17 @@ internal sealed class VectorBodyEmitter
         bool longIntCall = !_l && fn is "Min" or "Max" or "Abs" &&
             vecArgs.Any(a => a.Value.Kind == Kind.L) &&
             vecArgs.All(a => a.Value.Kind is Kind.L or Kind.I);
+        // Min/Max/Abs over pure int lanes stay int (hardware pminsd/pmaxsd/pabsd), matching
+        // C#'s Math.Min(int, int) overload instead of detouring through float. This is also
+        // the byte/short clamp path: Math.Min(x + 60, 255) on widened narrow lanes.
+        bool intCall = !_l && !_d && fn is "Min" or "Max" or "Abs" or "Clamp" &&
+            vecArgs.All(a => a.Value.Kind == Kind.I);
         var target = _d || vecArgs.Any(a => a.Value.Kind == Kind.D)
             ? Kind.D
             : longIntCall
             ? Kind.L
+            : intCall
+            ? Kind.I
             : LaneFloatKind;
         string[] args = [.. vecArgs.Select(a => CoerceCode(a.Value, target, a.Node))];
         string code = fn == "!FMA"
@@ -2009,6 +2050,13 @@ internal sealed class VectorBodyEmitter
         {
             throw new UnsupportedConstructException(
                 $"multi-dimensional gather from '{bufName}' (only single-index a[expr] supported)", ea.GetLocation());
+        }
+
+        if (p.ElemKind is Kind.B or Kind.S)
+        {
+            throw new UnsupportedConstructException(
+                $"lane-varying index into byte/short buffer '{bufName}' (no 8/16-bit hardware gather; stage the data through an int[]/float[] table or restructure to contiguous access)",
+                ea.GetLocation());
         }
 
         Warn(Descriptors.GatherPerf, ea, ea.ToString());

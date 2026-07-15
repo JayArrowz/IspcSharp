@@ -7,7 +7,7 @@
 
 **SPMD-on-SIMD programming for C#**, write scalar-looking kernels, run them across every SIMD lane and every CPU core. Inspired by [Intel ISPC](https://ispc.github.io/), built on `System.Numerics.Vector<T>` so the same code uses SSE, AVX2, AVX-512, or NEON at runtime.
 
-- **`IspcSharp`**, the runtime: varying types (`VFloat`, `VInt`, `VDouble`, `VLong`, masks), the SPMD execution engine (`Spmd.Foreach`, `Spmd.ParallelForeach`, `Spmd.While`), a vectorized math library, reductions, gather/scatter, cross-lane shuffles, SoA helpers, and a correctness verifier.
+- **`IspcSharp`**, the runtime: varying types (`VFloat`, `VInt`, `VDouble`, `VLong`, `VShort`, `VByte`, masks), the SPMD execution engine (`Spmd.Foreach`, `Spmd.ParallelForeach`, `Spmd.While`), a vectorized math library, reductions, gather/scatter, cross-lane shuffles, SoA helpers, and a correctness verifier.
 - **`IspcSharp.Generators`**, a Roslyn source generator: write a plain scalar loop, mark it `[Spmd]`, and get vectorized `_Simd` / `_ParallelSimd` companions generated at compile time.
 
 ## Why
@@ -283,6 +283,66 @@ Spmd.While(
     });
 ```
 
+### 8/16-bit data: `byte[]`/`short[]` kernels and the `VByte`/`VShort` gangs
+
+`byte[]` and `short[]` buffers work directly in `[Spmd]` kernels, the same model ISPC uses for `int8`/`int16` on its i32 targets: the gang width stays fixed (`VInt.LaneCount`), loads **widen** into int lanes with one instruction (`vpmovzxbd` / `vpmovsxwd`), compute runs in int exactly as C# itself promotes byte/short in every expression (so SIMD results are bit-exact with your scalar loop), and stores **narrow** back (`vpmovdb` / pack). Narrow buffers mix freely with `int[]`/`float[]` in the same kernel, and cut memory traffic to a quarter/half:
+
+```csharp
+[Spmd]
+public static void Brighten(byte[] input, byte[] output, byte amount, int count)
+{
+    foreach (int i in Spmd.Range(count))
+        output[i] = (byte)Math.Min(input[i] + amount, 255);   // widen → add → pminsd → narrow
+}
+
+[Spmd]
+public static void SumBytes(byte[] input, int[] result, int count)
+{
+    int sum = 0;                                   // int accumulator over byte data
+    foreach (int i in Spmd.Range(count))
+        sum += input[i];
+    result[0] = sum;
+}
+
+[Spmd]
+public static void Q15Mul(short[] a, short[] b, short[] output, int count)
+{
+    foreach (int i in Spmd.Range(count))
+        output[i] = (short)((a[i] * b[i]) >> 15); // widening loads, int mul, narrow store
+}
+```
+
+For **maximum 8/16-bit throughput** — ISPC's `avx2-i8x32`/`i16x16` targets — the runtime types `VByte` and `VShort` run gangs at **4× and 2× the int-gang lane count** (AVX2: 32 bytes or 16 shorts per instruction; AVX-512: 64/32), with the ops that make narrow integer code fast: saturating arithmetic (`paddusb`/`paddsw`), byte averaging (`pavgb`), high-half multiply (`pmulhw`), and `psadbw`-powered byte sums. These are hand-written gang loops (the generator doesn't emit multi-register pumped kernels):
+
+```csharp
+using IspcSharp;
+
+// Brighten an 8-bit image, clamped at 255: one paddusb per 16/32/64 pixels.
+public static void Brighten(byte[] pixels, byte[] output, byte amount)
+{
+    var add = new VByte(amount);
+    int w = VByte.LaneCount, i = 0;
+    for (; i <= pixels.Length - w; i += w)
+        VByte.AddSaturate(VByte.Load(pixels, i), add).Store(output, i);
+
+    for (; i < pixels.Length; i++)                       // scalar tail
+        output[i] = (byte)Math.Min(pixels[i] + amount, 255);
+}
+
+// Q16 fixed-point multiply on shorts: one pmulhw per 8/16/32 lanes.
+var q = VShort.MultiplyHigh(VShort.Load(a, i), VShort.Load(b, i));
+
+// Sum a byte buffer: Reduce.Add(VByte) is one hardware psadbw per gang, widened to int.
+sum += Reduce.Add(VByte.Load(data, i));
+
+// Cross-width bridges when you need int-precision intermediates:
+var (lo, hi) = VByte.Widen(pixels8);       // 2× VShort (zero-extended)
+var (ilo, ihi) = VShort.Widen(lo);         // 2× VInt   (sign-extended)
+var back = VByte.Narrow(lo, hi);           // truncating narrow
+```
+
+`VByte`/`VShort` arithmetic wraps exactly like scalar C# casts (`(byte)(200 + 100) == 44`); reach for `AddSaturate`/`SubtractSaturate` when you want pixel/DSP clamping. `VByte` comparisons are unsigned (`200 > 100` is true). Masks are `VMaskB`/`VMaskS`, with `Widen`/`Narrow` to move between mask widths.
+
 ### Verify before you trust
 
 SIMD/masking bugs are **silent**, wrong numbers, not exceptions. Always check kernels against a scalar reference, with a count that exercises the tail:
@@ -299,7 +359,8 @@ KernelVerifier.AssertMatches(
 | ISPC | IspcSharp |
 |---|---|
 | `varying float` / `int` / `double` / `long` | `VFloat` / `VInt` / `VDouble` / `VLong` (+ `VDouble2` / `VLong2` for double / 64-bit-int precision at float-gang width) |
-| `varying bool` / execution mask | `VMask` (32-bit float/int gangs) / `VMaskD` (64-bit double/long gangs), `Widen`/`Narrow` to convert |
+| `varying int8` / `int16` (ISPC i32-target style) | `byte[]`/`short[]` buffers in `[Spmd]` kernels: fixed gang width, widening loads (`vpmovzxbd`/`vpmovsxwd`) into int lanes, narrowing stores; mixes freely with int/float buffers. Plus `VShort` / `VByte` runtime gangs (2× / 4× the int-gang lane count, like ISPC's i16x16/i8x32 targets) with saturating `AddSaturate`/`SubtractSaturate` and `Widen`/`Narrow` bridges |
+| `varying bool` / execution mask | `VMask` (32-bit float/int gangs) / `VMaskD` (64-bit double/long gangs) / `VMaskS` / `VMaskB` (16/8-bit gangs), `Widen`/`Narrow` to convert |
 | `uniform float` | plain `float` (broadcasts implicitly in mixed expressions) |
 | `programIndex` / `programCount` | `VInt.ProgramIndex` / `Spmd.LaneCount` |
 | `foreach (i = 0 ... n)` | `Spmd.Foreach(n, kernel)` or `[Spmd]` + `Spmd.Range(n)` |
@@ -324,7 +385,7 @@ KernelVerifier.AssertMatches(
 
 The generator handles a deliberately constrained, verifiable subset. Kernel shape: optional pre-loop locals, one `foreach` over a `Spmd.Range*` marker, optional trailing statements (including `return`). The foreach may also be **nested inside uniform control flow**, `for`/`while`/`if` scaffolding whose statements (loop counters, swaps, `MathF.PI`, `j ^= bit`, `for (i += len)`, `arr.Length`, …) run as plain scalar C# around the vectorized loop. This is what lets an iterative FFT or a matrix multiply be a single `[Spmd]` method (see the matmul example above); only the innermost `Spmd.Range` loop is vectorized, so its body must still be per-lane parallel (no loop-carried recurrence).
 
-- **Types:** `float`, `int`, `double`, and `long` lane variables (locals declared in the loop body), parameters of `float[]`/`int[]`/`double[]`/`long[]`, `float[,]`/`int[,]`/`double[,]`/`long[,]` (2-D matrices), `Span<T>`/`ReadOnlySpan<T>` of those, and uniform `float`/`int`/`double`/`long`. Implicit int→float promotion; explicit `(float)`/`(int)`/`(double)` casts. **Wide (64-bit) kernels:** a kernel with `double` **buffers** becomes a `VDouble`/`VMaskD` gang; a kernel with `long` **buffers** becomes a `VLong`/`VMaskD` gang (64-bit integers: arithmetic, bitwise `& | ^ ~`, shifts, `/` `%`, `Math.Min/Max/Abs`, gather/scatter, reductions). Both are half the lane count of float/int, and a wide kernel can't mix in 32-bit buffers. In float/int kernels, `double` locals/uniforms/`d`-literals/`(double)` casts give **double-precision intermediates at full gang width** (`VDouble2` pairs), e.g. a `double` accumulator over float data; likewise `long` locals/`L`-literals/`(long)` casts give **64-bit integer intermediates at full gang width** (`VLong2` pairs), e.g. an exact `long` sum over `int` data, or an overflow-free `(long)a[i] * b[i]` widening multiply.
+- **Types:** `float`, `int`, `double`, and `long` lane variables (locals declared in the loop body), parameters of `float[]`/`int[]`/`double[]`/`long[]`, `float[,]`/`int[,]`/`double[,]`/`long[,]` (2-D matrices), `Span<T>`/`ReadOnlySpan<T>` of those, and uniform `float`/`int`/`double`/`long`. Implicit int→float promotion; explicit `(float)`/`(int)`/`(double)` casts. **Narrow (8/16-bit) types, ISPC's `int8`/`int16` on i32 targets:** `byte[]`/`short[]` buffers (and `Span`/`ReadOnlySpan` of them), uniform `byte`/`short`, and `byte`/`sbyte`/`short`/`ushort` lane locals — all at the same int-gang width, mixing freely with int/float buffers in one kernel. Loads widen into int lanes with one hardware instruction (`vpmovzxbd` zero-extend for `byte`, `vpmovsxwd` sign-extend for `short`), compute follows C#'s own byte/short→int promotion (so results are bit-exact with the scalar reference), stores truncate back with one narrowing instruction (`vpmovdb`/`vpmovdw` or a pack sequence), and `(byte)`/`(sbyte)`/`(short)`/`(ushort)` casts lower to mask/shift pairs. `Math.Min/Max/Abs/Clamp` over int lanes stay integer (`pminsd`/`pmaxsd`/`pabsd`) — the byte-clamp pattern `(byte)Math.Min(x + amount, 255)` is fully vectorized. **Wide (64-bit) kernels:** a kernel with `double` **buffers** becomes a `VDouble`/`VMaskD` gang; a kernel with `long` **buffers** becomes a `VLong`/`VMaskD` gang (64-bit integers: arithmetic, bitwise `& | ^ ~`, shifts, `/` `%`, `Math.Min/Max/Abs`, gather/scatter, reductions). Both are half the lane count of float/int, and a wide kernel can't mix in 32-bit buffers. In float/int kernels, `double` locals/uniforms/`d`-literals/`(double)` casts give **double-precision intermediates at full gang width** (`VDouble2` pairs), e.g. a `double` accumulator over float data; likewise `long` locals/`L`-literals/`(long)` casts give **64-bit integer intermediates at full gang width** (`VLong2` pairs), e.g. an exact `long` sum over `int` data, or an overflow-free `(long)a[i] * b[i]` widening multiply.
 - **Return values:** kernels may return `float`/`int`/`double`/`long`, reduce into a pre-loop local and `return` it after the loop; both `_Simd` and `_ParallelSimd` return it directly. (A `long` return from a 32-bit kernel is the natural home for a `VLong2` accumulator, an exact 64-bit sum over `int` data.) A kernel may also **return a `[SpmdStruct]`** built from several reduced accumulators (`return new Stats { Sum = sum, Min = mn, Max = mx };`), ISPC's "export a struct" — the trailing `return` runs as scalar C# over the already-reduced scalars, so it works in both variants. (`[SpmdFunction]` helpers return structs too; see below.)
 - **Memory:** `a[i]` reads/writes indexed by the loop variable, including affine offsets `a[i + u1 + u2]` (uniform terms), this keeps `buf[y*width + x]` and an FFT's `buf[i + k + half]` contiguous loads. **Affine index locals** are tracked too: `int even = i + k; … real[even] = …` stays a contiguous load/store (the offset even propagates through `int odd = even + half`), so you don't have to inline the index arithmetic to keep the fast path. **2-D arrays** index as `a[row, col]` (viewed as a flat row-major span): contiguous when the last index is unit-stride in the lane (`a[row, k]`), a strided gather otherwise (`b[k, col]`). Any genuinely lane-varying index becomes a gather (`a[expr]`) or scatter (`a[expr] = x`) via `Memory.Gather`/`Scatter`; double kernels index with `VLong` through `table[(int)x]`-style casts.
 - **Constants:** `MathF.PI`/`Math.PI`, `.E`, `.Tau`, `float.MaxValue`/`int.MinValue`/`double.Epsilon`/`…` broadcast automatically inside vectorized expressions.
@@ -352,15 +413,16 @@ Notes:
 
 | Area | Types / members |
 |---|---|
-| Varying types | `VFloat`, `VInt`, `VDouble`, `VLong`, arithmetic/comparison operators, bitwise, shifts, `Load/Store(+Masked)`, `Select`/`Blend`, conversions, `AsInt()`/`AsFloat()` bitcasts, hardware FMA `MulAdd`, variable per-lane shifts (`VInt.Shift*Variable`) |
-| Cross-gang-width | `VDouble2` / `VLong2`, double / 64-bit-int precision at full float/int-gang width (two `VDouble`/`VLong` halves, full operator/math surface; `FromInt`/`FromFloat`↔`ToInt`/`ToFloat`); `VInt.Widen/Narrow` ↔ `VLong`, `VMaskD.Widen`/`VMask.Narrow` |
-| Masks | `VMask`, `VMaskD`, `& \| ! ^`, `Any()`, `AllActive()`, `FirstN(n)`, `AndNot` |
+| Varying types | `VFloat`, `VInt`, `VDouble`, `VLong`, arithmetic/comparison operators, bitwise, shifts, `Load/Store(+Masked)`, `Select`/`Blend`, conversions, `AsInt()`/`AsFloat()` bitcasts, hardware FMA `MulAdd`, variable per-lane shifts (`VInt.Shift*Variable`), narrow-memory bridges (`VInt.LoadZeroExtend`/`LoadSignExtend`/`StoreNarrow` for byte/short buffers) |
+| 8/16-bit varying types | `VByte` (unsigned, 4× int-gang width) / `VShort` (signed, 2×): wrapping `+ - *`, saturating `AddSaturate`/`SubtractSaturate` (hardware `paddusb`/`paddsw`/NEON `uqadd`/`sqadd`), `VByte.Average` (`pavgb`), `VShort.MultiplyHigh` (`pmulhw`), unsigned byte compares, `Min`/`Max`, shifts, `Select`/`Blend` |
+| Cross-gang-width | `VDouble2` / `VLong2`, double / 64-bit-int precision at full float/int-gang width (two `VDouble`/`VLong` halves, full operator/math surface; `FromInt`/`FromFloat`↔`ToInt`/`ToFloat`); `VInt.Widen/Narrow` ↔ `VLong`, `VMaskD.Widen`/`VMask.Narrow`; `VByte.Widen/Narrow` ↔ `VShort` ↔ `VInt` (`VShort.Widen/Narrow`), same for masks |
+| Masks | `VMask`, `VMaskD`, `VMaskS`, `VMaskB`, `& \| ! ^`, `Any()`, `AllActive()`, `FirstN(n)`, `AndNot` |
 | Execution | `Spmd.Foreach`, `ParallelForeach`, `Foreach2D`, `ParallelForeach2D`, `Spmd.While` (+ `LoopState.Break/Continue/Return`), `Spmd.If`, `Spmd.Coherent` |
 | Math | `VectorMath`, `Sqrt Rsqrt Rcp Abs Min Max Clamp Lerp Floor Round Truncate Exp Log Pow Sin Cos Tan Tanh Sigmoid Atan Atan2 Asin Acos Cbrt Hypot`, float + double |
-| Reductions | `Reduce.Add/Min/Max` for `VFloat`/`VInt`/`VDouble`, with masked overloads |
+| Reductions | `Reduce.Add/Min/Max` for `VFloat`/`VInt`/`VDouble`/`VLong`/`VShort`/`VByte`, with masked overloads; byte sums use one hardware `psadbw` per gang and widen to `int` |
 | Indexed memory | `Memory.Gather`/`Scatter` for float/int/double, AVX2 hardware gather, movemask-driven scatter |
 | Layout helpers | `Memory.Transpose`/`Transposed` (cache-blocked, float/int/double); `SoaFloat2/3` + `FromInterleaved`/`ToInterleaved` de-interleavers |
-| Cross-lane | `Lanes.Shuffle` (hardware permutes), `Rotate`, `Broadcast`, `ShiftLanes` |
+| Cross-lane | `Lanes.Shuffle` (hardware permutes, incl. `pshufb`-class byte/short shuffles), `Rotate`, `Broadcast`, `ShiftLanes` — float/int/short/byte |
 | Data layout | `SoaFloat2`, `SoaFloat3` |
 | Testing | `KernelVerifier.AssertMatches`, asserts a kernel against a scalar reference |
 
@@ -392,6 +454,8 @@ Accuracy: `VectorMath` transcendentals are branch-free polynomial/rational appro
 - **`long` lanes accelerate partially**, add/subtract/bitwise/compare/shift/min-max vectorize well on AVX2+, but there's no single-instruction 64-bit packed multiply before AVX-512DQ (`vpmullq`; else a JIT sequence) and integer divide is scalar on all ISAs. So `long` kernels fly for bitwise/additive/hashing/indexing work and are only partly accelerated for multiply/divide-heavy code.
 - **`float[,]`/`int[,]`/`double[,]`/`long[,]` kernels are `_Simd`-only**, the flat row-major span view can't be captured across threads, so no `_ParallelSimd` (parallelize the outer loop yourself).
 - **Integer `/` `%`, masked tail load/store, and non-contiguous 2-D access are per-lane loops**, there's no SIMD instruction for them; expect scalar-ish speed on those specific ops.
+- **`byte`/`short` in `[Spmd]` kernels run at int-gang width (ISPC's i32-target model), not 4×/2× lane count.** Narrow buffers cut memory traffic to a quarter/half and loads/stores are single widening/narrowing instructions, but each gang still processes `VInt.LaneCount` elements — exactly like `int8` on an ISPC `avx2-i32x8` target. For genuine 32/64-lanes-per-instruction 8-bit throughput (ISPC's `i8x32` targets), use the `VByte`/`VShort` runtime types and write the gang loop by hand. Lane-varying indexing (gather/scatter) into byte/short buffers is rejected — there's no 8/16-bit hardware gather; stage through an `int[]` table. 2-D `byte[,]`/`short[,]` params and byte/short `[SpmdStruct]` fields aren't supported yet.
+- `VByte`/`VShort` multiplies note: 16-bit low multiply is native (`pmullw`), but x86 has no 8-bit packed multiply, so `VByte.operator *` is a JIT widening sequence — fine, just not single-instruction. Integer divide/remainder is scalar per-lane on all types.
 - The generator matches `Math`/`Span` symbols syntactically rather than via full semantic-model resolution, so exotic shadowing of those names could confuse it.
 
 ## Repository layout
@@ -401,8 +465,9 @@ src/IspcSharp/                  Runtime library
 src/IspcSharp.Generators/       Roslyn source generator + AoS analyzer
 benchmarks/IspcSharp.Benchmarks BenchmarkDotNet suite on generated kernels: branchless, reductions,
                                 transcendental, divergent while, 2D Mandelbrot, FFT, matrix
-                                multiply, bandwidth-bound control, grid route finding
-tests/IspcSharp.Tests/          xUnit suite (272 tests) covering every feature above, in both
+                                multiply, bandwidth-bound control, grid route finding, plus
+                                byte/short gangs (saturating image add, psadbw sums, Q16 multiply)
+tests/IspcSharp.Tests/          xUnit suite (335 tests) covering every feature above, in both
                                 hardware-SIMD and software-fallback modes
 .github/workflows/ci.yml        Test matrix: Linux/Windows x64 + macOS ARM64 (NEON), plus an
                                 on-demand benchmark job

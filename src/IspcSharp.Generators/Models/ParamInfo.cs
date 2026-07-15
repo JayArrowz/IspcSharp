@@ -19,20 +19,27 @@ internal readonly struct ParamInfo(string name, ParamKind kind, string typeText,
                                   or ParamKind.IntArray or ParamKind.IntSpan or ParamKind.IntReadOnlySpan
                                   or ParamKind.DoubleArray or ParamKind.DoubleSpan or ParamKind.DoubleReadOnlySpan
                                   or ParamKind.LongArray or ParamKind.LongSpan or ParamKind.LongReadOnlySpan
+                                  or ParamKind.ByteArray or ParamKind.ByteSpan or ParamKind.ByteReadOnlySpan
+                                  or ParamKind.ShortArray or ParamKind.ShortSpan or ParamKind.ShortReadOnlySpan
                                   or ParamKind.FloatArray2D or ParamKind.IntArray2D or ParamKind.DoubleArray2D or ParamKind.LongArray2D;
 
-    public bool IsReadOnly => PKind is ParamKind.FloatReadOnlySpan or ParamKind.IntReadOnlySpan or ParamKind.DoubleReadOnlySpan or ParamKind.LongReadOnlySpan;
+    public bool IsReadOnly => PKind is ParamKind.FloatReadOnlySpan or ParamKind.IntReadOnlySpan or ParamKind.DoubleReadOnlySpan
+                                    or ParamKind.LongReadOnlySpan or ParamKind.ByteReadOnlySpan or ParamKind.ShortReadOnlySpan;
 
     public bool IsSpan => PKind is ParamKind.FloatSpan or ParamKind.FloatReadOnlySpan
                                 or ParamKind.IntSpan or ParamKind.IntReadOnlySpan
                                 or ParamKind.DoubleSpan or ParamKind.DoubleReadOnlySpan
-                                or ParamKind.LongSpan or ParamKind.LongReadOnlySpan;
+                                or ParamKind.LongSpan or ParamKind.LongReadOnlySpan
+                                or ParamKind.ByteSpan or ParamKind.ByteReadOnlySpan
+                                or ParamKind.ShortSpan or ParamKind.ShortReadOnlySpan;
 
     public Kind ElemKind => PKind switch
     {
         ParamKind.IntArray or ParamKind.IntSpan or ParamKind.IntReadOnlySpan or ParamKind.IntArray2D => Kind.I,
         ParamKind.DoubleArray or ParamKind.DoubleSpan or ParamKind.DoubleReadOnlySpan or ParamKind.DoubleArray2D => Kind.D,
         ParamKind.LongArray or ParamKind.LongSpan or ParamKind.LongReadOnlySpan or ParamKind.LongArray2D => Kind.L,
+        ParamKind.ByteArray or ParamKind.ByteSpan or ParamKind.ByteReadOnlySpan => Kind.B,
+        ParamKind.ShortArray or ParamKind.ShortSpan or ParamKind.ShortReadOnlySpan => Kind.S,
         _ => Kind.F,
     };
 

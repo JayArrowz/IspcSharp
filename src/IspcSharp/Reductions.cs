@@ -272,6 +272,134 @@ public static class Reduce
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long Max(VLong2 v) => Math.Max(Max(v.Lower), Max(v.Upper));
+
+    /// <summary>
+    /// Sum of all byte lanes, widened to int (a full gang can exceed 255).
+    /// One hardware <c>psadbw</c> against zero (SSE2/AVX2/AVX-512BW) sums 8 bytes per
+    /// 64-bit lane in a single instruction; portable loop otherwise.
+    /// </summary>
+    public static int Add(VByte v)
+    {
+#if NET8_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx512BW.IsSupported && VByte.LaneCount == 64)
+        {
+            var sad = System.Runtime.Intrinsics.X86.Avx512BW.SumAbsoluteDifferences(
+                Vector512.AsVector512(v.V), Vector512<byte>.Zero);
+            return (int)Vector512.Sum(sad.AsUInt64());
+        }
+
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && VByte.LaneCount == 32)
+        {
+            var sad = System.Runtime.Intrinsics.X86.Avx2.SumAbsoluteDifferences(
+                Vector256.AsVector256(v.V), Vector256<byte>.Zero);
+            return (int)Vector256.Sum(sad.AsUInt64());
+        }
+
+        if (System.Runtime.Intrinsics.X86.Sse2.IsSupported && VByte.LaneCount == 16)
+        {
+            var sad = System.Runtime.Intrinsics.X86.Sse2.SumAbsoluteDifferences(
+                Vector128.AsVector128(v.V), Vector128<byte>.Zero);
+            return (int)Vector128.Sum(sad.AsUInt64());
+        }
+#endif
+        int sum = 0;
+        for (int l = 0; l < VByte.LaneCount; l++)
+            sum += v.V[l];
+        return sum;
+    }
+
+    /// <summary>
+    /// Sum of active byte lanes only (inactive lanes contribute 0), widened to int.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int Add(VByte v, VMaskB mask) => Add(VByte.Select(mask, v, VByte.Zero));
+
+    /// <summary>
+    /// Minimum across all lanes.
+    /// </summary>
+    public static byte Min(VByte v)
+    {
+        byte m = v.V[0];
+        for (int l = 1; l < VByte.LaneCount; l++)
+            m = Math.Min(m, v.V[l]);
+        return m;
+    }
+
+    /// <summary>
+    /// Minimum across active lanes (inactive lanes ignored via byte.MaxValue).
+    /// </summary>
+    public static byte Min(VByte v, VMaskB mask) => Min(VByte.Select(mask, v, new VByte(byte.MaxValue)));
+
+    /// <summary>
+    /// Maximum across all lanes.
+    /// </summary>
+    public static byte Max(VByte v)
+    {
+        byte m = v.V[0];
+        for (int l = 1; l < VByte.LaneCount; l++)
+            m = Math.Max(m, v.V[l]);
+        return m;
+    }
+
+    /// <summary>
+    /// Maximum across active lanes (inactive lanes ignored via 0).
+    /// </summary>
+    public static byte Max(VByte v, VMaskB mask) => Max(VByte.Select(mask, v, VByte.Zero));
+
+    /// <summary>
+    /// Sum of all short lanes, widened to int (a full gang can exceed short range).
+    /// SIMD widen + one vector add + horizontal sum on net8.0+; portable loop otherwise.
+    /// </summary>
+    public static int Add(VShort v)
+    {
+#if NET8_0_OR_GREATER
+        Vector.Widen(v.V, out var lo, out var hi);
+        return Vector.Sum(lo + hi);
+#else
+        int sum = 0;
+        for (int l = 0; l < VShort.LaneCount; l++)
+            sum += v.V[l];
+        return sum;
+#endif
+    }
+
+    /// <summary>
+    /// Sum of active short lanes only (inactive lanes contribute 0), widened to int.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int Add(VShort v, VMaskS mask) => Add(VShort.Select(mask, v, VShort.Zero));
+
+    /// <summary>
+    /// Minimum across all lanes.
+    /// </summary>
+    public static short Min(VShort v)
+    {
+        short m = v.V[0];
+        for (int l = 1; l < VShort.LaneCount; l++)
+            m = Math.Min(m, v.V[l]);
+        return m;
+    }
+
+    /// <summary>
+    /// Minimum across active lanes (inactive lanes ignored via short.MaxValue).
+    /// </summary>
+    public static short Min(VShort v, VMaskS mask) => Min(VShort.Select(mask, v, new VShort(short.MaxValue)));
+
+    /// <summary>
+    /// Maximum across all lanes.
+    /// </summary>
+    public static short Max(VShort v)
+    {
+        short m = v.V[0];
+        for (int l = 1; l < VShort.LaneCount; l++)
+            m = Math.Max(m, v.V[l]);
+        return m;
+    }
+
+    /// <summary>
+    /// Maximum across active lanes (inactive lanes ignored via short.MinValue).
+    /// </summary>
+    public static short Max(VShort v, VMaskS mask) => Max(VShort.Select(mask, v, new VShort(short.MinValue)));
 }
 
 /// <summary>

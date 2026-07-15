@@ -27,6 +27,8 @@ public static class Program
         Console.WriteLine($"Vector<float>    : Count={System.Numerics.Vector<float>.Count} ({System.Numerics.Vector<float>.Count * 32}-bit), HwAccelerated={System.Numerics.Vector.IsHardwareAccelerated}");
         Console.WriteLine($"Vector<double>   : Count={System.Numerics.Vector<double>.Count}");
         Console.WriteLine($"Vector<long>     : Count={System.Numerics.Vector<long>.Count}");
+        Console.WriteLine($"Vector<short>    : Count={System.Numerics.Vector<short>.Count}");
+        Console.WriteLine($"Vector<byte>     : Count={System.Numerics.Vector<byte>.Count}");
 #if NET8_0_OR_GREATER
         bool x = System.Runtime.Intrinsics.X86.Avx2.IsSupported;
         Console.WriteLine($"x86 ISA          : SSE2={System.Runtime.Intrinsics.X86.Sse2.IsSupported} AVX2={System.Runtime.Intrinsics.X86.Avx2.IsSupported} " +
@@ -536,6 +538,41 @@ public static partial class GeneratedKernels
             }
 
             c[row, col] = sum;
+        }
+    }
+
+    /// <summary>
+    /// ISPC-style narrow buffers: byte pixels brighten with clamp. Loads widen
+    /// (vpmovzxbd) into int lanes, Math.Min stays int (pminsd), the store narrows back
+    /// (pack / vpmovdb) — a quarter of the memory traffic of an int kernel.
+    /// </summary>
+    /// <param name="input"></param>
+    /// <param name="output"></param>
+    /// <param name="amount"></param>
+    /// <param name="count"></param>
+    [Spmd]
+    public static void ByteBrighten(byte[] input, byte[] output, byte amount, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            output[i] = (byte)Math.Min(input[i] + amount, 255);
+        }
+    }
+
+    /// <summary>
+    /// ISPC-style narrow buffers: Q16 fixed-point multiply over short[] data
+    /// (widening loads, int multiply, shift, narrowing store).
+    /// </summary>
+    /// <param name="a"></param>
+    /// <param name="b"></param>
+    /// <param name="output"></param>
+    /// <param name="count"></param>
+    [Spmd]
+    public static void ShortQ16(short[] a, short[] b, short[] output, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            output[i] = (short)((a[i] * b[i]) >> 16);
         }
     }
 }
@@ -1426,4 +1463,210 @@ public class SinCosBench
 
     [Benchmark]
     public void GeneratedParallelSimd() => GeneratedKernels.SinCos_ParallelSimd(_input, _output, N);
+}
+
+
+/// <summary>
+/// Classic 8-bit image op: brighten with clamp-to-255. Scalar needs a compare+branch (or
+/// min) per pixel; VByte.AddSaturate is ONE hardware instruction (paddusb) per 16/32/64
+/// pixels, the widest gang in the library, so this is the largest per-instruction
+/// element count of any benchmark here.
+/// </summary>
+[MemoryDiagnoser]
+public class ByteSaturateAddBench
+{
+    [Params(1 << 16, 1 << 22)]
+    public int N;
+
+    private byte[] _input = null!;
+    private byte[] _output = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        Random rng = new Random(42);
+        _input = new byte[N];
+        _output = new byte[N];
+        rng.NextBytes(_input);
+    }
+
+    [Benchmark(Baseline = true)]
+    public void Scalar()
+    {
+        for (int i = 0; i < N; i++)
+        {
+            int s = _input[i] + 60;
+            _output[i] = s > 255 ? (byte)255 : (byte)s;
+        }
+    }
+
+    [Benchmark]
+    public void SimdVByte()
+    {
+        VByte brighten = new VByte(60);
+        int w = VByte.LaneCount;
+        int i = 0;
+        for (; i <= N - w; i += w)
+            VByte.AddSaturate(VByte.Load(_input, i), brighten).Store(_output, i);
+
+        for (; i < N; i++)
+        {
+            int s = _input[i] + 60;
+            _output[i] = s > 255 ? (byte)255 : (byte)s;
+        }
+    }
+
+    [Benchmark]
+    public void GeneratedSimd() => GeneratedKernels.ByteBrighten_Simd(_input, _output, 60, N);
+
+    [Benchmark]
+    public void GeneratedParallelSimd() => GeneratedKernels.ByteBrighten_ParallelSimd(_input, _output, 60, N);
+}
+
+/// <summary>
+/// Byte-buffer reduction: sum of all bytes (histogram/mean building block). The SIMD loop
+/// leans on Reduce.Add(VByte), one hardware psadbw per gang that sums 8 bytes per 64-bit
+/// lane against zero, versus a scalar add per element.
+/// </summary>
+[MemoryDiagnoser]
+public class ByteSumBench
+{
+    [Params(1 << 22)]
+    public int N;
+
+    private byte[] _input = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        Random rng = new Random(42);
+        _input = new byte[N];
+        rng.NextBytes(_input);
+    }
+
+    [Benchmark(Baseline = true)]
+    public long Scalar()
+    {
+        long sum = 0;
+        for (int i = 0; i < N; i++)
+            sum += _input[i];
+        return sum;
+    }
+
+    [Benchmark]
+    public long SimdVByte()
+    {
+        long sum = 0;
+        int w = VByte.LaneCount;
+        int i = 0;
+        for (; i <= N - w; i += w)
+            sum += Reduce.Add(VByte.Load(_input, i));
+
+        for (; i < N; i++)
+            sum += _input[i];
+        return sum;
+    }
+}
+
+/// <summary>
+/// Q16 fixed-point multiply, the DSP staple: out[i] = (short)((a[i] * b[i]) >> 16).
+/// Scalar widens to int, multiplies, shifts, narrows per element; VShort.MultiplyHigh is
+/// one hardware pmulhw per 8/16/32 lanes.
+/// </summary>
+[MemoryDiagnoser]
+public class ShortFixedPointBench
+{
+    [Params(1 << 16, 1 << 22)]
+    public int N;
+
+    private short[] _a = null!;
+    private short[] _b = null!;
+    private short[] _output = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        Random rng = new Random(42);
+        _a = new short[N];
+        _b = new short[N];
+        _output = new short[N];
+        for (int i = 0; i < N; i++)
+        {
+            _a[i] = (short)rng.Next(short.MinValue, short.MaxValue + 1);
+            _b[i] = (short)rng.Next(short.MinValue, short.MaxValue + 1);
+        }
+    }
+
+    [Benchmark(Baseline = true)]
+    public void Scalar()
+    {
+        for (int i = 0; i < N; i++)
+            _output[i] = (short)((_a[i] * _b[i]) >> 16);
+    }
+
+    [Benchmark]
+    public void SimdVShort()
+    {
+        int w = VShort.LaneCount;
+        int i = 0;
+        for (; i <= N - w; i += w)
+            VShort.MultiplyHigh(VShort.Load(_a, i), VShort.Load(_b, i)).Store(_output, i);
+
+        for (; i < N; i++)
+            _output[i] = (short)((_a[i] * _b[i]) >> 16);
+    }
+
+    [Benchmark]
+    public void GeneratedSimd() => GeneratedKernels.ShortQ16_Simd(_a, _b, _output, N);
+
+    [Benchmark]
+    public void GeneratedParallelSimd() => GeneratedKernels.ShortQ16_ParallelSimd(_a, _b, _output, N);
+}
+
+/// <summary>
+/// 16-bit audio-style mix: saturating add of two sample streams. Scalar clamps through
+/// int per sample; VShort.AddSaturate is one hardware paddsw per gang.
+/// </summary>
+[MemoryDiagnoser]
+public class ShortSaturateMixBench
+{
+    [Params(1 << 22)]
+    public int N;
+
+    private short[] _a = null!;
+    private short[] _b = null!;
+    private short[] _output = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        Random rng = new Random(42);
+        _a = new short[N];
+        _b = new short[N];
+        _output = new short[N];
+        for (int i = 0; i < N; i++)
+        {
+            _a[i] = (short)rng.Next(short.MinValue, short.MaxValue + 1);
+            _b[i] = (short)rng.Next(short.MinValue, short.MaxValue + 1);
+        }
+    }
+
+    [Benchmark(Baseline = true)]
+    public void Scalar()
+    {
+        for (int i = 0; i < N; i++)
+            _output[i] = (short)Math.Clamp(_a[i] + _b[i], short.MinValue, short.MaxValue);
+    }
+
+    [Benchmark]
+    public void GeneratedSimd()
+    {
+        int w = VShort.LaneCount;
+        int i = 0;
+        for (; i <= N - w; i += w)
+            VShort.AddSaturate(VShort.Load(_a, i), VShort.Load(_b, i)).Store(_output, i);
+
+        for (; i < N; i++)
+            _output[i] = (short)Math.Clamp(_a[i] + _b[i], short.MinValue, short.MaxValue);
+    }
 }

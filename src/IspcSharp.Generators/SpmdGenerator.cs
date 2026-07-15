@@ -221,6 +221,12 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 "long[]" => ParamKind.LongArray,
                 "Span<long>" or "System.Span<long>" => ParamKind.LongSpan,
                 "ReadOnlySpan<long>" or "System.ReadOnlySpan<long>" => ParamKind.LongReadOnlySpan,
+                "byte[]" => ParamKind.ByteArray,
+                "Span<byte>" or "System.Span<byte>" => ParamKind.ByteSpan,
+                "ReadOnlySpan<byte>" or "System.ReadOnlySpan<byte>" => ParamKind.ByteReadOnlySpan,
+                "short[]" => ParamKind.ShortArray,
+                "Span<short>" or "System.Span<short>" => ParamKind.ShortSpan,
+                "ReadOnlySpan<short>" or "System.ReadOnlySpan<short>" => ParamKind.ShortReadOnlySpan,
                 "float[,]" => ParamKind.FloatArray2D,
                 "int[,]" => ParamKind.IntArray2D,
                 "double[,]" => ParamKind.DoubleArray2D,
@@ -229,6 +235,8 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 "int" => ParamKind.UniformInt,
                 "double" => ParamKind.UniformDouble,
                 "long" => ParamKind.UniformLong,
+                "byte" => ParamKind.UniformByte,
+                "short" => ParamKind.UniformShort,
                 _ => ParamKind.Unsupported,
             };
             // Blittable [SpmdStruct] buffer: 'S[]' where S has a uniform field type (flat SoA view).
@@ -425,7 +433,8 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                     "int" => Kind.I,
                     "double" => Kind.D,
                     "long" => Kind.L,
-                    _ => throw new UnsupportedConstructException($"pre-loop local of type '{t}' (only float/int/double/long)", d.GetLocation()),
+                    "byte" or "sbyte" or "short" or "ushort" => Kind.I,
+                    _ => throw new UnsupportedConstructException($"pre-loop local of type '{t}' (only float/int/double/long/byte/short)", d.GetLocation()),
                 };
                 foreach (var v in d.Declaration.Variables)
                     preLocals[v.Identifier.Text] = k;
@@ -1017,13 +1026,14 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         Kind.F => "VFloat",
         Kind.I => "VInt",
         Kind.L => longMode ? "VLong" : "VLong2",
+        Kind.B or Kind.S => throw new InvalidOperationException("byte/short are memory-only lane kinds (widened to VInt in registers)"),
         _ => doubleMode ? "VDouble" : "VDouble2",
     };
 
     /// <summary>
     /// Scalar element type name for a lane kind (the flat-view element type of a buffer).
     /// </summary>
-    internal static string ElemTypeName(Kind k) => k switch { Kind.I => "int", Kind.D => "double", Kind.L => "long", _ => "float" };
+    internal static string ElemTypeName(Kind k) => k switch { Kind.I => "int", Kind.D => "double", Kind.L => "long", Kind.B => "byte", Kind.S => "short", _ => "float" };
 
     /// <summary>
     /// Flat SoA view name for a struct-buffer field. A homogeneous buffer shares one view
@@ -1338,6 +1348,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 "float" => Kind.F,
                 "double" => Kind.D,
                 "long" => Kind.L,
+                "byte" or "sbyte" or "short" or "ushort" => Kind.I,
                 _ => null,
             };
             if (k is { } kind)

@@ -163,4 +163,168 @@ public static class Lanes
             tmp[l] = (l + normalized) % w;
         return VInt.Load(tmp);
     }
+
+    /// <summary>
+    /// result[l] = v[indices[l]], arbitrary lane permutation (ISPC's shuffle) for short gangs.
+    /// Hardware permutes via <c>VectorXXX.Shuffle</c> on net8.0+.
+    /// </summary>
+    /// <param name="v">The input vector.</param>
+    /// <param name="indices">The indices to shuffle.</param>
+    /// <returns>The shuffled vector.</returns>
+    public static VShort Shuffle(VShort v, VShort indices)
+    {
+#if NET8_0_OR_GREATER
+        if (VShort.LaneCount == 32)
+        {
+            return new VShort(System.Runtime.Intrinsics.Vector512.AsVector(
+                System.Runtime.Intrinsics.Vector512.Shuffle(
+                    System.Runtime.Intrinsics.Vector512.AsVector512(v.V),
+                    System.Runtime.Intrinsics.Vector512.AsVector512(indices.V))));
+        }
+
+        if (VShort.LaneCount == 16)
+        {
+            return new VShort(System.Runtime.Intrinsics.Vector256.AsVector(
+                System.Runtime.Intrinsics.Vector256.Shuffle(
+                    System.Runtime.Intrinsics.Vector256.AsVector256(v.V),
+                    System.Runtime.Intrinsics.Vector256.AsVector256(indices.V))));
+        }
+
+        if (VShort.LaneCount == 8)
+        {
+            return new VShort(System.Runtime.Intrinsics.Vector128.AsVector(
+                System.Runtime.Intrinsics.Vector128.Shuffle(
+                    System.Runtime.Intrinsics.Vector128.AsVector128(v.V),
+                    System.Runtime.Intrinsics.Vector128.AsVector128(indices.V))));
+        }
+#endif
+        Span<short> tmp = stackalloc short[VShort.LaneCount];
+        for (int l = 0; l < VShort.LaneCount; l++)
+        {
+            int idx = indices.V[l];
+            tmp[l] = (uint)idx < (uint)VShort.LaneCount ? v.V[idx] : (short)0;
+        }
+
+        return VShort.Load(tmp);
+    }
+
+    /// <summary>
+    /// result[l] = v[indices[l]], arbitrary lane permutation (ISPC's shuffle) for byte gangs.
+    /// Hardware <c>pshufb</c>-class permutes via <c>VectorXXX.Shuffle</c> on net8.0+.
+    /// </summary>
+    /// <param name="v">The input vector.</param>
+    /// <param name="indices">The indices to shuffle.</param>
+    /// <returns>The shuffled vector.</returns>
+    public static VByte Shuffle(VByte v, VByte indices)
+    {
+#if NET8_0_OR_GREATER
+        if (VByte.LaneCount == 64)
+        {
+            return new VByte(System.Runtime.Intrinsics.Vector512.AsVector(
+                System.Runtime.Intrinsics.Vector512.Shuffle(
+                    System.Runtime.Intrinsics.Vector512.AsVector512(v.V),
+                    System.Runtime.Intrinsics.Vector512.AsVector512(indices.V))));
+        }
+
+        if (VByte.LaneCount == 32)
+        {
+            return new VByte(System.Runtime.Intrinsics.Vector256.AsVector(
+                System.Runtime.Intrinsics.Vector256.Shuffle(
+                    System.Runtime.Intrinsics.Vector256.AsVector256(v.V),
+                    System.Runtime.Intrinsics.Vector256.AsVector256(indices.V))));
+        }
+
+        if (VByte.LaneCount == 16)
+        {
+            return new VByte(System.Runtime.Intrinsics.Vector128.AsVector(
+                System.Runtime.Intrinsics.Vector128.Shuffle(
+                    System.Runtime.Intrinsics.Vector128.AsVector128(v.V),
+                    System.Runtime.Intrinsics.Vector128.AsVector128(indices.V))));
+        }
+#endif
+        Span<byte> tmp = stackalloc byte[VByte.LaneCount];
+        for (int l = 0; l < VByte.LaneCount; l++)
+        {
+            int idx = indices.V[l];
+            tmp[l] = idx < VByte.LaneCount ? v.V[idx] : (byte)0;
+        }
+
+        return VByte.Load(tmp);
+    }
+
+    /// <summary>
+    /// result[l] = v[(l + offset) mod LaneCount], ISPC's rotate.
+    /// </summary>
+    /// <param name="v">The input vector.</param>
+    /// <param name="offset">The offset to rotate by.</param>
+    /// <returns>The rotated vector.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VShort Rotate(VShort v, int offset)
+        => Shuffle(v, RotateIndicesS(offset));
+
+    /// <summary>
+    /// result[l] = v[(l + offset) mod LaneCount], ISPC's rotate.
+    /// </summary>
+    /// <param name="v">The input vector.</param>
+    /// <param name="offset">The offset to rotate by.</param>
+    /// <returns>The rotated vector.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VByte Rotate(VByte v, int offset)
+        => Shuffle(v, RotateIndicesB(offset));
+
+    /// <summary>
+    /// All lanes take v[lane], ISPC's broadcast.
+    /// </summary>
+    /// <param name="v">The input vector.</param>
+    /// <param name="lane">The lane to broadcast.</param>
+    /// <returns>The broadcast vector.</returns>
+    public static VShort Broadcast(VShort v, int lane) => new(v.V[lane]);
+
+    /// <summary>
+    /// All lanes take v[lane], ISPC's broadcast.
+    /// </summary>
+    /// <param name="v">The input vector.</param>
+    /// <param name="lane">The lane to broadcast.</param>
+    /// <returns>The broadcast vector.</returns>
+    public static VByte Broadcast(VByte v, int lane) => new(v.V[lane]);
+
+    /// <summary>
+    /// result[l] = v[l + offset], lanes shifted past the edge become 0, ISPC's shift.
+    /// </summary>
+    /// <param name="v">The input vector.</param>
+    /// <param name="offset">The offset to shift by.</param>
+    /// <returns>The shifted vector.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VShort ShiftLanes(VShort v, int offset)
+        => Shuffle(v, VShort.ProgramIndex + (short)offset);   // wrapped negatives land out of range → 0
+
+    /// <summary>
+    /// result[l] = v[l + offset], lanes shifted past the edge become 0, ISPC's shift.
+    /// </summary>
+    /// <param name="v">The input vector.</param>
+    /// <param name="offset">The offset to shift by.</param>
+    /// <returns>The shifted vector.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VByte ShiftLanes(VByte v, int offset)
+        => Shuffle(v, VByte.ProgramIndex + unchecked((byte)offset));   // wrapped negatives land out of range → 0
+
+    private static VShort RotateIndicesS(int offset)
+    {
+        int w = VShort.LaneCount;
+        int normalized = ((offset % w) + w) % w;
+        Span<short> tmp = stackalloc short[w];
+        for (int l = 0; l < w; l++)
+            tmp[l] = (short)((l + normalized) % w);
+        return VShort.Load(tmp);
+    }
+
+    private static VByte RotateIndicesB(int offset)
+    {
+        int w = VByte.LaneCount;
+        int normalized = ((offset % w) + w) % w;
+        Span<byte> tmp = stackalloc byte[w];
+        for (int l = 0; l < w; l++)
+            tmp[l] = (byte)((l + normalized) % w);
+        return VByte.Load(tmp);
+    }
 }
