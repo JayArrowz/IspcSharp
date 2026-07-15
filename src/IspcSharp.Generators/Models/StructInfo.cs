@@ -36,6 +36,13 @@ internal sealed record StructInfo(string Name, string Namespace, EquatableReadOn
     public bool HasArrayField => Fields.Any(f => f.IsArray);
 
     /// <summary>
+    /// True when any field is a narrow (byte/short) type. Such structs are locals /
+    /// uniform params / helper args / returns only — the buffer flat-view machinery
+    /// assumes 32/64-bit element strides.
+    /// </summary>
+    public bool HasNarrowField => Fields.Any(f => f.Kind is Kind.B or Kind.S);
+
+    /// <summary>
     /// The companion's flattened gang fields: a scalar field yields one gang, an array
     /// member of length N yields N (<c>f_0 … f_{N-1}</c>). Drives companion emission and blends.
     /// </summary>
@@ -130,6 +137,8 @@ internal sealed record StructInfo(string Name, string Namespace, EquatableReadOn
         "int" => Kind.I,
         "double" => Kind.D,
         "long" => Kind.L,
+        "byte" => Kind.B,
+        "short" => Kind.S,
         _ => null,
     };
 

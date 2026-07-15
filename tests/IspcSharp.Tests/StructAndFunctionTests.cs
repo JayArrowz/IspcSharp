@@ -53,6 +53,31 @@ public struct Poly
     public float Bias;                    // plain scalar field alongside the arrays
 }
 
+/// <summary>
+/// 64-bit (double/long) array members plus a narrow (byte) one, used as a uniform kernel
+/// parameter with lane-varying (gathered) indices.
+/// </summary>
+[SpmdStruct]
+public struct Wide64
+{
+    [SpmdArray(3)] public double[] D;
+    [SpmdArray(3)] public long[] L;
+    [SpmdArray(3)] public byte[] B;
+}
+
+/// <summary>
+/// Narrow (byte/short) scalar fields and array members: companion gangs are VInt
+/// (widened, C#'s own promotion semantics).
+/// </summary>
+[SpmdStruct]
+public struct NarrowFields
+{
+    [SpmdArray(3)] public byte[] B;
+    [SpmdArray(3)] public short[] S;
+    public byte Flag;
+    public short Scale;
+}
+
 public static partial class StructKernels
 {
     /// <summary>
@@ -379,6 +404,110 @@ public static partial class StructKernels
             outIm[i] = r.Im;
         }
     }
+
+    /// <summary>
+    /// Lane-varying index into a uniform struct's array member: SPMD over the array member
+    /// itself (the loop variable indexes it), lowered to a gather like ISPC. The 3-element
+    /// range is narrower than any gang, so this exercises the scalar tail too.
+    /// </summary>
+    [Spmd]
+    public static float SumCoefs(Poly poly)
+    {
+        float sum = 0;
+        foreach (var i in Spmd.Range(poly.Coef.Length))
+        {
+            sum += poly.Coef[i];
+        }
+
+        return sum;
+    }
+
+    /// <summary>
+    /// Lane-varying gather from a uniform array member in a full-width data loop: each
+    /// element selects a coefficient (float member) and a tag (int member) per lane.
+    /// </summary>
+    [Spmd]
+    public static void SelectCoefPerLane(int[] sel, float[] o, int[] tags, Poly p, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            o[i] = p.Coef[sel[i]] * 2f;
+            tags[i] = p.Tag[sel[i] & 1];
+        }
+    }
+
+    /// <summary>
+    /// Lane-varying gathers from 64-bit (double/long) array members inside a 32-bit kernel:
+    /// values come back as full-gang-width VDouble2/VLong2 pairs (widened two-part gathers).
+    /// </summary>
+    [Spmd]
+    public static void SelectWide32(int[] sel, float[] o, int[] o2, Wide64 w, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            o[i] = (float)w.D[sel[i]];
+            o2[i] = (int)w.L[sel[i]];
+        }
+    }
+
+    /// <summary>
+    /// Double kernel: lane-varying gathers from a double member (native) and a float member
+    /// (widening gather) of a uniform struct.
+    /// </summary>
+    [Spmd]
+    public static void SelectInDoubleKernel(double[] sel, double[] o, double[] o2, double[] o3, Wide64 w, Poly p, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            o[i] = w.D[(int)sel[i]];
+            o2[i] = p.Coef[(int)sel[i]];
+            o3[i] = w.B[(int)sel[i]];
+        }
+    }
+
+    /// <summary>
+    /// Long kernel: lane-varying gathers from a long member (native) and an int member
+    /// (widening gather) of a uniform struct.
+    /// </summary>
+    [Spmd]
+    public static void SelectInLongKernel(long[] sel, long[] o, long[] o2, long[] o3, Wide64 w, Poly p, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            o[i] = w.L[(int)sel[i]];
+            o2[i] = p.Tag[(int)(sel[i] & 1)];
+            o3[i] = w.B[(int)sel[i]];
+        }
+    }
+
+    /// <summary>
+    /// Narrow struct fields as a uniform param: gathered byte/short array members plus
+    /// broadcast byte/short scalar fields, all computing in int lanes.
+    /// </summary>
+    [Spmd]
+    public static void NarrowStructUniform(int[] sel, int[] o, NarrowFields n, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            o[i] = (n.B[sel[i]] * n.Scale) + n.S[sel[i]] + n.Flag;
+        }
+    }
+
+    /// <summary>
+    /// Narrow struct fields on a varying local: uniform→varying broadcast, literal
+    /// array-member indexing, and a masked narrow-cast field write.
+    /// </summary>
+    [Spmd]
+    public static void NarrowStructLocal(int[] sel, int[] o, NarrowFields n, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            NarrowFields q = n;
+            if (sel[i] > 0)
+                q.Flag = (byte)(q.Flag + 200);
+            o[i] = q.B[1] + q.S[2] + q.Flag;
+        }
+    }
 }
 
 public class StructAndFunctionTests
@@ -703,5 +832,155 @@ public class StructAndFunctionTests
             Assert.True(MathF.Abs(actRe[i] - expRe[i]) <= 1e-4f * (1f + MathF.Abs(expRe[i])), $"re i={i}");
             Assert.True(MathF.Abs(actIm[i] - expIm[i]) <= 1e-4f * (1f + MathF.Abs(expIm[i])), $"im i={i}");
         }
+    }
+
+    [Fact]
+    public void SumCoefs_SpmdOverUniformArrayMember()
+    {
+        Poly p = MakePoly();
+
+        float expected = StructKernels.SumCoefs(p);
+        float actual = StructKernels.SumCoefs_Simd(p);
+
+        Assert.Equal(expected, actual, 5);
+    }
+
+    [Fact]
+    public void SelectCoefPerLane_GatherFromUniformArrayMembers()
+    {
+        Random r = new Random(28);
+        int[] sel = new int[N];
+        for (int i = 0; i < N; i++)
+            sel[i] = r.Next(0, 3);
+        float[] expO = new float[N], actO = new float[N];
+        int[] expT = new int[N], actT = new int[N];
+        Poly p = MakePoly();
+        StructKernels.SelectCoefPerLane(sel, expO, expT, p, N);
+
+        StructKernels.SelectCoefPerLane_Simd(sel, actO, actT, p, N);
+
+        for (int i = 0; i < N; i++)
+        {
+            Assert.Equal(expO[i], actO[i]);
+            Assert.Equal(expT[i], actT[i]);
+        }
+    }
+
+    private static Wide64 MakeWide64() => new Wide64
+    {
+        D = [1.5, -2.25, 1e9],
+        L = [7L, -3_000_000_000L, 42L],
+        B = [200, 5, 255],
+    };
+
+    [Fact]
+    public void SelectWide32_DoubleAndLongMembers_In32BitKernel()
+    {
+        Random r = new Random(29);
+        int[] sel = new int[N];
+        for (int i = 0; i < N; i++)
+            sel[i] = r.Next(0, 3);
+        float[] expO = new float[N], actO = new float[N];
+        int[] expT = new int[N], actT = new int[N];
+        Wide64 w = MakeWide64();
+        StructKernels.SelectWide32(sel, expO, expT, w, N);
+
+        StructKernels.SelectWide32_Simd(sel, actO, actT, w, N);
+
+        for (int i = 0; i < N; i++)
+        {
+            Assert.Equal(expO[i], actO[i]);
+            Assert.Equal(expT[i], actT[i]);
+        }
+    }
+
+    [Fact]
+    public void SelectInDoubleKernel_DoubleAndFloatMembers()
+    {
+        Random r = new Random(30);
+        double[] sel = new double[N];
+        for (int i = 0; i < N; i++)
+            sel[i] = r.Next(0, 3);
+        double[] expO = new double[N], actO = new double[N];
+        double[] expC = new double[N], actC = new double[N];
+        double[] expB = new double[N], actB = new double[N];
+        Wide64 w = MakeWide64();
+        Poly p = MakePoly();
+        StructKernels.SelectInDoubleKernel(sel, expO, expC, expB, w, p, N);
+
+        StructKernels.SelectInDoubleKernel_Simd(sel, actO, actC, actB, w, p, N);
+
+        for (int i = 0; i < N; i++)
+        {
+            Assert.Equal(expO[i], actO[i]);
+            Assert.Equal(expC[i], actC[i]);
+            Assert.Equal(expB[i], actB[i]);
+        }
+    }
+
+    [Fact]
+    public void SelectInLongKernel_LongAndIntMembers()
+    {
+        Random r = new Random(31);
+        long[] sel = new long[N];
+        for (int i = 0; i < N; i++)
+            sel[i] = r.Next(0, 3);
+        long[] expO = new long[N], actO = new long[N];
+        long[] expT = new long[N], actT = new long[N];
+        long[] expB = new long[N], actB = new long[N];
+        Wide64 w = MakeWide64();
+        Poly p = MakePoly();
+        StructKernels.SelectInLongKernel(sel, expO, expT, expB, w, p, N);
+
+        StructKernels.SelectInLongKernel_Simd(sel, actO, actT, actB, w, p, N);
+
+        for (int i = 0; i < N; i++)
+        {
+            Assert.Equal(expO[i], actO[i]);
+            Assert.Equal(expT[i], actT[i]);
+            Assert.Equal(expB[i], actB[i]);
+        }
+    }
+
+    private static NarrowFields MakeNarrow() => new NarrowFields
+    {
+        B = [200, 5, 255],
+        S = [-30000, 123, 32000],
+        Flag = 77,
+        Scale = -500,
+    };
+
+    [Fact]
+    public void NarrowStructUniform_ByteShortMembersAndFields()
+    {
+        Random r = new Random(32);
+        int[] sel = new int[N];
+        for (int i = 0; i < N; i++)
+            sel[i] = r.Next(0, 3);
+        int[] expected = new int[N], actual = new int[N];
+        NarrowFields n = MakeNarrow();
+        StructKernels.NarrowStructUniform(sel, expected, n, N);
+
+        StructKernels.NarrowStructUniform_Simd(sel, actual, n, N);
+
+        for (int i = 0; i < N; i++)
+            Assert.Equal(expected[i], actual[i]);
+    }
+
+    [Fact]
+    public void NarrowStructLocal_BroadcastAndMaskedFieldWrite()
+    {
+        Random r = new Random(33);
+        int[] sel = new int[N];
+        for (int i = 0; i < N; i++)
+            sel[i] = r.Next(-1, 2); // mix of masked-on and masked-off lanes
+        int[] expected = new int[N], actual = new int[N];
+        NarrowFields n = MakeNarrow();
+        StructKernels.NarrowStructLocal(sel, expected, n, N);
+
+        StructKernels.NarrowStructLocal_Simd(sel, actual, n, N);
+
+        for (int i = 0; i < N; i++)
+            Assert.Equal(expected[i], actual[i]);
     }
 }

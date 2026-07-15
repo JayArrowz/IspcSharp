@@ -662,14 +662,19 @@ internal sealed class VectorBodyEmitter
                     $"compound scatter '{op}' on '{scatterId.Identifier.Text}' (only '=' supported for indexed stores)", asg.GetLocation());
             }
 
+            Warn(Descriptors.ScatterPerf, eaScatter, eaScatter.ToString());
+
+            // Byte/short buffers: a truncating scatter — values are int lanes and each
+            // active lane stores its low 8/16 bits, exactly C#'s narrowing store.
             if (scatterParam.ElemKind is Kind.B or Kind.S)
             {
-                throw new UnsupportedConstructException(
-                    $"lane-varying indexed store into byte/short buffer '{scatterId.Identifier.Text}' (no 8/16-bit scatter; stage through an int[] or restructure to contiguous writes)",
-                    eaScatter.GetLocation());
+                var nIdxExpr = eaScatter.ArgumentList.Arguments[0].Expression;
+                string nVal = Coerce(Vec(asg.Right), Kind.I, asg.Right);
+                string nIdx = Coerce(Vec(nIdxExpr), Kind.I, nIdxExpr);
+                _ = sb.AppendLine($"{indent}Memory.Scatter({scatterId.Identifier.Text}, {nIdx}, {nVal}, {mask ?? MTAll});");
+                return;
             }
 
-            Warn(Descriptors.ScatterPerf, eaScatter, eaScatter.ToString());
             // Lower: Memory.Scatter(buf, indices, values, mask).
             // Long kernels index with VLong directly; double kernels truncate to VLong.
             var ek = scatterParam.ElemKind;
@@ -1506,7 +1511,8 @@ internal sealed class VectorBodyEmitter
                             $"array member '{field}' used without an index (write '{field}[k]' with a constant k)", at.GetLocation());
                     }
 
-                    return f.Kind;
+                    // Narrow (byte/short) fields live as int gangs in the companion.
+                    return SpmdGenerator.LaneKind(f.Kind);
                 }
             }
         }
@@ -1550,7 +1556,7 @@ internal sealed class VectorBodyEmitter
         }
 
         gang = $"{sid.Identifier.Text}.{f.GangName(k)}";
-        kind = f.Kind;
+        kind = SpmdGenerator.LaneKind(f.Kind);
         return true;
     }
 
@@ -1602,9 +1608,10 @@ internal sealed class VectorBodyEmitter
 
     /// <summary>
     /// Array-member read on a uniform [SpmdStruct] parameter: <c>p.Coef[j]</c>. The member is
-    /// an ordinary scalar array here, so any UNIFORM index works (unlike varying struct
-    /// locals, whose SoA-in-registers layout needs a compile-time literal). A lane-varying
-    /// index would be a per-lane gather from a heap array — rejected with guidance.
+    /// an ordinary scalar array here, so any UNIFORM index broadcasts (unlike varying struct
+    /// locals, whose SoA-in-registers layout needs a compile-time literal). A LANE-VARYING
+    /// index lowers to a per-lane gather from the scalar array — exactly ISPC's lowering of
+    /// <c>uniformStruct.arr[varyingIndex]</c> — and is flagged ISPC101 like any other gather.
     /// </summary>
     private bool TryUniformStructArrayRead(ElementAccessExpressionSyntax ea, out (string, Kind) result)
     {
@@ -1627,16 +1634,76 @@ internal sealed class VectorBodyEmitter
                 $"indexing non-array field '{f.Name}' of uniform struct '{id.Identifier.Text}'", ea.GetLocation());
         }
 
-        if (ea.ArgumentList.Arguments.Count != 1 ||
-            !IsUniformExpression(ea.ArgumentList.Arguments[0].Expression))
+        if (ea.ArgumentList.Arguments.Count != 1)
         {
             throw new UnsupportedConstructException(
-                $"per-lane index into uniform array member '{id.Identifier.Text}.{f.Name}' (uniform indices only; copy the data to a buffer parameter for lane-varying access)",
-                ea.GetLocation());
+                $"multi-dimensional index into uniform array member '{id.Identifier.Text}.{f.Name}'", ea.GetLocation());
         }
 
-        var bk = UniformBroadcastKind(f.Kind, ea);
-        result = ($"new {VType(bk)}({ea})", bk);
+        var idxArg = ea.ArgumentList.Arguments[0].Expression;
+        if (IsUniformExpression(idxArg))
+        {
+            var bk = UniformBroadcastKind(f.Kind, ea);
+            result = ($"new {VType(bk)}({ea})", bk);
+            return true;
+        }
+
+        // Lane-varying index → gather. Inactive lanes (in masked flow) take the fallback,
+        // which downstream blends discard, so out-of-loop lanes never read the array.
+        Warn(Descriptors.GatherPerf, ea, ea.ToString());
+        string src = $"{id.Identifier.Text}.{f.Name}";
+        string gmask = _exprMask ?? MTAll;
+
+        if (_d)
+        {
+            // Double kernels index with VLong (truncated from the double lane expression);
+            // double members gather natively, float/byte/short members through widening
+            // gathers (narrow ones land in VLong, then convert to the double lane).
+            if (f.Kind is Kind.L)
+            {
+                throw new UnsupportedConstructException(
+                    $"per-lane index into 'long' array member '{src}' in a double kernel", ea.GetLocation());
+            }
+
+            string idxD = $"VLong.FromDoubleTruncate({Coerce(Vec(idxArg), Kind.D, idxArg)})";
+            result = f.Kind switch
+            {
+                Kind.D => ($"Memory.Gather({src}, {idxD}, {gmask}, 0d)", Kind.D),
+                Kind.F => ($"Memory.Gather({src}, {idxD}, {gmask}, 0f)", Kind.D),
+                _ => ($"Memory.Gather({src}, {idxD}, {gmask}, 0).ToDouble()", Kind.D),
+            };
+            return true;
+        }
+
+        if (_l)
+        {
+            // Long kernels index with VLong directly; long members gather natively,
+            // int/byte/short members through the widening gathers.
+            if (f.Kind is Kind.F or Kind.D)
+            {
+                throw new UnsupportedConstructException(
+                    $"per-lane index into '{SpmdGenerator.ElemTypeName(f.Kind)}' array member '{src}' in a long kernel", ea.GetLocation());
+            }
+
+            string idxL = Coerce(Vec(idxArg), Kind.L, idxArg);
+            result = f.Kind == Kind.L
+                ? ($"Memory.Gather({src}, {idxL}, {gmask}, 0L)", Kind.L)
+                : ($"Memory.Gather({src}, {idxL}, {gmask}, 0)", Kind.L);
+            return true;
+        }
+
+        // 32-bit kernels: every member kind gathers. Float/int lanes use the int-gang
+        // gathers, byte/short members widen into int lanes, and double/long members come
+        // back as full-gang-width VDouble2/VLong2 pairs (the index gang widens into two
+        // long-gang halves, one hardware gather each).
+        string idx = Coerce(Vec(idxArg), Kind.I, idxArg);
+        result = f.Kind switch
+        {
+            Kind.F => ($"Memory.Gather({src}, {idx}, {gmask}, 0f)", Kind.F),
+            Kind.I or Kind.B or Kind.S => ($"Memory.Gather({src}, {idx}, {gmask}, 0)", Kind.I),
+            Kind.D => ($"Memory.Gather({src}, {idx}, {gmask}, 0d)", Kind.D),
+            _ => ($"Memory.Gather({src}, {idx}, {gmask}, 0L)", Kind.L),
+        };
         return true;
     }
 
@@ -1648,7 +1715,7 @@ internal sealed class VectorBodyEmitter
     {
         if (_l)
         {
-            return fieldKind is Kind.I or Kind.L
+            return fieldKind is Kind.I or Kind.L or Kind.B or Kind.S
                 ? Kind.L
                 : throw new UnsupportedConstructException(
                     "float/double struct field in a long kernel (64-bit integer gang)", at.GetLocation());
@@ -1656,7 +1723,7 @@ internal sealed class VectorBodyEmitter
 
         if (_d)
             return Kind.D;
-        return fieldKind;
+        return SpmdGenerator.LaneKind(fieldKind);
     }
 
     /// <summary>
@@ -1670,14 +1737,15 @@ internal sealed class VectorBodyEmitter
         var sets = new List<string>();
         foreach (var f in si.Fields)
         {
+            string gangType = VType(SpmdGenerator.LaneKind(f.Kind));
             if (f.IsArray)
             {
                 for (int k = 0; k < f.ArrayLength; k++)
-                    sets.Add($"{f.GangName(k)} = new {VType(f.Kind)}({name}.{f.Name}[{k}])");
+                    sets.Add($"{f.GangName(k)} = new {gangType}({name}.{f.Name}[{k}])");
             }
             else
             {
-                sets.Add($"{f.Name} = new {VType(f.Kind)}({name}.{f.Name})");
+                sets.Add($"{f.Name} = new {gangType}({name}.{f.Name})");
             }
         }
 
@@ -1762,11 +1830,11 @@ internal sealed class VectorBodyEmitter
                     // 'arr = new float[]{ e0, e1 }' → gang assignments 'arr_0 = e0, arr_1 = e1'.
                     var elems = ExtractArrayElements(a.Right, field.ArrayLength);
                     for (int i = 0; i < field.ArrayLength; i++)
-                        sets.Add($"{field.GangName(i)} = {Coerce(Vec(elems[i]), field.Kind, elems[i])}");
+                        sets.Add($"{field.GangName(i)} = {Coerce(Vec(elems[i]), SpmdGenerator.LaneKind(field.Kind), elems[i])}");
                 }
                 else
                 {
-                    sets.Add($"{field.Name} = {Coerce(Vec(a.Right), field.Kind, a.Right)}");
+                    sets.Add($"{field.Name} = {Coerce(Vec(a.Right), SpmdGenerator.LaneKind(field.Kind), a.Right)}");
                 }
             }
 
@@ -1788,7 +1856,7 @@ internal sealed class VectorBodyEmitter
 
         var ctor = new List<string>();
         for (int i = 0; i < ctorArgs.Count; i++)
-            ctor.Add(Coerce(Vec(ctorArgs[i].Expression), si.Fields[i].Kind, ctorArgs[i].Expression));
+            ctor.Add(Coerce(Vec(ctorArgs[i].Expression), SpmdGenerator.LaneKind(si.Fields[i].Kind), ctorArgs[i].Expression));
         return ($"new {vt}({string.Join(", ", ctor)})", type);
     }
 
@@ -2174,15 +2242,17 @@ internal sealed class VectorBodyEmitter
                 $"multi-dimensional gather from '{bufName}' (only single-index a[expr] supported)", ea.GetLocation());
         }
 
-        if (p.ElemKind is Kind.B or Kind.S)
-        {
-            throw new UnsupportedConstructException(
-                $"lane-varying index into byte/short buffer '{bufName}' (no 8/16-bit hardware gather; stage the data through an int[]/float[] table or restructure to contiguous access)",
-                ea.GetLocation());
-        }
-
         Warn(Descriptors.GatherPerf, ea, ea.ToString());
         var idxExpr = ea.ArgumentList.Arguments[0].Expression;
+
+        // Byte/short buffers (32-bit kernels only; wide kernels reject narrow buffers at
+        // the mode check): a widening gather into int lanes — a per-lane loop, since no
+        // 8/16-bit hardware gather exists. Masked so inactive lanes never read.
+        if (p.ElemKind is Kind.B or Kind.S)
+        {
+            string nIdx = Coerce(Vec(idxExpr), Kind.I, idxExpr);
+            return ($"Memory.Gather({bufName}, {nIdx}, {_exprMask ?? "VMask.All"}, 0)", Kind.I);
+        }
 
         // Long kernels index with VLong directly (the lane expression is already 64-bit).
         if (_l)

@@ -260,6 +260,12 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                         $"struct buffer '{bufStruct.Name}[]' has fixed-size array member fields (array-member structs are locals, helper args, or returns only; use separate SoA arrays for a buffer)", p.GetLocation());
                 }
 
+                if (bufStruct.HasNarrowField)
+                {
+                    throw new UnsupportedConstructException(
+                        $"struct buffer '{bufStruct.Name}[]' has byte/short fields (narrow-field structs are locals, uniform params, helper args, or returns only; use byte[]/short[] SoA buffers)", p.GetLocation());
+                }
+
                 // A mixed-field struct[] buffer is allowed when every field is 32-bit (float/int):
                 // the AoS array casts to one 4-byte element size, and each field is gathered/
                 // scattered through its own correctly-typed flat view. Mixing 32- and 64-bit
@@ -878,6 +884,10 @@ public sealed class SpmdGenerator : IIncrementalGenerator
             case "float":
                 return "VFloat";
             case "int":
+            case "byte":
+            case "sbyte":
+            case "short":
+            case "ushort":
                 return "VInt";
             case "double":
                 return "VDouble2";
@@ -886,7 +896,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
             default:
                 if (structs.TryGetValue(scalarType, out var si))
                     return si.VName;
-                throw new UnsupportedConstructException($"type '{scalarType}' (only float/int/double/long and [SpmdStruct] structs)");
+                throw new UnsupportedConstructException($"type '{scalarType}' (only float/int/double/long/byte/short and [SpmdStruct] structs)");
         }
     }
 
@@ -924,9 +934,9 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 _ = src.AppendLine($"    public struct {vt}");
                 _ = src.AppendLine("    {");
                 foreach (var g in gangs)
-                    _ = src.AppendLine($"        public {VType(g.Kind, false, false)} {g.Name};");
+                    _ = src.AppendLine($"        public {VType(LaneKind(g.Kind), false, false)} {g.Name};");
                 // Constructor.
-                string ctorParams = string.Join(", ", gangs.Select(g => $"{VType(g.Kind, false, false)} {g.Name}"));
+                string ctorParams = string.Join(", ", gangs.Select(g => $"{VType(LaneKind(g.Kind), false, false)} {g.Name}"));
                 _ = src.AppendLine($"        public {vt}({ctorParams})");
                 _ = src.AppendLine("        {");
                 foreach (var g in gangs)
@@ -934,7 +944,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 _ = src.AppendLine("        }");
                 // Per-lane blend.
                 _ = src.AppendLine($"        public static {vt} Select(VMask __m, {vt} __t, {vt} __f)");
-                string selArgs = string.Join(", ", gangs.Select(g => $"{VType(g.Kind, false, false)}.Select(__m, __t.{g.Name}, __f.{g.Name})"));
+                string selArgs = string.Join(", ", gangs.Select(g => $"{VType(LaneKind(g.Kind), false, false)}.Select(__m, __t.{g.Name}, __f.{g.Name})"));
                 _ = src.AppendLine($"            => new {vt}({selArgs});");
                 _ = src.AppendLine("    }");
                 _ = src.AppendLine();
@@ -1050,7 +1060,9 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         "int" => Kind.I,
         "double" => Kind.D,
         "long" => Kind.L,
-        _ => throw new UnsupportedConstructException($"type '{t}' (only float/int/double/long)", loc),
+        // Narrow scalars live as int lanes (C# promotes them to int in every expression).
+        "byte" or "sbyte" or "short" or "ushort" => Kind.I,
+        _ => throw new UnsupportedConstructException($"type '{t}' (only float/int/double/long/byte/short)", loc),
     };
 
     /// <summary>
@@ -1058,6 +1070,12 @@ public sealed class SpmdGenerator : IIncrementalGenerator
     /// full-int/float-gang-width pairs: double lanes are VDouble2, long lanes VLong2. In their
     /// own 64-bit kernels they're plain VDouble / VLong gangs.
     /// </summary>
+    /// <summary>
+    /// The register (lane-value) kind of a field/element kind: narrow memory kinds widen
+    /// to int lanes, everything else is already a lane kind.
+    /// </summary>
+    internal static Kind LaneKind(Kind k) => k is Kind.B or Kind.S ? Kind.I : k;
+
     internal static string VType(Kind k, bool doubleMode, bool longMode) => k switch
     {
         Kind.F => "VFloat",

@@ -179,6 +179,40 @@ public static partial class ByteShortKernels
             output[i] = samples[i] * (weights[i] * (1f / 255f));
         }
     }
+
+    /// <summary>
+    /// Lane-varying gathers from byte and short buffers: widening per-lane gathers into
+    /// int lanes (byte zero-extends, short sign-extends).
+    /// </summary>
+    /// <param name="bTable"></param>
+    /// <param name="sTable"></param>
+    /// <param name="idx"></param>
+    /// <param name="output"></param>
+    /// <param name="count"></param>
+    [Spmd]
+    public static void NarrowTableLookup(byte[] bTable, short[] sTable, int[] idx, int[] output, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            output[i] = bTable[idx[i]] + sTable[idx[i]];
+        }
+    }
+
+    /// <summary>
+    /// Lane-varying stores into a byte buffer: a truncating scatter.
+    /// </summary>
+    /// <param name="dest"></param>
+    /// <param name="idx"></param>
+    /// <param name="vals"></param>
+    /// <param name="count"></param>
+    [Spmd]
+    public static void ByteScatterWrite(byte[] dest, int[] idx, int[] vals, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            dest[idx[i]] = (byte)vals[i];
+        }
+    }
 }
 
 public class ByteShortKernelTests
@@ -363,5 +397,52 @@ public class ByteShortKernelTests
 
         for (int i = 0; i < n; i++)
             Assert.Equal(expected[i], actual[i]);
+    }
+
+    [Fact]
+    public void NarrowTableLookup_GathersWidenPerLane()
+    {
+        int n = OddCount;
+        var rng = new Random(41);
+        byte[] bTable = Bytes(n, i => (byte)(255 - (i % 256)));     // values > 127: zero-extension check
+        short[] sTable = Shorts(n, i => (short)((i * 700) - 9000)); // negatives: sign-extension check
+        int[] idx = new int[n];
+        for (int i = 0; i < n; i++)
+            idx[i] = rng.Next(0, n);
+        int[] expected = new int[n];
+        int[] actual = new int[n];
+        ByteShortKernels.NarrowTableLookup(bTable, sTable, idx, expected, n);
+
+        ByteShortKernels.NarrowTableLookup_Simd(bTable, sTable, idx, actual, n);
+
+        Assert.Equal(expected, actual);
+    }
+
+    [Fact]
+    public void ByteScatterWrite_TruncatesPerLane()
+    {
+        int n = OddCount;
+        var rng = new Random(42);
+        // A permutation, so scalar/SIMD agree regardless of duplicate-index ordering.
+        int[] idx = new int[n];
+        for (int i = 0; i < n; i++)
+            idx[i] = i;
+        for (int i = n - 1; i > 0; i--)
+        {
+            int j = rng.Next(i + 1);
+            (idx[i], idx[j]) = (idx[j], idx[i]);
+        }
+
+        int[] vals = new int[n];
+        for (int i = 0; i < n; i++)
+            vals[i] = (i * 313) - 400; // negative and >255 values: truncation check
+
+        byte[] expected = new byte[n];
+        byte[] actual = new byte[n];
+        ByteShortKernels.ByteScatterWrite(expected, idx, vals, n);
+
+        ByteShortKernels.ByteScatterWrite_Simd(actual, idx, vals, n);
+
+        Assert.Equal(expected, actual);
     }
 }

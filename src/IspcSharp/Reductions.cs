@@ -749,6 +749,176 @@ public static class Memory
         => Gather(source, indices, VMaskD.All);
 
     /// <summary>
+    /// Gather double lanes at full int-gang width (a <see cref="VDouble2"/> pair): the int
+    /// index gang widens into its two long-gang halves, one hardware gather each. Used for
+    /// double values indexed per-lane inside 32-bit (float/int) kernels.
+    /// </summary>
+    public static VDouble2 Gather(ReadOnlySpan<double> source, VInt indices, VMask mask, double fallback = 0d)
+    {
+        var (ilo, ihi) = VInt.Widen(indices);
+        var (mlo, mhi) = VMaskD.Widen(mask);
+        return new VDouble2(Gather(source, ilo, mlo, fallback), Gather(source, ihi, mhi, fallback));
+    }
+
+    /// <summary>
+    /// Gather 64-bit integer lanes at full int-gang width (a <see cref="VLong2"/> pair);
+    /// the integer mirror of the <see cref="VDouble2"/> overload above.
+    /// </summary>
+    public static VLong2 Gather(ReadOnlySpan<long> source, VInt indices, VMask mask, long fallback = 0L)
+    {
+        var (ilo, ihi) = VInt.Widen(indices);
+        var (mlo, mhi) = VMaskD.Widen(mask);
+        return new VLong2(Gather(source, ilo, mlo, fallback), Gather(source, ihi, mhi, fallback));
+    }
+
+    /// <summary>
+    /// Widening gather: float source into double lanes (float data indexed per-lane inside a
+    /// double kernel). Portable per-lane loop — there is no hardware float→double gather.
+    /// </summary>
+    public static VDouble Gather(ReadOnlySpan<float> source, VLong indices, VMaskD mask, float fallback = 0f)
+    {
+        int w = VDouble.LaneCount;
+        Span<long> idxs = stackalloc long[w];
+        indices.V.CopyTo(idxs);
+        Span<double> tmp = stackalloc double[w];
+        for (int l = 0; l < w; l++)
+            tmp[l] = mask.IsLaneActive(l) ? source[(int)idxs[l]] : fallback;
+
+        return VDouble.Load(tmp);
+    }
+
+    /// <summary>
+    /// Widening gather: int source into 64-bit integer lanes (int data indexed per-lane
+    /// inside a long kernel). Portable per-lane loop.
+    /// </summary>
+    public static VLong Gather(ReadOnlySpan<int> source, VLong indices, VMaskD mask, int fallback = 0)
+    {
+        int w = VLong.LaneCount;
+        Span<long> idxs = stackalloc long[w];
+        indices.V.CopyTo(idxs);
+        Span<long> tmp = stackalloc long[w];
+        for (int l = 0; l < w; l++)
+            tmp[l] = mask.IsLaneActive(l) ? source[(int)idxs[l]] : fallback;
+
+        return VLong.Load(tmp);
+    }
+
+    /// <summary>
+    /// Widening gather: byte source into int lanes, zero-extended (byte data indexed
+    /// per-lane, ISPC's <c>uint8</c> gather on i32 targets). Portable per-lane loop —
+    /// there is no 8-bit hardware gather.
+    /// </summary>
+    public static VInt Gather(ReadOnlySpan<byte> source, VInt indices, VMask mask, byte fallback = 0)
+    {
+        int w = VInt.LaneCount;
+        Span<int> idxs = stackalloc int[w];
+        indices.V.CopyTo(idxs);
+        Span<int> tmp = stackalloc int[w];
+        for (int l = 0; l < w; l++)
+            tmp[l] = mask.IsLaneActive(l) ? source[idxs[l]] : fallback;
+
+        return VInt.Load(tmp);
+    }
+
+    /// <summary>
+    /// Widening gather: short source into int lanes, sign-extended. Portable per-lane loop.
+    /// </summary>
+    public static VInt Gather(ReadOnlySpan<short> source, VInt indices, VMask mask, short fallback = 0)
+    {
+        int w = VInt.LaneCount;
+        Span<int> idxs = stackalloc int[w];
+        indices.V.CopyTo(idxs);
+        Span<int> tmp = stackalloc int[w];
+        for (int l = 0; l < w; l++)
+            tmp[l] = mask.IsLaneActive(l) ? source[idxs[l]] : fallback;
+
+        return VInt.Load(tmp);
+    }
+
+    /// <summary>
+    /// Widening gather: byte source into 64-bit integer lanes, zero-extended (byte data
+    /// indexed per-lane inside a double/long kernel). Portable per-lane loop.
+    /// </summary>
+    public static VLong Gather(ReadOnlySpan<byte> source, VLong indices, VMaskD mask, byte fallback = 0)
+    {
+        int w = VLong.LaneCount;
+        Span<long> idxs = stackalloc long[w];
+        indices.V.CopyTo(idxs);
+        Span<long> tmp = stackalloc long[w];
+        for (int l = 0; l < w; l++)
+            tmp[l] = mask.IsLaneActive(l) ? source[(int)idxs[l]] : fallback;
+
+        return VLong.Load(tmp);
+    }
+
+    /// <summary>
+    /// Widening gather: short source into 64-bit integer lanes, sign-extended. Portable per-lane loop.
+    /// </summary>
+    public static VLong Gather(ReadOnlySpan<short> source, VLong indices, VMaskD mask, short fallback = 0)
+    {
+        int w = VLong.LaneCount;
+        Span<long> idxs = stackalloc long[w];
+        indices.V.CopyTo(idxs);
+        Span<long> tmp = stackalloc long[w];
+        for (int l = 0; l < w; l++)
+            tmp[l] = mask.IsLaneActive(l) ? source[(int)idxs[l]] : fallback;
+
+        return VLong.Load(tmp);
+    }
+
+    /// <summary>
+    /// Truncating scatter into a byte buffer: destination[indices[lane]] = (byte)values[lane]
+    /// for active lanes (higher lane wins on duplicate indices, matching ISPC). Same
+    /// movemask-driven active-lane path as the other scatters.
+    /// </summary>
+    public static void Scatter(Span<byte> destination, VInt indices, VInt values, VMask mask)
+    {
+#if NET8_0_OR_GREATER
+        if (TryGetActiveBits(mask, out uint bits))
+        {
+            while (bits != 0)
+            {
+                int l = BitOperations.TrailingZeroCount(bits);
+                bits &= bits - 1;
+                destination[indices.V[l]] = (byte)values.V[l];
+            }
+
+            return;
+        }
+#endif
+        for (int l = 0; l < VInt.LaneCount; l++)
+        {
+            if (mask.IsLaneActive(l))
+                destination[indices.V[l]] = (byte)values.V[l];
+        }
+    }
+
+    /// <summary>
+    /// Truncating scatter into a short buffer; same semantics as the byte overload.
+    /// </summary>
+    public static void Scatter(Span<short> destination, VInt indices, VInt values, VMask mask)
+    {
+#if NET8_0_OR_GREATER
+        if (TryGetActiveBits(mask, out uint bits))
+        {
+            while (bits != 0)
+            {
+                int l = BitOperations.TrailingZeroCount(bits);
+                bits &= bits - 1;
+                destination[indices.V[l]] = (short)values.V[l];
+            }
+
+            return;
+        }
+#endif
+        for (int l = 0; l < VInt.LaneCount; l++)
+        {
+            if (mask.IsLaneActive(l))
+                destination[indices.V[l]] = (short)values.V[l];
+        }
+    }
+
+    /// <summary>
     /// Scatter for long lanes; same semantics and hardware mask path as the double overload.
     /// </summary>
     public static void Scatter(Span<long> destination, VLong indices, VLong values, VMaskD mask)
