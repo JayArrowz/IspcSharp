@@ -27,7 +27,7 @@ The .NET JIT auto-vectorizes almost nothing beyond trivial loops. Hardware intri
 
 
 ## Performance
-Benchmarks are run automatically on Linux x64 (AVX2), Windows x64 (AVX2), and macOS ARM64 (Apple Silicon / NEON) using GitHub Actions [here](https://github.com/JayArrowz/IspcSharp/actions/runs/29326842215/attempts/2#summary-87066998054).
+Benchmarks are run automatically on Linux x64 (AVX2), Windows x64 (AVX2), and macOS ARM64 (Apple Silicon / NEON) using GitHub Actions [here](https://github.com/JayArrowz/IspcSharp/actions/runs/29409094802/attempts/1#summary-87334053543).
 
 Across the benchmark suite:
 
@@ -46,7 +46,7 @@ Install the Nuget Packages, IspcSharp & IspcSharp.Generators
 
 For the generator to work it must be like this:
 ```xml
-<PackageReference Include="IspcSharp.Generators" OutputItemType="Analyzer" ReferenceOutputAssembly="false" Version="1.0.4">
+<PackageReference Include="IspcSharp.Generators" OutputItemType="Analyzer" ReferenceOutputAssembly="false" Version="1.0.5">
 ```
 
 ## Usage
