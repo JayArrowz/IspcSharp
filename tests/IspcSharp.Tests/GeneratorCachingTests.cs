@@ -158,4 +158,62 @@ public class GeneratorCachingTests
         Assert.Contains("2f", a.SourceText.ToString());
         Assert.Contains("3f", b.SourceText.ToString());
     }
+
+    [Fact]
+    public void SameFunctionName_InDifferentClasses_BothGenerate_AndResolvePerClass()
+    {
+        const string source = """
+            using IspcSharp;
+
+            namespace CacheDemo;
+
+            public static partial class DspA
+            {
+                [SpmdFunction]
+                public static float Curve(float x) => x * x;
+
+                [Spmd]
+                public static void Apply(float[] input, float[] output, int count)
+                {
+                    foreach (int i in Spmd.Range(count))
+                    {
+                        output[i] = Curve(input[i]);
+                    }
+                }
+            }
+
+            public static partial class DspB
+            {
+                [SpmdFunction]
+                public static float Curve(float x, float gain) => x * gain;
+
+                [Spmd]
+                public static void Apply(float[] input, float[] output, float gain, int count)
+                {
+                    foreach (int i in Spmd.Range(count))
+                    {
+                        output[i] = Curve(input[i], gain);
+                    }
+                }
+            }
+            """;
+
+        var driver = CreateDriver().RunGeneratorsAndUpdateCompilation(
+            CreateCompilation(source), out var outputCompilation, out _);
+        GeneratorRunResult result = driver.GetRunResult().Results[0];
+
+        Assert.Empty(result.Diagnostics);
+
+        var a = result.GeneratedSources.Single(s => s.HintName == "CacheDemo.DspA.Curve_SpmdFn.g.cs");
+        var b = result.GeneratedSources.Single(s => s.HintName == "CacheDemo.DspB.Curve_SpmdFn.g.cs");
+        Assert.Contains("x * x", a.SourceText.ToString());
+        Assert.Contains("gain", b.SourceText.ToString());
+
+        _ = result.GeneratedSources.Single(s => s.HintName == "CacheDemo.DspA.Apply_Spmd.g.cs");
+        _ = result.GeneratedSources.Single(s => s.HintName == "CacheDemo.DspB.Apply_Spmd.g.cs");
+        var errors = outputCompilation.GetDiagnostics()
+            .Where(d => d.Severity == DiagnosticSeverity.Error)
+            .ToList();
+        Assert.Empty(errors);
+    }
 }

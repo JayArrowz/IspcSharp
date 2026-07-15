@@ -78,19 +78,19 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 spc.AddSource("__SpmdStructs.g.cs", SourceText.From(src, Encoding.UTF8));
         });
 
-        // Varying companions for the [SpmdFunction] helpers.
         context.RegisterSourceOutput(tables, static (spc, pair) =>
         {
             var structMap = BuildStructMap(pair.Left);
-            var fnMap = BuildFunctionMap(pair.Right);
-            foreach (var fn in fnMap.Values)
+            var functions = DistinctFunctions(pair.Right);
+            foreach (var fn in functions)
             {
                 try
                 {
                     var method = ParseMethod(fn.DeclarationText);
                     if (method is null)
                         continue;
-                    string? src = GenerateFunctionSource(fn, method, structMap, fnMap, DropDiagnostic);
+                    var fnScope = ScopedFunctionMap(functions, fn.Namespace, fn.TypeName);
+                    string? src = GenerateFunctionSource(fn, method, structMap, fnScope, DropDiagnostic);
                     if (src != null)
                         spc.AddSource(HintName(fn.Namespace, fn.TypeName, fn.Name, "_SpmdFn.g.cs"), SourceText.From(src, Encoding.UTF8));
                 }
@@ -111,7 +111,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 if (method is null)
                     return;
                 var structMap = BuildStructMap(pair.Right.Left);
-                var fnMap = BuildFunctionMap(pair.Right.Right);
+                var fnMap = ScopedFunctionMap(pair.Right.Right, kernel.Namespace, kernel.TypeName);
                 string? src = GenerateKernelSource(kernel, method, structMap, fnMap, DropDiagnostic);
                 if (src != null)
                     spc.AddSource(HintName(kernel.Namespace, kernel.TypeName, kernel.Name, "_Spmd.g.cs"), SourceText.From(src, Encoding.UTF8));
@@ -1012,8 +1012,31 @@ public sealed class SpmdGenerator : IIncrementalGenerator
     internal static Dictionary<string, StructInfo> BuildStructMap(IEnumerable<StructInfo> structs)
         => structs.GroupBy(s => s.Name).ToDictionary(g => g.Key, g => g.First());
 
-    internal static Dictionary<string, FunctionInfo> BuildFunctionMap(IEnumerable<FunctionInfo> functions)
-        => functions.GroupBy(f => f.Name).ToDictionary(g => g.Key, g => g.First());
+    /// <summary>
+    /// All distinct [SpmdFunction] helpers (one per container + name), in deterministic order.
+    /// Helpers with the same name in DIFFERENT containers are separate entries — each gets its
+    /// own varying companion.
+    /// </summary>
+    internal static List<FunctionInfo> DistinctFunctions(IEnumerable<FunctionInfo> functions)
+        => [.. functions
+            .GroupBy(f => (f.Namespace, f.TypeName, f.Name))
+            .Select(g => g.First())
+            .OrderBy(f => f.Namespace, StringComparer.Ordinal)
+            .ThenBy(f => f.TypeName, StringComparer.Ordinal)
+            .ThenBy(f => f.Name, StringComparer.Ordinal)];
+
+    /// <summary>
+    /// The helpers visible to a method by simple name: those in its own containing type
+    /// (kernels call helpers as bare identifiers, which C# resolves within the same type —
+    /// partial declarations included). Scoping the lookup this way keeps two same-named
+    /// helpers in different classes from resolving against each other's signatures.
+    /// </summary>
+    internal static Dictionary<string, FunctionInfo> ScopedFunctionMap(
+        IEnumerable<FunctionInfo> functions, string ns, string typeName)
+        => functions
+            .Where(f => f.Namespace == ns && f.TypeName == typeName)
+            .GroupBy(f => f.Name)
+            .ToDictionary(g => g.Key, g => g.First());
 
     internal static Kind KindOfScalar(string t, Location loc) => t switch
     {

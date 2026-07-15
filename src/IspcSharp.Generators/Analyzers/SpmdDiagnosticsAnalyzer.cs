@@ -35,7 +35,7 @@ public sealed class SpmdDiagnosticsAnalyzer : DiagnosticAnalyzer
         context.EnableConcurrentExecution();
         context.RegisterCompilationStartAction(static compilationContext =>
         {
-            var tables = new Lazy<(Dictionary<string, StructInfo> Structs, Dictionary<string, FunctionInfo> Functions)>(
+            var tables = new Lazy<(Dictionary<string, StructInfo> Structs, List<FunctionInfo> Functions)>(
                 () => BuildTables(compilationContext.Compilation));
 
             compilationContext.RegisterSyntaxNodeAction(
@@ -46,7 +46,7 @@ public sealed class SpmdDiagnosticsAnalyzer : DiagnosticAnalyzer
 
     private static void AnalyzeMethod(
         SyntaxNodeAnalysisContext ctx,
-        Lazy<(Dictionary<string, StructInfo> Structs, Dictionary<string, FunctionInfo> Functions)> tables)
+        Lazy<(Dictionary<string, StructInfo> Structs, List<FunctionInfo> Functions)> tables)
     {
         var method = (MethodDeclarationSyntax)ctx.Node;
         bool isKernel = SpmdGenerator.HasAttribute(method.AttributeLists, "Spmd");
@@ -54,14 +54,21 @@ public sealed class SpmdDiagnosticsAnalyzer : DiagnosticAnalyzer
         if (!isKernel && !isFunction)
             return;
 
-        var (structMap, fnMap) = tables.Value;
+        var (structMap, functions) = tables.Value;
         try
         {
-            _ = isKernel
-                ? SpmdGenerator.GenerateKernelSource(
-                    KernelInfo.From(method), method, structMap, fnMap, ctx.ReportDiagnostic)
-                : SpmdGenerator.GenerateFunctionSource(
-                    FunctionInfo.From(method), method, structMap, fnMap, ctx.ReportDiagnostic);
+            if (isKernel)
+            {
+                var info = KernelInfo.From(method);
+                var fnMap = SpmdGenerator.ScopedFunctionMap(functions, info.Namespace, info.TypeName);
+                _ = SpmdGenerator.GenerateKernelSource(info, method, structMap, fnMap, ctx.ReportDiagnostic);
+            }
+            else
+            {
+                var info = FunctionInfo.From(method);
+                var fnMap = SpmdGenerator.ScopedFunctionMap(functions, info.Namespace, info.TypeName);
+                _ = SpmdGenerator.GenerateFunctionSource(info, method, structMap, fnMap, ctx.ReportDiagnostic);
+            }
         }
         catch (UnsupportedConstructException ex)
         {
@@ -75,7 +82,7 @@ public sealed class SpmdDiagnosticsAnalyzer : DiagnosticAnalyzer
     /// Syntax-only scan for [SpmdStruct]/[SpmdFunction] declarations across the compilation
     /// (the same syntactic parse the generator's transforms use).
     /// </summary>
-    private static (Dictionary<string, StructInfo> Structs, Dictionary<string, FunctionInfo> Functions) BuildTables(
+    private static (Dictionary<string, StructInfo> Structs, List<FunctionInfo> Functions) BuildTables(
         Compilation compilation)
     {
         var structs = new List<StructInfo>();
@@ -99,6 +106,6 @@ public sealed class SpmdDiagnosticsAnalyzer : DiagnosticAnalyzer
             }
         }
 
-        return (SpmdGenerator.BuildStructMap(structs), SpmdGenerator.BuildFunctionMap(functions));
+        return (SpmdGenerator.BuildStructMap(structs), SpmdGenerator.DistinctFunctions(functions));
     }
 }
