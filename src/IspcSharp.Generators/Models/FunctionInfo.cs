@@ -13,6 +13,7 @@ internal sealed record FunctionInfo(
     EquatableReadOnlyList<(string Name, string Type)> Parameters,
     string DeclarationText,
     string TypeHeader,
+    string TypeName,
     bool TypeIsPartial,
     string Namespace)
 {
@@ -21,13 +22,14 @@ internal sealed record FunctionInfo(
         var ps = m.ParameterList.Parameters
             .Select(p => (p.Identifier.Text, p.Type?.ToString().Trim() ?? ""))
             .ToList();
-        var (header, isPartial, ns) = DeclarationModel.ContainerOf(m);
+        var (header, typeName, isPartial, ns) = DeclarationModel.ContainerOf(m);
         return new FunctionInfo(
             m.Identifier.Text,
             m.ReturnType.ToString().Trim(),
             new EquatableReadOnlyList<(string Name, string Type)>(ps),
             m.ToFullString(),
             header,
+            typeName,
             isPartial,
             ns);
     }

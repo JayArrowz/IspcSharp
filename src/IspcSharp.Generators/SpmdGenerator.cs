@@ -92,7 +92,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                         continue;
                     string? src = GenerateFunctionSource(fn, method, structMap, fnMap, DropDiagnostic);
                     if (src != null)
-                        spc.AddSource($"{fn.Name}_SpmdFn.g.cs", SourceText.From(src, Encoding.UTF8));
+                        spc.AddSource(HintName(fn.Namespace, fn.TypeName, fn.Name, "_SpmdFn.g.cs"), SourceText.From(src, Encoding.UTF8));
                 }
                 catch (UnsupportedConstructException)
                 {
@@ -114,7 +114,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 var fnMap = BuildFunctionMap(pair.Right.Right);
                 string? src = GenerateKernelSource(kernel, method, structMap, fnMap, DropDiagnostic);
                 if (src != null)
-                    spc.AddSource($"{kernel.Name}_Spmd.g.cs", SourceText.From(src, Encoding.UTF8));
+                    spc.AddSource(HintName(kernel.Namespace, kernel.TypeName, kernel.Name, "_Spmd.g.cs"), SourceText.From(src, Encoding.UTF8));
             }
             catch (UnsupportedConstructException)
             {
@@ -130,6 +130,14 @@ public sealed class SpmdGenerator : IIncrementalGenerator
     private static void DropDiagnostic(Diagnostic _)
     {
     }
+
+    /// <summary>
+    /// Fully qualified hint name (Namespace.Type.Member + suffix), so kernels with the
+    /// same method name in different types/namespaces never collide on the generated
+    /// file name (a hintName collision aborts the entire generator pass).
+    /// </summary>
+    private static string HintName(string ns, string typeName, string member, string suffix)
+        => $"{(ns.Length > 0 ? ns + "." : "")}{(typeName.Length > 0 ? typeName + "." : "")}{member}{suffix}";
 
     /// <summary>
     /// Re-parse a pipeline model's declaration text back to a method node for emission.

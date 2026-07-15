@@ -11,21 +11,24 @@ namespace IspcSharp.Generators.Models;
 /// </summary>
 internal static class DeclarationModel
 {
-    public static (string TypeHeader, bool TypeIsPartial, string Namespace) ContainerOf(MethodDeclarationSyntax m)
+    public static (string TypeHeader, string TypeName, bool TypeIsPartial, string Namespace) ContainerOf(MethodDeclarationSyntax m)
     {
         if (m.Parent is not TypeDeclarationSyntax type)
-            return ("", false, "");
+            return ("", "", false, "");
 
         bool isPartial = type.Modifiers.Any(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PartialKeyword);
         string header = $"{type.Modifiers} {type.Keyword.Text} {type.Identifier.Text}";
 
+        var typeParts = new List<string> { type.Identifier.Text };
         var parts = new List<string>();
         for (var n = type.Parent; n != null; n = n.Parent)
         {
+            if (n is TypeDeclarationSyntax outer)
+                typeParts.Insert(0, outer.Identifier.Text);
             if (n is BaseNamespaceDeclarationSyntax nds)
                 parts.Insert(0, nds.Name.ToString());
         }
 
-        return (header, isPartial, string.Join(".", parts));
+        return (header, string.Join(".", typeParts), isPartial, string.Join(".", parts));
     }
 }

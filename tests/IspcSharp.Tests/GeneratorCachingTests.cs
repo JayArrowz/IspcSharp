@@ -69,8 +69,8 @@ public class GeneratorCachingTests
         var driver = CreateDriver().RunGenerators(CreateCompilation(KernelSource));
         GeneratorRunResult result = driver.GetRunResult().Results[0];
         Assert.Empty(result.Diagnostics);
-        Assert.Contains(result.GeneratedSources, s => s.HintName == "Blend_Spmd.g.cs");
-        Assert.Contains(result.GeneratedSources, s => s.HintName == "Lerp_SpmdFn.g.cs");
+        Assert.Contains(result.GeneratedSources, s => s.HintName == "CacheDemo.Kernels.Blend_Spmd.g.cs");
+        Assert.Contains(result.GeneratedSources, s => s.HintName == "CacheDemo.Kernels.Lerp_SpmdFn.g.cs");
         Assert.Contains(result.GeneratedSources, s => s.HintName == "__SpmdStructs.g.cs");
     }
 
@@ -112,7 +112,50 @@ public class GeneratorCachingTests
         driver = driver.RunGenerators(edited);
         GeneratorRunResult result = driver.GetRunResult().Results[0];
 
-        var blend = result.GeneratedSources.Single(s => s.HintName == "Blend_Spmd.g.cs");
+        var blend = result.GeneratedSources.Single(s => s.HintName == "CacheDemo.Kernels.Blend_Spmd.g.cs");
         Assert.Contains("2f", blend.SourceText.ToString());
+    }
+
+    [Fact]
+    public void SameKernelName_InDifferentClasses_BothGenerate()
+    {
+        const string source = """
+            using IspcSharp;
+
+            namespace CacheDemo;
+
+            public static partial class KernelsA
+            {
+                [Spmd]
+                public static void Scale(float[] a, float[] o, int count)
+                {
+                    foreach (int i in Spmd.Range(count))
+                    {
+                        o[i] = a[i] * 2f;
+                    }
+                }
+            }
+
+            public static partial class KernelsB
+            {
+                [Spmd]
+                public static void Scale(float[] a, float[] o, int count)
+                {
+                    foreach (int i in Spmd.Range(count))
+                    {
+                        o[i] = a[i] * 3f;
+                    }
+                }
+            }
+            """;
+
+        var driver = CreateDriver().RunGenerators(CreateCompilation(source));
+        GeneratorRunResult result = driver.GetRunResult().Results[0];
+
+        Assert.Empty(result.Diagnostics);
+        var a = result.GeneratedSources.Single(s => s.HintName == "CacheDemo.KernelsA.Scale_Spmd.g.cs");
+        var b = result.GeneratedSources.Single(s => s.HintName == "CacheDemo.KernelsB.Scale_Spmd.g.cs");
+        Assert.Contains("2f", a.SourceText.ToString());
+        Assert.Contains("3f", b.SourceText.ToString());
     }
 }
