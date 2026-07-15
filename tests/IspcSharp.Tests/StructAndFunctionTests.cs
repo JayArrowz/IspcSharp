@@ -322,6 +322,63 @@ public static partial class StructKernels
             tag[i] = p.Tag[0] + p.Tag[1];
         }
     }
+
+    /// <summary>
+    /// Uniform [SpmdStruct] kernel parameter (ISPC's 'uniform struct' export arg): scalar
+    /// field, literal-indexed array members (float AND int), all broadcast per gang.
+    /// </summary>
+    [Spmd]
+    public static void EvalUniformPoly(float[] xs, float[] ys, Poly p, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            float x = xs[i];
+            ys[i] = (p.Coef[0] + (p.Coef[1] * x) + (p.Coef[2] * (x * x)) + p.Bias) * p.Tag[0];
+        }
+    }
+
+    /// <summary>
+    /// Uniform struct array member indexed by a RUNTIME uniform value — legal on a uniform
+    /// param (it's an ordinary scalar array), unlike varying struct locals which need a
+    /// compile-time literal.
+    /// </summary>
+    [Spmd]
+    public static void ScaleBySelectedCoef(float[] xs, float[] ys, Poly p, int idx, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            ys[i] = xs[i] * p.Coef[idx];
+        }
+    }
+
+    /// <summary>
+    /// Uniform→varying struct broadcast: assigning the uniform param to a struct local
+    /// splats every field gang (ISPC's implicit uniform→varying struct conversion).
+    /// </summary>
+    [Spmd]
+    public static void PolyThroughLocal(float[] xs, float[] ys, Poly p, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            Poly q = p;
+            ys[i] = (q.Coef[1] * xs[i]) + q.Bias;
+        }
+    }
+
+    /// <summary>
+    /// Uniform struct passed straight into a [SpmdFunction] helper's struct parameter.
+    /// </summary>
+    [Spmd]
+    public static void MulByUniformComplex(float[] re, float[] im, float[] outRe, float[] outIm, Complex w, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            Complex v = new Complex { Re = re[i], Im = im[i] };
+            Complex r = CMul(v, w);
+            outRe[i] = r.Re;
+            outIm[i] = r.Im;
+        }
+    }
 }
 
 public class StructAndFunctionTests
@@ -545,6 +602,106 @@ public class StructAndFunctionTests
         {
             Assert.Equal(x[i] + (x[i] * 2f), o[i], 3);
             Assert.Equal(i + (i * 2), tag[i]);
+        }
+    }
+
+    private static Poly MakePoly() => new Poly
+    {
+        Coef = [0.5f, -1.25f, 2.75f],
+        Tag = [3, 7],
+        Bias = 0.125f,
+    };
+
+    [Fact]
+    public void EvalUniformPoly_UniformStructArg_MatchesScalar()
+    {
+        Random r = new Random(23);
+        float[] xs = Rand(N, r);
+        float[] expected = new float[N];
+        float[] actual = new float[N];
+        Poly p = MakePoly();
+        StructKernels.EvalUniformPoly(xs, expected, p, N);
+
+        StructKernels.EvalUniformPoly_Simd(xs, actual, p, N);
+
+        for (int i = 0; i < N; i++)
+        {
+            // coef*x terms fuse into FMAs (single rounding), so compare with a relative tolerance.
+            Assert.True(MathF.Abs(actual[i] - expected[i]) <= 1e-4f * (1f + MathF.Abs(expected[i])),
+                $"i={i}: {actual[i]} vs {expected[i]}");
+        }
+    }
+
+    [Fact]
+    public void EvalUniformPoly_ParallelSimd_MatchesScalar()
+    {
+        Random r = new Random(24);
+        float[] xs = Rand(N, r);
+        float[] expected = new float[N];
+        float[] actual = new float[N];
+        Poly p = MakePoly();
+        StructKernels.EvalUniformPoly(xs, expected, p, N);
+
+        StructKernels.EvalUniformPoly_ParallelSimd(xs, actual, p, N, minChunkSize: 64);
+
+        for (int i = 0; i < N; i++)
+        {
+            Assert.True(MathF.Abs(actual[i] - expected[i]) <= 1e-4f * (1f + MathF.Abs(expected[i])),
+                $"i={i}: {actual[i]} vs {expected[i]}");
+        }
+    }
+
+    [Fact]
+    public void ScaleBySelectedCoef_RuntimeUniformIndex()
+    {
+        Random r = new Random(25);
+        float[] xs = Rand(N, r);
+        float[] actual = new float[N];
+        Poly p = MakePoly();
+
+        for (int idx = 0; idx < 3; idx++)
+        {
+            StructKernels.ScaleBySelectedCoef_Simd(xs, actual, p, idx, N);
+            for (int i = 0; i < N; i++)
+                Assert.Equal(xs[i] * p.Coef[idx], actual[i]);
+        }
+    }
+
+    [Fact]
+    public void PolyThroughLocal_UniformToVaryingBroadcast()
+    {
+        Random r = new Random(26);
+        float[] xs = Rand(N, r);
+        float[] expected = new float[N];
+        float[] actual = new float[N];
+        Poly p = MakePoly();
+        StructKernels.PolyThroughLocal(xs, expected, p, N);
+
+        StructKernels.PolyThroughLocal_Simd(xs, actual, p, N);
+
+        for (int i = 0; i < N; i++)
+        {
+            Assert.True(MathF.Abs(actual[i] - expected[i]) <= 1e-4f * (1f + MathF.Abs(expected[i])),
+                $"i={i}: {actual[i]} vs {expected[i]}");
+        }
+    }
+
+    [Fact]
+    public void MulByUniformComplex_StructArgToHelper()
+    {
+        Random r = new Random(27);
+        float[] re = Rand(N, r), im = Rand(N, r);
+        float[] expRe = new float[N], expIm = new float[N];
+        float[] actRe = new float[N], actIm = new float[N];
+        Complex w = new Complex { Re = 0.6f, Im = -0.8f };
+        StructKernels.MulByUniformComplex(re, im, expRe, expIm, w, N);
+
+        StructKernels.MulByUniformComplex_Simd(re, im, actRe, actIm, w, N);
+
+        for (int i = 0; i < N; i++)
+        {
+            Assert.True(MathF.Abs(actRe[i] - expRe[i]) <= 1e-4f * (1f + MathF.Abs(expRe[i])), $"re i={i}");
+            Assert.True(MathF.Abs(actIm[i] - expIm[i]) <= 1e-4f * (1f + MathF.Abs(expIm[i])), $"im i={i}");
         }
     }
 }

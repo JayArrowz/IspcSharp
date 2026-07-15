@@ -274,6 +274,12 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 structElem = bufStruct.Name;
             }
 
+            if (kind == ParamKind.Unsupported && structMap.TryGetValue(t, out var uniformStruct))
+            {
+                kind = ParamKind.UniformStruct;
+                structElem = uniformStruct.Name;
+            }
+
             if (kind == ParamKind.Unsupported)
             {
                 report(Diagnostic.Create(Descriptors.BadParam, p.GetLocation(), name, p.Identifier.Text, t));

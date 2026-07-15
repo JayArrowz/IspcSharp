@@ -1189,6 +1189,9 @@ internal sealed class VectorBodyEmitter
         // Struct field access: 'v.field' on a struct local, or 'buf[i].field' on a struct buffer.
         MemberAccessExpressionSyntax sfa when TryStructFieldRead(sfa, out var sfr) => sfr,
 
+        // Scalar field of a uniform [SpmdStruct] parameter: 'p.Bias' => broadcast.
+        MemberAccessExpressionSyntax uma when TryUniformStructMemberRead(uma, out var umr) => umr,
+
         // Known scalar constants: MathF.PI / Math.PI / float.MaxValue / int.MinValue / ...
         MemberAccessExpressionSyntax cma when TryConstMember(cma, out var cc) => cc,
 
@@ -1211,6 +1214,9 @@ internal sealed class VectorBodyEmitter
             eaGather.Expression is IdentifierNameSyntax gatherId &&
             _params.TryGetValue(gatherId.Identifier.Text, out var gatherParam) && gatherParam.IsBuffer
             => EmitGather(eaGather, gatherId.Identifier.Text, gatherParam),
+
+        // Array member of a uniform [SpmdStruct] parameter: 'p.Coef[j]' (uniform j) => broadcast.
+        ElementAccessExpressionSyntax uea when TryUniformStructArrayRead(uea, out var uar) => uar,
 
         BinaryExpressionSyntax bin => BinExpr(bin),
 
@@ -1574,6 +1580,111 @@ internal sealed class VectorBodyEmitter
     }
 
     /// <summary>
+    /// Field read on a uniform [SpmdStruct] parameter: <c>p.Bias</c> stays a scalar
+    /// expression in the companion (the struct is a plain value argument) and broadcasts
+    /// into a gang, exactly like a uniform scalar parameter.
+    /// </summary>
+    private bool TryUniformStructMemberRead(MemberAccessExpressionSyntax ma, out (string, Kind) result)
+    {
+        result = default;
+        if (ma.Expression is not IdentifierNameSyntax id ||
+            !_params.TryGetValue(id.Identifier.Text, out var p) ||
+            p.PKind != ParamKind.UniformStruct)
+        {
+            return false;
+        }
+
+        var k = FieldKind(p.StructType!, ma.Name.Identifier.Text, ma);
+        var bk = UniformBroadcastKind(k, ma);
+        result = ($"new {VType(bk)}({ma})", bk);
+        return true;
+    }
+
+    /// <summary>
+    /// Array-member read on a uniform [SpmdStruct] parameter: <c>p.Coef[j]</c>. The member is
+    /// an ordinary scalar array here, so any UNIFORM index works (unlike varying struct
+    /// locals, whose SoA-in-registers layout needs a compile-time literal). A lane-varying
+    /// index would be a per-lane gather from a heap array — rejected with guidance.
+    /// </summary>
+    private bool TryUniformStructArrayRead(ElementAccessExpressionSyntax ea, out (string, Kind) result)
+    {
+        result = default;
+        if (ea.Expression is not MemberAccessExpressionSyntax ma ||
+            ma.Expression is not IdentifierNameSyntax id ||
+            !_params.TryGetValue(id.Identifier.Text, out var p) ||
+            p.PKind != ParamKind.UniformStruct)
+        {
+            return false;
+        }
+
+        var si = _structs[p.StructType!];
+        var f = si.Fields.FirstOrDefault(x => x.Name == ma.Name.Identifier.Text)
+            ?? throw new UnsupportedConstructException(
+                $"field '{ma.Name.Identifier.Text}' on struct '{p.StructType}'", ea.GetLocation());
+        if (!f.IsArray)
+        {
+            throw new UnsupportedConstructException(
+                $"indexing non-array field '{f.Name}' of uniform struct '{id.Identifier.Text}'", ea.GetLocation());
+        }
+
+        if (ea.ArgumentList.Arguments.Count != 1 ||
+            !IsUniformExpression(ea.ArgumentList.Arguments[0].Expression))
+        {
+            throw new UnsupportedConstructException(
+                $"per-lane index into uniform array member '{id.Identifier.Text}.{f.Name}' (uniform indices only; copy the data to a buffer parameter for lane-varying access)",
+                ea.GetLocation());
+        }
+
+        var bk = UniformBroadcastKind(f.Kind, ea);
+        result = ($"new {VType(bk)}({ea})", bk);
+        return true;
+    }
+
+    /// <summary>
+    /// The gang kind a uniform struct field broadcasts to: its own kind in 32-bit kernels;
+    /// the wide lane kind in double/long kernels (mirroring uniform scalar parameters).
+    /// </summary>
+    private Kind UniformBroadcastKind(Kind fieldKind, SyntaxNode at)
+    {
+        if (_l)
+        {
+            return fieldKind is Kind.I or Kind.L
+                ? Kind.L
+                : throw new UnsupportedConstructException(
+                    "float/double struct field in a long kernel (64-bit integer gang)", at.GetLocation());
+        }
+
+        if (_d)
+            return Kind.D;
+        return fieldKind;
+    }
+
+    /// <summary>
+    /// Broadcast a whole uniform [SpmdStruct] parameter into its varying companion
+    /// (ISPC's implicit uniform→varying struct conversion): every field gang takes the
+    /// scalar field's value, array members one gang per element.
+    /// </summary>
+    private string BroadcastStruct(string name, string structType)
+    {
+        var si = _structs[structType];
+        var sets = new List<string>();
+        foreach (var f in si.Fields)
+        {
+            if (f.IsArray)
+            {
+                for (int k = 0; k < f.ArrayLength; k++)
+                    sets.Add($"{f.GangName(k)} = new {VType(f.Kind)}({name}.{f.Name}[{k}])");
+            }
+            else
+            {
+                sets.Add($"{f.Name} = new {VType(f.Kind)}({name}.{f.Name})");
+            }
+        }
+
+        return $"new {si.VName} {{ {string.Join(", ", sets)} }}";
+    }
+
+    /// <summary>
     /// A struct-valued expression: local, <c>new S{...}</c>/<c>new S(...)</c>, helper call, or ternary.
     /// </summary>
     private (string Code, string StructType) VecStruct(ExpressionSyntax e)
@@ -1584,6 +1695,17 @@ internal sealed class VectorBodyEmitter
                 return VecStruct(p.Expression);
             case IdentifierNameSyntax id when _structLocals.TryGetValue(id.Identifier.Text, out string? st):
                 return (id.Identifier.Text, st);
+            case IdentifierNameSyntax uid when _params.TryGetValue(uid.Identifier.Text, out var up) &&
+                    up.PKind == ParamKind.UniformStruct:
+            {
+                if (Wide)
+                {
+                    throw new UnsupportedConstructException(
+                        "a uniform struct value in a 64-bit (double/long) kernel", e.GetLocation());
+                }
+
+                return (BroadcastStruct(uid.Identifier.Text, up.StructType!), up.StructType!);
+            }
             case ElementAccessExpressionSyntax ea when TryStructBufferField(ea, out string? bn, out string? bs, out string? bidx):
             {
                 // Whole-struct read 'buf[i]' → construct the varying struct from each field's gang load.
