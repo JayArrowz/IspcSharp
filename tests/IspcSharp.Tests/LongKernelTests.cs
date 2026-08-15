@@ -157,6 +157,23 @@ public static partial class LongKernels
     }
 
     /// <summary>
+    /// Hex mask carrying the 'L' suffix inside a 32-bit int kernel: '0xFFFFFFFFL' is a 64-bit
+    /// literal, so it has to widen into a VLong2 like any other L-suffixed constant rather than
+    /// being classified as an int lane because it starts with "0x". This is the zero-extend
+    /// half of the counter-based-RNG idiom (mask to 32 unsigned bits, widening-multiply, take
+    /// the high word), which has no unsigned lane type to lean on.
+    /// </summary>
+    [Spmd]
+    public static void ZeroExtendMulHigh(int[] input, int[] output, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            long p = ((long)input[i] & 0xFFFFFFFFL) * 0xD2511F53L;
+            output[i] = (int)(p >>> 32);
+        }
+    }
+
+    /// <summary>
     /// Exact sum of products over int[], each product needs 64 bits, so it is widened before
     /// accumulating ('long p = (long)a[i] * b[i];' is an overflow-free multiply).
     /// </summary>
@@ -252,6 +269,25 @@ public class LongKernelTests
     }
 
     private const int TailCount = (8192 * 3) + 5;   // not a multiple of any lane count
+
+    [Fact]
+    public void HexLongLiteral_WidensInsteadOfTruncating()
+    {
+        int n = TailCount;
+        Random rng = new Random(11);
+        int[] input = new int[n];
+        int[] actual = new int[n];
+        for (int i = 0; i < n; i++)
+            input[i] = rng.Next(int.MinValue, int.MaxValue);
+
+        LongKernels.ZeroExtendMulHigh_Simd(input, actual, n);
+
+        for (int i = 0; i < n; i++)
+        {
+            long p = (input[i] & 0xFFFFFFFFL) * 0xD2511F53L;
+            Assert.Equal((int)(p >>> 32), actual[i]);
+        }
+    }
 
     [Fact]
     public void Scale_Simd_MatchesScalar()

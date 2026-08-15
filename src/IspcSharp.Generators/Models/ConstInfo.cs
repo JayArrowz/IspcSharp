@@ -51,9 +51,7 @@ internal static class ConstScan
         {
             if (node is not (IdentifierNameSyntax or MemberAccessExpressionSyntax))
                 continue;
-            // The '.Member' half of 'a.Member' is not a reference of its own; the whole
-            // member access is the node that binds to the field.
-            if (node.Parent is MemberAccessExpressionSyntax parent && parent.Name == node)
+            if (IsMemberDesignator(node))
                 continue;
 
             string text = Normalize(node.ToString());
@@ -76,6 +74,21 @@ internal static class ConstScan
             .ToList();
         return new EquatableReadOnlyList<ConstInfo>(kept);
     }
+
+    /// <summary>
+    /// True where a name *designates a member* rather than reading a value: the <c>.Member</c>
+    /// half of <c>a.Member</c>, the <c>W0</c> in <c>new S { W0 = … }</c>, and named argument /
+    /// attribute-argument names. These bind to whatever member they name, which is usually not a
+    /// constant — counting them would wrongly poison a genuine constant of the same name
+    /// (<c>struct Philox4 { int W0; }</c> alongside <c>const int W0</c>).
+    /// </summary>
+    public static bool IsMemberDesignator(SyntaxNode node) => node.Parent switch
+    {
+        MemberAccessExpressionSyntax ma => ma.Name == node,
+        AssignmentExpressionSyntax asg => asg.Left == node && asg.Parent is InitializerExpressionSyntax,
+        NameColonSyntax or NameEqualsSyntax => true,
+        _ => false,
+    };
 
     private static ConstInfo? AsConstant(ISymbol? symbol, string text)
     {

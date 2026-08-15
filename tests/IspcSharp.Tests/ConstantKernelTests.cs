@@ -34,6 +34,33 @@ public struct UnitPair
     public float B;
 }
 
+/// <summary>
+/// Field names that collide with constant names in the calling class. Naming a field in an
+/// object initializer is not a value read, so it must not shadow or poison the constant.
+/// </summary>
+[SpmdStruct]
+public struct Word2
+{
+    public int W0;
+    public int W1;
+}
+
+/// <summary>
+/// A helper library in its own class: kernels reach these by qualified name, and the constants
+/// they read live here too.
+/// </summary>
+public static partial class ConstLib
+{
+    private const int Rounds = 3;
+    private const float Weight = 0.25f;
+
+    [SpmdFunction]
+    public static float Blend(float a, float b) => (a * Weight) + (b * (1f - Weight));
+
+    [SpmdFunction]
+    public static Word2 Step(int x) => new Word2 { W0 = x + Rounds, W1 = x * Rounds };
+}
+
 public static partial class ConstKernels
 {
     private const int LowBits = 9;
@@ -41,6 +68,10 @@ public static partial class ConstKernels
     private const long Mix = 0x5555555555555555L;
     private const byte NarrowBias = 7;
     private const int FixedCount = 1000;
+
+    // Same names as Word2's fields, on purpose: the two must not be confused.
+    private const int W0 = unchecked((int)0x9E3779B9);
+    private const int W1 = unchecked((int)0xBB67AE85);
     private static readonly int Stride = 2;
 
     /// <summary>Bare constant in a float lane expression (the ISPC003 case this adds).</summary>
@@ -202,6 +233,46 @@ public static partial class ConstKernels
         {
             long x = input[i] ^ (input[i] >> LowBits);
             output[i] = x * Mix;
+        }
+    }
+
+    /// <summary>
+    /// A constant whose name matches a [SpmdStruct] field. The 'W0 =' in the object initializer
+    /// designates the field, so it must neither resolve to the constant nor stop 'k + W0' from
+    /// doing so.
+    /// </summary>
+    [SpmdFunction]
+    public static Word2 BumpWords(int a, int b)
+    {
+        Word2 w = new Word2 { W0 = a, W1 = b };
+        int k0 = w.W0 + W0;
+        int k1 = w.W1 + W1;
+        return new Word2 { W0 = k0, W1 = k1 };
+    }
+
+    [Spmd]
+    public static void ConstNameMatchesField(int[] a, int[] outW0, int[] outW1, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            Word2 w = BumpWords(a[i], a[i] + 1);
+            outW0[i] = w.W0;
+            outW1[i] = w.W1;
+        }
+    }
+
+    /// <summary>
+    /// Helpers in another class, called by qualified name: one scalar-returning, one
+    /// struct-returning, each reading constants private to its own class.
+    /// </summary>
+    [Spmd]
+    public static void CrossClassHelpers(float[] a, float[] b, float[] o, int[] steps, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            o[i] = ConstLib.Blend(a[i], b[i]);
+            Word2 w = ConstLib.Step(i);
+            steps[i] = w.W0 + w.W1;
         }
     }
 
@@ -414,6 +485,38 @@ public class ConstantKernelTests
         {
             Assert.Equal(UnitScalar(bits[i]) * 6.2831853f, outA[i], 5);
             Assert.Equal(UnitScalar(bits[i] + 1) * 2.5f, outB[i], 5);
+        }
+    }
+
+    [Fact]
+    public void ConstNameMatchingStructField_ResolvesBoth()
+    {
+        int[] a = new int[N], w0 = new int[N], w1 = new int[N];
+        Random r = new Random(17);
+        for (int i = 0; i < N; i++)
+            a[i] = r.Next(int.MinValue, int.MaxValue - 1);
+
+        ConstKernels.ConstNameMatchesField_Simd(a, w0, w1, N);
+        for (int i = 0; i < N; i++)
+        {
+            Assert.Equal(unchecked(a[i] + (int)0x9E3779B9), w0[i]);
+            Assert.Equal(unchecked(a[i] + 1 + (int)0xBB67AE85), w1[i]);
+        }
+    }
+
+    [Fact]
+    public void CrossClassHelpers_ResolveByQualifiedName()
+    {
+        float[] a = Rand(N, new Random(18)), b = Rand(N, new Random(19)), o = new float[N];
+        int[] steps = new int[N];
+
+        ConstKernels.CrossClassHelpers_Simd(a, b, o, steps, N);
+        for (int i = 0; i < N; i++)
+        {
+            float expected = (a[i] * 0.25f) + (b[i] * 0.75f);
+            Assert.True(MathF.Abs(o[i] - expected) <= 1e-6f * (1f + MathF.Abs(expected)),
+                $"i={i}: {o[i]} vs {expected}");
+            Assert.Equal((i + 3) + (i * 3), steps[i]);
         }
     }
 

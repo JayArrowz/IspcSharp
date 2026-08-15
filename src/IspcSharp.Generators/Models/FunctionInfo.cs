@@ -18,6 +18,15 @@ internal sealed record FunctionInfo(
     string Namespace,
     EquatableReadOnlyList<ConstInfo> Consts)
 {
+    /// <summary>
+    /// How a caller in another type must name this helper's varying companion. The companion is
+    /// emitted into <c>Namespace.TypeName</c> as a public static method, and the calling
+    /// companion is a separate file that imports only System and IspcSharp, so cross-type calls
+    /// are emitted fully qualified.
+    /// </summary>
+    public string QualifiedName
+        => $"global::{(Namespace.Length > 0 ? Namespace + "." : "")}{TypeName}.{Name}";
+
     public static FunctionInfo From(MethodDeclarationSyntax m, SemanticModel? model = null)
     {
         var ps = m.ParameterList.Parameters

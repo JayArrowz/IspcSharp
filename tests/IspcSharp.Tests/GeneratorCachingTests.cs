@@ -267,6 +267,76 @@ public class GeneratorCachingTests
         Assert.Empty(errors);
     }
 
+    /// <summary>
+    /// A qualified call reaches a [SpmdFunction] in another class (and another namespace), and
+    /// still picks the right one when the name is ambiguous across classes. The emitted call is
+    /// fully qualified, since the companion file has no using directives of its own.
+    /// </summary>
+    [Fact]
+    public void QualifiedCall_ResolvesHelperInAnotherClass()
+    {
+        const string source = """
+            using IspcSharp;
+            using Rng;
+
+            namespace Rng
+            {
+                public static partial class Bits
+                {
+                    [SpmdFunction]
+                    public static float Curve(float x) => x * 2f;
+                }
+            }
+
+            namespace App
+            {
+                [SpmdStruct]
+                public struct Word2 { public int W0; public int W1; }
+
+                public static partial class Lib
+                {
+                    [SpmdFunction]
+                    public static Word2 Draw(int i) => new Word2 { W0 = i * 3, W1 = i * 5 };
+                }
+
+                public static partial class Kernels
+                {
+                    // Same helper name as Rng.Bits.Curve: a bare call must still mean this one.
+                    [SpmdFunction]
+                    public static float Curve(float x) => x * 3f;
+
+                    [Spmd]
+                    public static void Run(float[] a, float[] o, int[] w, int count)
+                    {
+                        foreach (int i in Spmd.Range(count))
+                        {
+                            Word2 d = Lib.Draw(i);                   // another class, struct-returning
+                            o[i] = Curve(a[i]) + Bits.Curve(a[i]);   // 'Bits' is reachable only via using
+                            w[i] = d.W0 ^ d.W1;
+                        }
+                    }
+                }
+            }
+            """;
+
+        var driver = CreateDriver().RunGeneratorsAndUpdateCompilation(
+            CreateCompilation(source), out var outputCompilation, out _);
+        GeneratorRunResult result = driver.GetRunResult().Results[0];
+
+        Assert.Empty(result.Diagnostics);
+        string generated = result.GeneratedSources
+            .Single(s => s.HintName == "App.Kernels.Run_Spmd.g.cs").SourceText.ToString();
+
+        Assert.Contains("global::App.Lib.Draw(", generated);        // another class, struct-returning
+        Assert.Contains("global::Rng.Bits.Curve(", generated);      // another namespace, via using
+        Assert.Contains("Curve(VFloat.Load(a, __i))", generated);   // bare call stays this type's
+
+        var errors = outputCompilation.GetDiagnostics()
+            .Where(d => d.Severity == DiagnosticSeverity.Error)
+            .ToList();
+        Assert.Empty(errors);
+    }
+
     [Fact]
     public void SameFunctionName_InDifferentClasses_BothGenerate_AndResolvePerClass()
     {

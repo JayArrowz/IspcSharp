@@ -1312,11 +1312,15 @@ internal sealed class VectorBodyEmitter
             return ($"new VLong({text.TrimEnd('L', 'l', 'u', 'U')})", Kind.L);
         }
 
-        // Hex/binary literals are always int lanes ("0xFF" ends in 'F' but is not a float).
+        // Hex/binary literals are int lanes ("0xFF" ends in 'F' but is not a float) — unless
+        // they carry the 'L' suffix, which opts into 64-bit integers exactly like a decimal
+        // one does (a mask such as '0xFFFFFFFFL' has to stay a VLong2, not truncate to VInt).
         bool isHexOrBinary = text.StartsWith("0x") || text.StartsWith("0X") ||
                              text.StartsWith("0b") || text.StartsWith("0B");
         if (isHexOrBinary)
         {
+            if (!_d && (text.EndsWith("L") || text.EndsWith("l")))
+                return ($"new VLong2({text})", Kind.L);
             return _d
                 ? ($"new VDouble({text})", Kind.D)
                 : ($"new VInt({text})", Kind.I);
@@ -1828,9 +1832,9 @@ internal sealed class VectorBodyEmitter
             }
             case ObjectCreationExpressionSyntax oc:
                 return VecStructNew(oc);
-            case InvocationExpressionSyntax call when call.Expression is IdentifierNameSyntax fid &&
-                    _functions.TryGetValue(fid.Identifier.Text, out var fnInfo) && _structs.ContainsKey(fnInfo.ReturnType):
-                return ($"{fnInfo.Name}({EmitCallArgs(call, fnInfo)})", fnInfo.ReturnType);
+            case InvocationExpressionSyntax call when TryResolveHelper(call, out var fnInfo, out string helperName) &&
+                    _structs.ContainsKey(fnInfo.ReturnType):
+                return ($"{helperName}({EmitCallArgs(call, fnInfo)})", fnInfo.ReturnType);
             case ConditionalExpressionSyntax tern:
             {
                 var (code, structType) = VecStruct(tern.WhenTrue);
@@ -2040,12 +2044,38 @@ internal sealed class VectorBodyEmitter
         _ = sb.AppendLine($"{indent}Memory.Scatter({flat}, {idxVec}, {valueCode}, {mask ?? MTAll});");
     }
 
+    /// <summary>
+    /// Resolve a call to a <c>[SpmdFunction]</c> helper's varying companion, yielding the name
+    /// to emit: a bare call stays bare (the companion lands in this same partial type), a
+    /// qualified call is emitted fully qualified, since the generated file has no <c>using</c>
+    /// directives of its own to lean on.
+    /// </summary>
+    private bool TryResolveHelper(InvocationExpressionSyntax call, out FunctionInfo fn, out string emitName)
+    {
+        fn = null!;
+        emitName = "";
+        switch (call.Expression)
+        {
+            case IdentifierNameSyntax bare when _functions.TryGetValue(bare.Identifier.Text, out var bareFn):
+                fn = bareFn;
+                emitName = bareFn.Name;
+                return true;
+            case MemberAccessExpressionSyntax ma when _functions.TryGetValue(ma.ToString().Replace(" ", ""), out var qualFn):
+                fn = qualFn;
+                emitName = qualFn.QualifiedName;
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private (string Code, Kind Kind) VecCall(InvocationExpressionSyntax call)
     {
         string callee = call.Expression.ToString().Replace(" ", "");
 
         // A call to another [SpmdFunction] returning a primitive → its varying companion.
-        if (call.Expression is IdentifierNameSyntax fid && _functions.TryGetValue(fid.Identifier.Text, out var fnInfo))
+        // Bare ('Lerp') resolves within this type; qualified ('Dist.Normal') anywhere.
+        if (TryResolveHelper(call, out var fnInfo, out string helperName))
         {
             if (_structs.ContainsKey(fnInfo.ReturnType))
             {
@@ -2054,7 +2084,7 @@ internal sealed class VectorBodyEmitter
             }
 
             string callArgs = EmitCallArgs(call, fnInfo);
-            return ($"{fnInfo.Name}({callArgs})", SpmdGenerator.KindOfScalar(fnInfo.ReturnType, call.GetLocation()));
+            return ($"{helperName}({callArgs})", SpmdGenerator.KindOfScalar(fnInfo.ReturnType, call.GetLocation()));
         }
 
         string fn = callee switch

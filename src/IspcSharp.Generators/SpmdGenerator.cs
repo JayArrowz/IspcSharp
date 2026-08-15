@@ -89,8 +89,8 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                     var method = ParseMethod(fn.DeclarationText);
                     if (method is null)
                         continue;
-                    method = ConstQualifyRewriter.Apply(method, ConstQualifyRewriter.BuildMap(fn.Consts));
                     var fnScope = ScopedFunctionMap(functions, fn.Namespace, fn.TypeName);
+                    method = NameQualifyRewriter.Apply(method, NameQualifyRewriter.BuildMap(fn.Consts), fnScope);
                     string? src = GenerateFunctionSource(fn, method, structMap, fnScope, DropDiagnostic);
                     if (src != null)
                         spc.AddSource(HintName(fn.Namespace, fn.TypeName, fn.Name, "_SpmdFn.g.cs"), SourceText.From(src, Encoding.UTF8));
@@ -111,9 +111,9 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 var method = ParseMethod(kernel.MethodText);
                 if (method is null)
                     return;
-                method = ConstQualifyRewriter.Apply(method, ConstQualifyRewriter.BuildMap(kernel.Consts));
                 var structMap = BuildStructMap(pair.Right.Left);
                 var fnMap = ScopedFunctionMap(pair.Right.Right, kernel.Namespace, kernel.TypeName);
+                method = NameQualifyRewriter.Apply(method, NameQualifyRewriter.BuildMap(kernel.Consts), fnMap);
                 string? src = GenerateKernelSource(kernel, method, structMap, fnMap, DropDiagnostic);
                 if (src != null)
                     spc.AddSource(HintName(kernel.Namespace, kernel.TypeName, kernel.Name, "_Spmd.g.cs"), SourceText.From(src, Encoding.UTF8));
@@ -496,7 +496,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         int unroll = UnrollFactor(body, reductions);
         bool streaming = GetSpmdBoolArg(method, "Streaming");
 
-        var emitter = new VectorBodyEmitter(loopVar, paramInfos, uniformPreLocals, preLocals, reductions, doubleMode, longMode, structMap, fnMap, ConstQualifyRewriter.BuildMap(kernel.Consts), streaming);
+        var emitter = new VectorBodyEmitter(loopVar, paramInfos, uniformPreLocals, preLocals, reductions, doubleMode, longMode, structMap, fnMap, NameQualifyRewriter.BuildMap(kernel.Consts), streaming);
         string vectorBody = emitter.EmitStatements(body, maskExpr: null, indent: "            ");
         foreach (var diag in emitter.Diagnostics)
             report(diag);
@@ -995,7 +995,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
             return $"{VaryingTypeOf(p.Type, structMap)} {p.Name}";
         }));
 
-        var emitter = new VectorBodyEmitter(structMap, fnMap, paramLocals, paramStructs, ConstQualifyRewriter.BuildMap(fn.Consts));
+        var emitter = new VectorBodyEmitter(structMap, fnMap, paramLocals, paramStructs, NameQualifyRewriter.BuildMap(fn.Consts));
         string body = emitter.EmitFunctionBody(method, "            ");
         foreach (var diag in emitter.Diagnostics)
             report(diag);
@@ -1044,17 +1044,39 @@ public sealed class SpmdGenerator : IIncrementalGenerator
             .ThenBy(f => f.Name, StringComparer.Ordinal)];
 
     /// <summary>
-    /// The helpers visible to a method by simple name: those in its own containing type
-    /// (kernels call helpers as bare identifiers, which C# resolves within the same type —
-    /// partial declarations included). Scoping the lookup this way keeps two same-named
-    /// helpers in different classes from resolving against each other's signatures.
+    /// The helpers a method can call, keyed by the text of the call.
+    ///
+    /// A <b>bare</b> name resolves only within the method's own containing type (partial
+    /// declarations included), exactly as C# resolves it — which is what keeps two same-named
+    /// helpers in different classes from resolving against each other's signatures. A
+    /// <b>qualified</b> name (<c>Philox.Draw</c>, <c>VRandom.Philox.Draw</c>) reaches any
+    /// <c>[SpmdFunction]</c> in the compilation, so a helper library can be split across
+    /// classes and files; the companion of a qualified call is emitted fully qualified in turn.
     /// </summary>
     internal static Dictionary<string, FunctionInfo> ScopedFunctionMap(
         IEnumerable<FunctionInfo> functions, string ns, string typeName)
-        => functions
-            .Where(f => f.Namespace == ns && f.TypeName == typeName)
-            .GroupBy(f => f.Name)
-            .ToDictionary(g => g.Key, g => g.First());
+    {
+        var map = new Dictionary<string, FunctionInfo>(StringComparer.Ordinal);
+        var all = functions.ToList();
+
+        // Qualified keys first, most-specific form always available. Helpers in the caller's own
+        // namespace are added last so they win a bare 'Type.Member' collision with another
+        // namespace's same-named type, matching C#'s own preference for the nearer scope.
+        foreach (var f in all.OrderBy(f => f.Namespace == ns ? 1 : 0))
+        {
+            map[$"{f.TypeName}.{f.Name}"] = f;
+            if (f.Namespace.Length > 0)
+                map[$"{f.Namespace}.{f.TypeName}.{f.Name}"] = f;
+            map[f.QualifiedName] = f;
+        }
+
+        // Bare names: the containing type only. These overwrite any qualified-key collision,
+        // since a bare call in source can only ever mean this type's helper.
+        foreach (var g in all.Where(f => f.Namespace == ns && f.TypeName == typeName).GroupBy(f => f.Name))
+            map[g.Key] = g.First();
+
+        return map;
+    }
 
     internal static Kind KindOfScalar(string t, Location loc) => t switch
     {
