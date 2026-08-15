@@ -49,14 +49,14 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         var functions = context.SyntaxProvider.ForAttributeWithMetadataName(
             FunctionAttributeFullName,
             predicate: static (node, _) => node is MethodDeclarationSyntax,
-            transform: static (ctx, _) => FunctionInfo.From((MethodDeclarationSyntax)ctx.TargetNode))
+            transform: static (ctx, _) => FunctionInfo.From((MethodDeclarationSyntax)ctx.TargetNode, ctx.SemanticModel))
             .WithTrackingName("SpmdFunctions");
 
         // [Spmd] kernels.
         var kernels = context.SyntaxProvider.ForAttributeWithMetadataName(
             AttributeFullName,
             predicate: static (node, _) => node is MethodDeclarationSyntax,
-            transform: static (ctx, _) => KernelInfo.From((MethodDeclarationSyntax)ctx.TargetNode))
+            transform: static (ctx, _) => KernelInfo.From((MethodDeclarationSyntax)ctx.TargetNode, ctx.SemanticModel))
             .WithTrackingName("SpmdKernels");
 
         var structTable = structs.Collect()
@@ -89,6 +89,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                     var method = ParseMethod(fn.DeclarationText);
                     if (method is null)
                         continue;
+                    method = ConstQualifyRewriter.Apply(method, ConstQualifyRewriter.BuildMap(fn.Consts));
                     var fnScope = ScopedFunctionMap(functions, fn.Namespace, fn.TypeName);
                     string? src = GenerateFunctionSource(fn, method, structMap, fnScope, DropDiagnostic);
                     if (src != null)
@@ -110,6 +111,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 var method = ParseMethod(kernel.MethodText);
                 if (method is null)
                     return;
+                method = ConstQualifyRewriter.Apply(method, ConstQualifyRewriter.BuildMap(kernel.Consts));
                 var structMap = BuildStructMap(pair.Right.Left);
                 var fnMap = ScopedFunctionMap(pair.Right.Right, kernel.Namespace, kernel.TypeName);
                 string? src = GenerateKernelSource(kernel, method, structMap, fnMap, DropDiagnostic);
@@ -494,7 +496,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         int unroll = UnrollFactor(body, reductions);
         bool streaming = GetSpmdBoolArg(method, "Streaming");
 
-        var emitter = new VectorBodyEmitter(loopVar, paramInfos, uniformPreLocals, preLocals, reductions, doubleMode, longMode, structMap, fnMap, streaming);
+        var emitter = new VectorBodyEmitter(loopVar, paramInfos, uniformPreLocals, preLocals, reductions, doubleMode, longMode, structMap, fnMap, ConstQualifyRewriter.BuildMap(kernel.Consts), streaming);
         string vectorBody = emitter.EmitStatements(body, maskExpr: null, indent: "            ");
         foreach (var diag in emitter.Diagnostics)
             report(diag);
@@ -993,7 +995,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
             return $"{VaryingTypeOf(p.Type, structMap)} {p.Name}";
         }));
 
-        var emitter = new VectorBodyEmitter(structMap, fnMap, paramLocals, paramStructs);
+        var emitter = new VectorBodyEmitter(structMap, fnMap, paramLocals, paramStructs, ConstQualifyRewriter.BuildMap(fn.Consts));
         string body = emitter.EmitFunctionBody(method, "            ");
         foreach (var diag in emitter.Diagnostics)
             report(diag);

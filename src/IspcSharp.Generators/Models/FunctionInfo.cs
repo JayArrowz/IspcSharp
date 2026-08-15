@@ -15,9 +15,10 @@ internal sealed record FunctionInfo(
     string TypeHeader,
     string TypeName,
     bool TypeIsPartial,
-    string Namespace)
+    string Namespace,
+    EquatableReadOnlyList<ConstInfo> Consts)
 {
-    public static FunctionInfo From(MethodDeclarationSyntax m)
+    public static FunctionInfo From(MethodDeclarationSyntax m, SemanticModel? model = null)
     {
         var ps = m.ParameterList.Parameters
             .Select(p => (p.Identifier.Text, p.Type?.ToString().Trim() ?? ""))
@@ -31,6 +32,7 @@ internal sealed record FunctionInfo(
             header,
             typeName,
             isPartial,
-            ns);
+            ns,
+            ConstScan.From(m, model));
     }
 }

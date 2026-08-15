@@ -59,13 +59,13 @@ public sealed class SpmdDiagnosticsAnalyzer : DiagnosticAnalyzer
         {
             if (isKernel)
             {
-                var info = KernelInfo.From(method);
+                var info = KernelInfo.From(method, ctx.SemanticModel);
                 var fnMap = SpmdGenerator.ScopedFunctionMap(functions, info.Namespace, info.TypeName);
                 _ = SpmdGenerator.GenerateKernelSource(info, method, structMap, fnMap, ctx.ReportDiagnostic);
             }
             else
             {
-                var info = FunctionInfo.From(method);
+                var info = FunctionInfo.From(method, ctx.SemanticModel);
                 var fnMap = SpmdGenerator.ScopedFunctionMap(functions, info.Namespace, info.TypeName);
                 _ = SpmdGenerator.GenerateFunctionSource(info, method, structMap, fnMap, ctx.ReportDiagnostic);
             }

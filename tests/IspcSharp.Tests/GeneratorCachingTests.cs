@@ -159,6 +159,114 @@ public class GeneratorCachingTests
         Assert.Contains("3f", b.SourceText.ToString());
     }
 
+    /// <summary>
+    /// A constant reached through a <c>using</c> directive: the companion is a separate file
+    /// that imports only System and IspcSharp, so the reference has to be emitted fully
+    /// qualified — in the vector body, in the pre-loop local, and in the scalar tail alike.
+    /// </summary>
+    [Fact]
+    public void ConstantFromAnotherNamespace_IsFullyQualified_AndCompiles()
+    {
+        const string source = """
+            using IspcSharp;
+            using Tuning;
+
+            namespace Tuning
+            {
+                public static class Knobs
+                {
+                    public const float Gain = 2.5f;
+                    public const int Shift = 3;
+                }
+            }
+
+            namespace App
+            {
+                public static partial class Kernels
+                {
+                    [Spmd]
+                    public static float Weighted(float[] a, int[] bits, float[] o, int count)
+                    {
+                        float head = Knobs.Gain;
+                        float sum = 0f;
+                        foreach (int i in Spmd.Range(count))
+                        {
+                            o[i] = (a[i] * Knobs.Gain) + (bits[i] >>> Knobs.Shift);
+                            sum += o[i];
+                        }
+
+                        return sum + head + Knobs.Gain;
+                    }
+                }
+            }
+            """;
+
+        var driver = CreateDriver().RunGeneratorsAndUpdateCompilation(
+            CreateCompilation(source), out var outputCompilation, out _);
+        GeneratorRunResult result = driver.GetRunResult().Results[0];
+
+        Assert.Empty(result.Diagnostics);
+        string generated = result.GeneratedSources
+            .Single(s => s.HintName == "App.Kernels.Weighted_Spmd.g.cs").SourceText.ToString();
+
+        Assert.Contains("new VFloat(global::Tuning.Knobs.Gain)", generated);   // broadcast in the vector body
+        Assert.Contains("global::Tuning.Knobs.Shift", generated);              // uniform shift count, not broadcast
+        Assert.DoesNotContain("Knobs.Gain)", generated.Replace("global::Tuning.Knobs.Gain)", ""));
+
+        var errors = outputCompilation.GetDiagnostics()
+            .Where(d => d.Severity == DiagnosticSeverity.Error)
+            .ToList();
+        Assert.Empty(errors);
+    }
+
+    /// <summary>
+    /// A constant declared in a different part of the same partial class: found through the
+    /// symbol, not the syntax of the part the kernel happens to live in.
+    /// </summary>
+    [Fact]
+    public void ConstantFromAnotherPartialPart_Resolves()
+    {
+        const string source = """
+            using IspcSharp;
+
+            namespace App;
+
+            public static partial class Kernels
+            {
+                private const float Scale = 1.1920929e-7f;
+            }
+
+            public static partial class Kernels
+            {
+                [SpmdFunction]
+                public static float Unit(int bits) => (bits >>> 9) * Scale;
+
+                [Spmd]
+                public static void Units(int[] bits, float[] o, int count)
+                {
+                    foreach (int i in Spmd.Range(count))
+                    {
+                        o[i] = Unit(bits[i]);
+                    }
+                }
+            }
+            """;
+
+        var driver = CreateDriver().RunGeneratorsAndUpdateCompilation(
+            CreateCompilation(source), out var outputCompilation, out _);
+        GeneratorRunResult result = driver.GetRunResult().Results[0];
+
+        Assert.Empty(result.Diagnostics);
+        string fn = result.GeneratedSources
+            .Single(s => s.HintName == "App.Kernels.Unit_SpmdFn.g.cs").SourceText.ToString();
+        Assert.Contains("new VFloat(global::App.Kernels.Scale)", fn);
+
+        var errors = outputCompilation.GetDiagnostics()
+            .Where(d => d.Severity == DiagnosticSeverity.Error)
+            .ToList();
+        Assert.Empty(errors);
+    }
+
     [Fact]
     public void SameFunctionName_InDifferentClasses_BothGenerate_AndResolvePerClass()
     {

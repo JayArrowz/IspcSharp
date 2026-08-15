@@ -52,6 +52,14 @@ internal sealed class VectorBodyEmitter
     /// </summary>
     private readonly IReadOnlyDictionary<string, StructInfo> _structs;
     private readonly IReadOnlyDictionary<string, FunctionInfo> _functions;
+
+    /// <summary>
+    /// The <c>const</c> / <c>static readonly</c> scalars this body reads, keyed by both the name
+    /// as written and its fully qualified form (the generator rewrites the method to the latter
+    /// before emission; the analyzer runs on the unrewritten syntax). Each one is uniform, so a
+    /// use inside a vector expression is a broadcast.
+    /// </summary>
+    private readonly IReadOnlyDictionary<string, ConstInfo> _consts;
     private readonly Dictionary<string, string> _structLocals = [];
     private Kind _retKind;
     private string? _retStruct;
@@ -89,9 +97,11 @@ internal sealed class VectorBodyEmitter
         bool longMode,
         IReadOnlyDictionary<string, StructInfo> structs,
         IReadOnlyDictionary<string, FunctionInfo> functions,
+        IReadOnlyDictionary<string, ConstInfo> consts,
         bool streaming = false)
     {
         _loopVar = loopVar;
+        _consts = consts;
         _params = parameters.ToDictionary(p => p.Name, p => p);
         _uniformPreLocals = uniformPreLocals;
         _preLocalKinds = preLocalKinds;
@@ -115,7 +125,8 @@ internal sealed class VectorBodyEmitter
         IReadOnlyDictionary<string, StructInfo> structs,
         IReadOnlyDictionary<string, FunctionInfo> functions,
         Dictionary<string, Kind> paramLocals,
-        Dictionary<string, string> paramStructs)
+        Dictionary<string, string> paramStructs,
+        IReadOnlyDictionary<string, ConstInfo> consts)
     {
         _loopVar = "";
         _params = [];
@@ -124,6 +135,7 @@ internal sealed class VectorBodyEmitter
         _reductions = [];
         _structs = structs;
         _functions = functions;
+        _consts = consts;
         foreach (var kv in paramLocals)
             _locals[kv.Key] = kv.Value;
         foreach (var kv in paramStructs)
@@ -1099,13 +1111,17 @@ internal sealed class VectorBodyEmitter
             // The foreach loop variable → varying.
             if (name == _loopVar)
                 return false;
+            // A const / static readonly scalar is uniform by definition.
+            if (_consts.ContainsKey(name))
+                continue;
             // If it's not a known uniform, assume varying.
             if (!_uniformPreLocals.Contains(name) &&
                 !_params.ContainsKey(name) &&
                 !_preLocalKinds.ContainsKey(name))
             {
-                // Could be a type name (MathF, etc.), check if parent is member access.
-                if (id.Parent is MemberAccessExpressionSyntax)
+                // Could be a type or namespace name (MathF, the 'Ns.Type' of a qualified
+                // constant, the 'global::' alias), check whether it's part of a larger name.
+                if (id.Parent is MemberAccessExpressionSyntax or AliasQualifiedNameSyntax)
                     continue;
                 return false;
             }
@@ -1181,6 +1197,11 @@ internal sealed class VectorBodyEmitter
                         _ => Kind.F,
                     }),
 
+        // A 'const'/'static readonly' scalar declared outside the method: uniform, so broadcast.
+        // (Checked after locals and params, which shadow it, exactly as in C#.)
+        IdentifierNameSyntax cid when _consts.TryGetValue(cid.Identifier.Text, out var cst)
+            => ConstBroadcast(cst, cid),
+
         IdentifierNameSyntax id when id.Identifier.Text == _loopVar
             => _l
                 ? ("(VLong.ProgramIndex + __i)", Kind.L)
@@ -1196,6 +1217,11 @@ internal sealed class VectorBodyEmitter
 
         // Scalar field of a uniform [SpmdStruct] parameter: 'p.Bias' => broadcast.
         MemberAccessExpressionSyntax uma when TryUniformStructMemberRead(uma, out var umr) => umr,
+
+        // Qualified user constant: 'Dist.Scale', 'Tuning.Gain', or the generator's rewritten
+        // 'global::Ns.Type.Member' form.
+        MemberAccessExpressionSyntax uc when _consts.TryGetValue(ConstScan.Normalize(uc.ToString()), out var ucv)
+            => ConstBroadcast(ucv, uc),
 
         // Known scalar constants: MathF.PI / Math.PI / float.MaxValue / int.MinValue / ...
         MemberAccessExpressionSyntax cma when TryConstMember(cma, out var cc) => cc,
@@ -1252,6 +1278,23 @@ internal sealed class VectorBodyEmitter
 
     private (string, Kind) Broadcast(string name, Kind k)
         => ($"new {VType(k)}({name})", k);
+
+    /// <summary>
+    /// Broadcast a named scalar constant into the kernel's gang. The constant keeps its own
+    /// type in 32-bit kernels (an int constant stays int lanes, so <c>x &amp; Mask</c> is still
+    /// integer work); 64-bit kernels widen it to their single lane type, like a uniform parameter.
+    /// </summary>
+    private (string, Kind) ConstBroadcast(ConstInfo c, SyntaxNode at)
+    {
+        if (_l && c.Kind is Kind.F or Kind.D)
+        {
+            throw new UnsupportedConstructException(
+                $"floating-point constant '{c.Text}' in a long kernel (64-bit integer gang)", at.GetLocation());
+        }
+
+        var k = _l ? Kind.L : _d ? Kind.D : SpmdGenerator.LaneKind(c.Kind);
+        return ($"new {VType(k)}({c.Code})", k);
+    }
 
     private (string, Kind) LitExpr(LiteralExpressionSyntax lit)
     {
