@@ -41,6 +41,12 @@ public class GeneratorCachingTests
     private static readonly string[] ModelSteps =
         ["SpmdStructs", "SpmdFunctions", "SpmdKernels", "SpmdStructTable", "SpmdFunctionTable"];
 
+    /// <summary>Shared with the attribute-argument caching tests below.</summary>
+    internal static CSharpCompilation CreateCompilationFor(string source) => CreateCompilation(source);
+
+    /// <summary>Shared with the attribute-argument caching tests below.</summary>
+    internal static GeneratorDriver CreateDriverFor() => CreateDriver();
+
     private static CSharpCompilation CreateCompilation(string source)
     {
         string tpa = (string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!;
@@ -393,5 +399,120 @@ public class GeneratorCachingTests
             .Where(d => d.Severity == DiagnosticSeverity.Error)
             .ToList();
         Assert.Empty(errors);
+    }
+}
+
+/// <summary>
+/// Attribute arguments on <c>[Spmd]</c> steer codegen, so they have to be part of the cache key.
+/// They are, because the cached kernel model stores the method's own <c>ToFullString()</c> and
+/// attribute lists are part of the method node — but that is an implicit guarantee, and these
+/// pin it: edit only the attribute and the kernel must both re-run and emit different code.
+/// </summary>
+public class AttributeArgCachingTests
+{
+    private const string Template = """
+        using IspcSharp;
+
+        namespace CacheDemo;
+
+        public static partial class Kernels
+        {
+            [Spmd__ATTR__]
+            public static float Sum(float[] a, int count)
+            {
+                float sum = 0f;
+                foreach (int i in Spmd.Range(count))
+                    sum += a[i] * a[i];
+                return sum;
+            }
+        }
+        """;
+
+    private static CSharpCompilation Compile(string attrArgs) =>
+        GeneratorCachingTests.CreateCompilationFor(Template.Replace("__ATTR__", attrArgs));
+
+    private static string KernelOf(GeneratorDriver driver) =>
+        driver.GetRunResult().Results[0].GeneratedSources
+            .Single(s => s.HintName == "CacheDemo.Kernels.Sum_Spmd.g.cs").SourceText.ToString();
+
+    [Fact]
+    public void ChangingUnroll_RegeneratesAndChangesOutput()
+    {
+        var driver = GeneratorCachingTests.CreateDriverFor().RunGenerators(Compile(""));
+        string auto = KernelOf(driver);
+
+        driver = driver.RunGenerators(Compile("(Unroll = 1)"));
+        var result = driver.GetRunResult().Results[0];
+        string forced = KernelOf(driver);
+
+        // The kernel step must actually re-run, not serve a cached model.
+        Assert.All(
+            result.TrackedSteps["SpmdKernels"].SelectMany(s => s.Outputs),
+            o => Assert.NotEqual(IncrementalStepRunReason.Cached, o.Reason));
+
+        Assert.Contains("__end - 4 * __w", auto);      // heuristic picks 4 for one float accumulator
+        Assert.Contains("__end - __w;", forced);       // attribute forces 1
+        Assert.NotEqual(auto, forced);
+    }
+
+    [Fact]
+    public void SameAttributeArgs_StayCached()
+    {
+        var driver = GeneratorCachingTests.CreateDriverFor().RunGenerators(Compile("(Unroll = 2)"));
+        string first = KernelOf(driver);
+
+        // Re-run on an equivalent compilation: nothing changed, so nothing should re-run.
+        driver = driver.RunGenerators(Compile("(Unroll = 2)"));
+        var result = driver.GetRunResult().Results[0];
+
+        Assert.All(
+            result.TrackedSteps["SpmdKernels"].SelectMany(s => s.Outputs),
+            o => Assert.True(
+                o.Reason is IncrementalStepRunReason.Cached or IncrementalStepRunReason.Unchanged,
+                $"kernel step re-ran: {o.Reason}"));
+        Assert.Equal(first, KernelOf(driver));
+    }
+
+    /// <summary>
+    /// The unroll heuristic now charges body size transitively through [SpmdFunction] calls, so a
+    /// kernel's output can change when only a *helper* body changes. That dependency has to be
+    /// cached too.
+    /// </summary>
+    [Fact]
+    public void GrowingAHelperBody_ChangesTheKernelsUnroll()
+    {
+        const string Shape = """
+            using IspcSharp;
+
+            namespace CacheDemo;
+
+            public static partial class Kernels
+            {
+                [SpmdFunction]
+                public static float H(float x) => __BODY__;
+
+                [Spmd]
+                public static float Sum(float[] a, int count)
+                {
+                    float sum = 0f;
+                    foreach (int i in Spmd.Range(count))
+                        sum += H(a[i]);
+                    return sum;
+                }
+            }
+            """;
+
+        string tiny = Shape.Replace("__BODY__", "x * 3f");
+        string huge = Shape.Replace(
+            "__BODY__",
+            "MathF.Exp(x) + MathF.Log(x) + MathF.Sin(x) + MathF.Cos(x) + MathF.Atan(x) + MathF.Cbrt(x)");
+
+        var d1 = GeneratorCachingTests.CreateDriverFor()
+            .RunGenerators(GeneratorCachingTests.CreateCompilationFor(tiny));
+        var d2 = GeneratorCachingTests.CreateDriverFor()
+            .RunGenerators(GeneratorCachingTests.CreateCompilationFor(huge));
+
+        Assert.Contains("__end - 4 * __w", KernelOf(d1));   // cheap helper: still worth unrolling
+        Assert.Contains("__end - __w;", KernelOf(d2));      // expensive helper: don't
     }
 }

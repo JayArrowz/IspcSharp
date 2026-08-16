@@ -148,10 +148,11 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         => SyntaxFactory.ParseMemberDeclaration(declarationText) as MethodDeclarationSyntax;
 
     /// <summary>
-    /// Read a <c>bool</c> named argument from the method's <c>[Spmd(...)]</c> attribute.
-    /// </summary>
-    /// <summary>
     /// Named <c>int</c> argument on the <c>[Spmd]</c> attribute, or 0 when absent.
+    ///
+    /// Read off the re-parsed <see cref="KernelInfo.MethodText"/>, which is the method's own
+    /// full text including its attribute lists — so the attribute value is part of the cache
+    /// key and editing it invalidates the kernel like any other source change.
     /// </summary>
     private static int GetSpmdIntArg(MethodDeclarationSyntax method, string argName)
     {
@@ -179,6 +180,9 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         return 0;
     }
 
+    /// <summary>
+    /// Read a <c>bool</c> named argument from the method's <c>[Spmd(...)]</c> attribute.
+    /// </summary>
     private static bool GetSpmdBoolArg(MethodDeclarationSyntax method, string argName)
     {
         foreach (var list in method.AttributeLists)
