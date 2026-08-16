@@ -511,3 +511,107 @@ public class ReductionsAndMemoryTests
         Assert.Equal(xyz, back);
     }
 }
+
+/// <summary>
+/// The scatter overloads that had no coverage before the movemask paths were collapsed onto
+/// <c>VMask.ToBitmask</c>/<c>VMaskD.ToBitmask</c>. Each must keep the two invariants the
+/// rewrite could plausibly have broken: only active lanes write, and on a duplicate index the
+/// *higher* lane wins (ISPC semantics), which depends on walking lanes in ascending order.
+/// </summary>
+public class ScatterWidthTests
+{
+    private static VMask Alternating(int w, int phase)
+    {
+        int[] bits = new int[w];
+        for (int i = 0; i < w; i++)
+            bits[i] = (i % 2 == phase) ? -1 : 0;
+        return new VMask(new System.Numerics.Vector<int>(bits));
+    }
+
+    private static VMaskD AlternatingD(int w, int phase)
+    {
+        long[] bits = new long[w];
+        for (int i = 0; i < w; i++)
+            bits[i] = (i % 2 == phase) ? -1L : 0L;
+        return new VMaskD(new System.Numerics.Vector<long>(bits));
+    }
+
+    private static VLong Iota()
+    {
+        long[] v = new long[VLong.LaneCount];
+        for (int i = 0; i < v.Length; i++) v[i] = i;
+        return VLong.Load(v, 0);
+    }
+
+    [Fact]
+    public void Scatter_Double_SparseMask_And_DuplicateIndices()
+    {
+        int w = VDouble.LaneCount;
+        double[] vals = new double[w];
+        for (int i = 0; i < w; i++) vals[i] = i + 1;
+
+        double[] dest = new double[w];
+        Memory.Scatter(dest, Iota(), VDouble.Load(vals, 0), AlternatingD(w, 0));
+        for (int l = 0; l < w; l++)
+            Assert.Equal(l % 2 == 0 ? l + 1 : 0d, dest[l]);
+
+        double[] one = new double[4];
+        Memory.Scatter(one, new VLong(0L), VDouble.Load(vals, 0), VMaskD.All);
+        Assert.Equal(w, one[0]);            // highest lane wins
+
+        double[] none = new double[w];
+        Memory.Scatter(none, Iota(), VDouble.Load(vals, 0), VMaskD.None);
+        Assert.All(none, d => Assert.Equal(0d, d));
+    }
+
+    [Fact]
+    public void Scatter_Long_SparseMask_And_DuplicateIndices()
+    {
+        int w = VLong.LaneCount;
+        long[] vals = new long[w];
+        for (int i = 0; i < w; i++) vals[i] = (i + 1) * 7;
+
+        long[] dest = new long[w];
+        Memory.Scatter(dest, Iota(), VLong.Load(vals, 0), AlternatingD(w, 1));
+        for (int l = 0; l < w; l++)
+            Assert.Equal(l % 2 == 1 ? (l + 1) * 7 : 0, dest[l]);
+
+        long[] one = new long[4];
+        Memory.Scatter(one, new VLong(0L), VLong.Load(vals, 0), VMaskD.All);
+        Assert.Equal(w * 7, one[0]);
+    }
+
+    [Fact]
+    public void Scatter_Byte_TruncatesAndRespectsMask()
+    {
+        int w = VInt.LaneCount;
+        int[] vals = new int[w];
+        for (int i = 0; i < w; i++) vals[i] = 0x100 + i + 1;   // must truncate to the low byte
+
+        byte[] dest = new byte[w];
+        Memory.Scatter(dest, VInt.ProgramIndex, VInt.Load(vals, 0), Alternating(w, 0));
+        for (int l = 0; l < w; l++)
+            Assert.Equal(l % 2 == 0 ? (byte)(l + 1) : (byte)0, dest[l]);
+
+        byte[] one = new byte[4];
+        Memory.Scatter(one, VInt.Zero, VInt.Load(vals, 0), VMask.All);
+        Assert.Equal((byte)w, one[0]);
+    }
+
+    [Fact]
+    public void Scatter_Short_TruncatesAndRespectsMask()
+    {
+        int w = VInt.LaneCount;
+        int[] vals = new int[w];
+        for (int i = 0; i < w; i++) vals[i] = 0x10000 + i + 1;
+
+        short[] dest = new short[w];
+        Memory.Scatter(dest, VInt.ProgramIndex, VInt.Load(vals, 0), Alternating(w, 1));
+        for (int l = 0; l < w; l++)
+            Assert.Equal(l % 2 == 1 ? (short)(l + 1) : (short)0, dest[l]);
+
+        short[] one = new short[4];
+        Memory.Scatter(one, VInt.Zero, VInt.Load(vals, 0), VMask.All);
+        Assert.Equal((short)w, one[0]);
+    }
+}

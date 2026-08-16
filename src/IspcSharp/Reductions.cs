@@ -464,7 +464,7 @@ public static class Memory
         }
         // NEON/SSE 4-lane fast path: full gangs build the vector directly, skipping the
         // stackalloc round-trip and per-lane mask tests (ARM has no hardware gather).
-        if (VFloat.LaneCount == 4 && TryGetActiveBits(mask, out uint gbits) && gbits == 0xF)
+        if (VFloat.LaneCount == 4 && mask.AllActive())
         {
             var r = Vector128.Create(
                 source[indices.V[0]], source[indices.V[1]],
@@ -506,23 +506,12 @@ public static class Memory
     /// </summary>
     public static void Scatter(Span<float> destination, VInt indices, VFloat values, VMask mask)
     {
-#if NET8_0_OR_GREATER
-        if (TryGetActiveBits(mask, out uint bits))
+        // Ascending lane order, so on a duplicate index the higher lane writes last and wins,
+        // matching ISPC. ToBitmask always yields an answer, so there is no per-lane fallback.
+        for (ulong bits = mask.ToBitmask(); bits != 0; bits &= bits - 1)
         {
-            while (bits != 0)
-            {
-                int l = BitOperations.TrailingZeroCount(bits);
-                bits &= bits - 1;
-                destination[indices.V[l]] = values.V[l];
-            }
-
-            return;
-        }
-#endif
-        for (int l = 0; l < VFloat.LaneCount; l++)
-        {
-            if (mask.IsLaneActive(l))
-                destination[indices.V[l]] = values.V[l];
+            int l = BitOperations.TrailingZeroCount(bits);
+            destination[indices.V[l]] = values.V[l];
         }
     }
 
@@ -586,23 +575,12 @@ public static class Memory
     /// </summary>
     public static void Scatter(Span<int> destination, VInt indices, VInt values, VMask mask)
     {
-#if NET8_0_OR_GREATER
-        if (TryGetActiveBits(mask, out uint bits))
+        // Ascending lane order, so on a duplicate index the higher lane writes last and wins,
+        // matching ISPC. ToBitmask always yields an answer, so there is no per-lane fallback.
+        for (ulong bits = mask.ToBitmask(); bits != 0; bits &= bits - 1)
         {
-            while (bits != 0)
-            {
-                int l = BitOperations.TrailingZeroCount(bits);
-                bits &= bits - 1;
-                destination[indices.V[l]] = values.V[l];
-            }
-
-            return;
-        }
-#endif
-        for (int l = 0; l < VInt.LaneCount; l++)
-        {
-            if (mask.IsLaneActive(l))
-                destination[indices.V[l]] = values.V[l];
+            int l = BitOperations.TrailingZeroCount(bits);
+            destination[indices.V[l]] = values.V[l];
         }
     }
 
@@ -668,23 +646,12 @@ public static class Memory
     /// </summary>
     public static void Scatter(Span<double> destination, VLong indices, VDouble values, VMaskD mask)
     {
-#if NET8_0_OR_GREATER
-        if (TryGetActiveBitsD(mask, out uint bits))
+        // Ascending lane order, so on a duplicate index the higher lane writes last and wins,
+        // matching ISPC. ToBitmask always yields an answer, so there is no per-lane fallback.
+        for (ulong bits = mask.ToBitmask(); bits != 0; bits &= bits - 1)
         {
-            while (bits != 0)
-            {
-                int l = BitOperations.TrailingZeroCount(bits);
-                bits &= bits - 1;
-                destination[(int)indices.V[l]] = values.V[l];
-            }
-
-            return;
-        }
-#endif
-        for (int l = 0; l < VDouble.LaneCount; l++)
-        {
-            if (mask.IsLaneActive(l))
-                destination[(int)indices.V[l]] = values.V[l];
+            int l = BitOperations.TrailingZeroCount(bits);
+            destination[(int)indices.V[l]] = values.V[l];
         }
     }
 
@@ -873,23 +840,12 @@ public static class Memory
     /// </summary>
     public static void Scatter(Span<byte> destination, VInt indices, VInt values, VMask mask)
     {
-#if NET8_0_OR_GREATER
-        if (TryGetActiveBits(mask, out uint bits))
+        // Ascending lane order, so on a duplicate index the higher lane writes last and wins,
+        // matching ISPC. ToBitmask always yields an answer, so there is no per-lane fallback.
+        for (ulong bits = mask.ToBitmask(); bits != 0; bits &= bits - 1)
         {
-            while (bits != 0)
-            {
-                int l = BitOperations.TrailingZeroCount(bits);
-                bits &= bits - 1;
-                destination[indices.V[l]] = (byte)values.V[l];
-            }
-
-            return;
-        }
-#endif
-        for (int l = 0; l < VInt.LaneCount; l++)
-        {
-            if (mask.IsLaneActive(l))
-                destination[indices.V[l]] = (byte)values.V[l];
+            int l = BitOperations.TrailingZeroCount(bits);
+            destination[indices.V[l]] = (byte)values.V[l];
         }
     }
 
@@ -898,23 +854,12 @@ public static class Memory
     /// </summary>
     public static void Scatter(Span<short> destination, VInt indices, VInt values, VMask mask)
     {
-#if NET8_0_OR_GREATER
-        if (TryGetActiveBits(mask, out uint bits))
+        // Ascending lane order, so on a duplicate index the higher lane writes last and wins,
+        // matching ISPC. ToBitmask always yields an answer, so there is no per-lane fallback.
+        for (ulong bits = mask.ToBitmask(); bits != 0; bits &= bits - 1)
         {
-            while (bits != 0)
-            {
-                int l = BitOperations.TrailingZeroCount(bits);
-                bits &= bits - 1;
-                destination[indices.V[l]] = (short)values.V[l];
-            }
-
-            return;
-        }
-#endif
-        for (int l = 0; l < VInt.LaneCount; l++)
-        {
-            if (mask.IsLaneActive(l))
-                destination[indices.V[l]] = (short)values.V[l];
+            int l = BitOperations.TrailingZeroCount(bits);
+            destination[indices.V[l]] = (short)values.V[l];
         }
     }
 
@@ -923,98 +868,18 @@ public static class Memory
     /// </summary>
     public static void Scatter(Span<long> destination, VLong indices, VLong values, VMaskD mask)
     {
-#if NET8_0_OR_GREATER
-        if (TryGetActiveBitsD(mask, out uint bits))
+        // Ascending lane order, so on a duplicate index the higher lane writes last and wins,
+        // matching ISPC. ToBitmask always yields an answer, so there is no per-lane fallback.
+        for (ulong bits = mask.ToBitmask(); bits != 0; bits &= bits - 1)
         {
-            while (bits != 0)
-            {
-                int l = BitOperations.TrailingZeroCount(bits);
-                bits &= bits - 1;
-                destination[(int)indices.V[l]] = values.V[l];
-            }
-
-            return;
-        }
-#endif
-        for (int l = 0; l < VLong.LaneCount; l++)
-        {
-            if (mask.IsLaneActive(l))
-                destination[(int)indices.V[l]] = values.V[l];
+            int l = BitOperations.TrailingZeroCount(bits);
+            destination[(int)indices.V[l]] = values.V[l];
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Scatter(Span<long> destination, VLong indices, VLong values)
         => Scatter(destination, indices, values, VMaskD.All);
-
-#if NET8_0_OR_GREATER
-    /// <summary>
-    /// Extract the active-lane set as a bitmask with one hardware instruction:
-    /// AVX-512 mask-register compare (16 lanes), AVX vmovmskps (8 lanes), or
-    /// SSE movmskps / NEON narrowing shift (4 lanes). Returns false when the lane
-    /// width has no fast path (callers fall back to the portable per-lane loop).
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool TryGetActiveBits(VMask mask, out uint bits)
-    {
-        if (VInt.LaneCount == 16 && System.Runtime.Intrinsics.X86.Avx512F.IsSupported)
-        {
-            bits = (uint)Vector512.ExtractMostSignificantBits(
-                Vector512.AsVector512(mask.Bits));
-            return true;
-        }
-
-        if (VInt.LaneCount == 8 && System.Runtime.Intrinsics.X86.Avx.IsSupported)
-        {
-            bits = Vector256.ExtractMostSignificantBits(
-                Vector256.AsVector256(mask.Bits));
-            return true;
-        }
-
-        if (VInt.LaneCount == 4 &&
-            (System.Runtime.Intrinsics.X86.Sse2.IsSupported || System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported))
-        {
-            bits = Vector128.ExtractMostSignificantBits(
-                Vector128.AsVector128(mask.Bits));
-            return true;
-        }
-
-        bits = 0;
-        return false;
-    }
-
-    /// <summary>
-    /// 64-bit-lane variant of <see cref="TryGetActiveBits"/> for VMaskD masks.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool TryGetActiveBitsD(VMaskD mask, out uint bits)
-    {
-        if (VDouble.LaneCount == 8 && System.Runtime.Intrinsics.X86.Avx512F.IsSupported)
-        {
-            bits = (uint)Vector512.ExtractMostSignificantBits(
-                Vector512.AsVector512(mask.Bits));
-            return true;
-        }
-
-        if (VDouble.LaneCount == 4 && System.Runtime.Intrinsics.X86.Avx.IsSupported)
-        {
-            bits = Vector256.AsVector256(mask.Bits).ExtractMostSignificantBits(
-);
-            return true;
-        }
-
-        if (VDouble.LaneCount == 2 &&
-            (System.Runtime.Intrinsics.X86.Sse2.IsSupported || System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported))
-        {
-            bits = Vector128.AsVector128(mask.Bits).ExtractMostSignificantBits(
-);
-            return true;
-        }
-
-        bits = 0;
-        return false;
-    }
-#endif
 
     /// <summary>
     /// Turns a strided access into a contiguous one. Classic use: matmul's b[k, col] is a

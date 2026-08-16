@@ -200,7 +200,7 @@ public class MaskBitmaskTests
     {
         int w = VMask.LaneCount;
         for (uint p = 0; p < (1u << w); p++)
-            Assert.Equal(p, FromPattern(p).ToBitmask());
+            Assert.Equal((ulong)p, FromPattern(p).ToBitmask());
     }
 
     [Fact]
@@ -210,9 +210,9 @@ public class MaskBitmaskTests
         for (uint p = 0; p < (1u << w); p++)
         {
             VMask m = FromPattern(p);
-            uint bits = m.ToBitmask();
+            ulong bits = m.ToBitmask();
             for (int l = 0; l < w; l++)
-                Assert.Equal(m.IsLaneActive(l), (bits & (1u << l)) != 0);
+                Assert.Equal(m.IsLaneActive(l), (bits & (1UL << l)) != 0);
         }
     }
 
@@ -220,11 +220,11 @@ public class MaskBitmaskTests
     public void ToBitmask_EdgeMasks()
     {
         int w = VMask.LaneCount;
-        uint all = w == 32 ? uint.MaxValue : (1u << w) - 1;
+        ulong all = w == 64 ? ulong.MaxValue : (1UL << w) - 1;
         Assert.Equal(all, VMask.All.ToBitmask());
-        Assert.Equal(0u, VMask.None.ToBitmask());
+        Assert.Equal(0UL, VMask.None.ToBitmask());
         for (int n = 0; n <= w; n++)
-            Assert.Equal(n == 32 ? uint.MaxValue : (1u << n) - 1, VMask.FirstN(n).ToBitmask());
+            Assert.Equal(n == 64 ? ulong.MaxValue : (1UL << n) - 1, VMask.FirstN(n).ToBitmask());
     }
 
     /// <summary>CountActive is now derived from ToBitmask; it must still agree lane by lane.</summary>
@@ -234,5 +234,96 @@ public class MaskBitmaskTests
         int w = VMask.LaneCount;
         for (uint p = 0; p < (1u << w); p++)
             Assert.Equal(System.Numerics.BitOperations.PopCount(p), FromPattern(p).CountActive());
+    }
+}
+
+/// <summary>
+/// <c>ToBitmask</c> across the whole mask family. VMaskB is the one that needs all 64 bits: a
+/// 512-bit gang is 64 byte lanes today, which is why the return type is <c>ulong</c> and not
+/// <c>uint</c>.
+/// </summary>
+public class MaskBitmaskFamilyTests
+{
+    private static ulong Expected(int lanes, Func<int, bool> active)
+    {
+        ulong m = 0;
+        for (int l = 0; l < lanes; l++)
+            if (active(l)) m |= 1UL << l;
+        return m;
+    }
+
+    [Fact]
+    public void VMaskB_ToBitmask_MatchesLanes()
+    {
+        int w = VMaskB.LaneCount;
+        byte[] v = new byte[w];
+        for (int l = 0; l < w; l++) v[l] = (byte)(l % 3 == 0 ? 200 : 1);
+        VMaskB m = VByte.Load(v) > new VByte(100);
+
+        ulong bits = m.ToBitmask();
+        Assert.Equal(Expected(w, l => l % 3 == 0), bits);
+        for (int l = 0; l < w; l++)
+            Assert.Equal(m.IsLaneActive(l), (bits & (1UL << l)) != 0);
+        Assert.Equal(m.CountActive(), System.Numerics.BitOperations.PopCount(bits));
+    }
+
+    [Fact]
+    public void VMaskS_ToBitmask_MatchesLanes()
+    {
+        int w = VMaskS.LaneCount;
+        short[] v = new short[w];
+        for (int l = 0; l < w; l++) v[l] = (short)(l % 4 == 1 ? 900 : -5);
+        VMaskS m = VShort.Load(v) > new VShort(100);
+
+        ulong bits = m.ToBitmask();
+        Assert.Equal(Expected(w, l => l % 4 == 1), bits);
+        for (int l = 0; l < w; l++)
+            Assert.Equal(m.IsLaneActive(l), (bits & (1UL << l)) != 0);
+        Assert.Equal(m.CountActive(), System.Numerics.BitOperations.PopCount(bits));
+    }
+
+    [Fact]
+    public void VMaskD_ToBitmask_MatchesLanes()
+    {
+        int w = VMaskD.LaneCount;
+        double[] v = new double[w];
+        for (int l = 0; l < w; l++) v[l] = l % 2 == 0 ? 5.0 : -5.0;
+        VMaskD m = VDouble.Load(v) > new VDouble(0.0);
+
+        ulong bits = m.ToBitmask();
+        Assert.Equal(Expected(w, l => l % 2 == 0), bits);
+        for (int l = 0; l < w; l++)
+            Assert.Equal(m.IsLaneActive(l), (bits & (1UL << l)) != 0);
+    }
+
+    [Fact]
+    public void AllAndNone_AreSaturatedAndEmpty()
+    {
+        Assert.Equal(Expected(VMask.LaneCount, _ => true), VMask.All.ToBitmask());
+        Assert.Equal(Expected(VMaskB.LaneCount, _ => true), VMaskB.All.ToBitmask());
+        Assert.Equal(Expected(VMaskS.LaneCount, _ => true), VMaskS.All.ToBitmask());
+        Assert.Equal(Expected(VMaskD.LaneCount, _ => true), VMaskD.All.ToBitmask());
+        Assert.Equal(0UL, VMask.None.ToBitmask());
+        Assert.Equal(0UL, VMaskB.None.ToBitmask());
+        Assert.Equal(0UL, VMaskS.None.ToBitmask());
+        Assert.Equal(0UL, VMaskD.None.ToBitmask());
+    }
+
+    /// <summary>Walking the mask by bit must visit exactly the active lanes, in order.</summary>
+    [Fact]
+    public void Bitmask_DrivesLaneWalk()
+    {
+        int w = VMaskB.LaneCount;
+        byte[] v = new byte[w];
+        for (int l = 0; l < w; l++) v[l] = (byte)(l % 5 == 2 ? 200 : 1);
+        VMaskB m = VByte.Load(v) > new VByte(100);
+
+        var walked = new System.Collections.Generic.List<int>();
+        for (ulong bits = m.ToBitmask(); bits != 0; bits &= bits - 1)
+            walked.Add(System.Numerics.BitOperations.TrailingZeroCount(bits));
+
+        var expected = new System.Collections.Generic.List<int>();
+        for (int l = 0; l < w; l++) if (m.IsLaneActive(l)) expected.Add(l);
+        Assert.Equal(expected, walked);
     }
 }

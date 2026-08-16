@@ -1,6 +1,9 @@
 using System;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+#if NET8_0_OR_GREATER
+using System.Runtime.Intrinsics;
+#endif
 
 namespace IspcSharp;
 
@@ -47,6 +50,57 @@ public readonly struct VMaskD(Vector<long> bits) : IEquatable<VMaskD>
     public bool AllActive() => !Vector.EqualsAny(Bits, Vector<long>.Zero);
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool NoneActive() => Vector.EqualsAll(Bits, Vector<long>.Zero);
+
+    /// <summary>
+    /// ISPC's <c>lanemask()</c>: bit <c>l</c> is set when lane <c>l</c> is active. One
+    /// <c>movmsk</c>-class instruction. Mirrors <see cref="VMask.ToBitmask"/> at 64-bit-lane width.
+    ///
+    /// Once the mask is an integer you can <c>TrailingZeroCount</c> it to walk active lanes one
+    /// at a time, <c>PopCount</c> it for a compaction offset, or test it against a constant.
+    /// Prefer <see cref="Any"/>/<see cref="AllActive"/> for a plain branch; reach for this when
+    /// you need lane <i>positions</i>.
+    /// </summary>
+    /// <summary>
+    /// Number of active lanes, ISPC's popcnt(lanemask()).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int CountActive() => System.Numerics.BitOperations.PopCount(ToBitmask());
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ulong ToBitmask()
+    {
+#if NET8_0_OR_GREATER
+        if (LaneCount == 8)
+            return Vector512.AsVector512(Bits).ExtractMostSignificantBits();
+        if (LaneCount == 4)
+            return Vector256.AsVector256(Bits).ExtractMostSignificantBits();
+        if (LaneCount == 2)
+            return Vector128.AsVector128(Bits).ExtractMostSignificantBits();
+#endif
+        return ToBitmaskPortable();
+    }
+
+    /// <summary>
+    /// Any gang width without a movemask instruction, including one wider than this build knows
+    /// about. <c>ulong</c> is the widest bitmask there is, so past 64 lanes this throws rather
+    /// than silently wrapping the shift — C# masks a shift count to 63, which would fold lane 64
+    /// onto bit 0 and return a plausible-looking wrong answer.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private ulong ToBitmaskPortable()
+    {
+        if (LaneCount > 64)
+            throw new NotSupportedException($"ToBitmask needs <= 64 lanes, gang is {LaneCount}");
+
+        ulong m = 0;
+        for (int l = 0; l < LaneCount; l++)
+        {
+            if (Bits[l] != 0)
+                m |= 1UL << l;
+        }
+
+        return m;
+    }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool IsLaneActive(int lane) => Bits[lane] != 0;
 

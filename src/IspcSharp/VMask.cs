@@ -92,11 +92,11 @@ public readonly struct VMask(Vector<int> bits) : IEquatable<VMask>
     /// reach for this when you need the lane <i>positions</i>, not just whether any exist.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public uint ToBitmask()
+    public ulong ToBitmask()
     {
 #if NET8_0_OR_GREATER
         if (LaneCount == 16)
-            return (uint)Vector512.AsVector512(Bits).ExtractMostSignificantBits();   // 16 lanes, always fits
+            return Vector512.AsVector512(Bits).ExtractMostSignificantBits();
         if (LaneCount == 8)
             return Vector256.AsVector256(Bits).ExtractMostSignificantBits();
         if (LaneCount == 4)
@@ -105,14 +105,25 @@ public readonly struct VMask(Vector<int> bits) : IEquatable<VMask>
         return ToBitmaskPortable();
     }
 
+    /// <summary>
+    /// Any gang width without a movemask instruction, including one wider than this build knows
+    /// about. <c>ulong</c> is the widest bitmask there is, so past 64 lanes this throws rather
+    /// than silently wrapping the shift — C# masks a shift count to 63, which would fold lane 64
+    /// onto bit 0 and return a plausible-looking wrong answer. Not reachable while
+    /// <c>Vector&lt;T&gt;</c> tops out at 512 bits; the check is here so that if it ever is, it
+    /// fails loudly.
+    /// </summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private uint ToBitmaskPortable()
+    private ulong ToBitmaskPortable()
     {
-        uint m = 0;
+        if (LaneCount > 64)
+            throw new NotSupportedException($"ToBitmask needs <= 64 lanes, gang is {LaneCount}");
+
+        ulong m = 0;
         for (int l = 0; l < LaneCount; l++)
         {
             if (Bits[l] != 0)
-                m |= 1u << l;
+                m |= 1UL << l;
         }
 
         return m;
