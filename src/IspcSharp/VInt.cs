@@ -229,6 +229,7 @@ public readonly struct VInt : IEquatable<VInt>
     /// Per-lane left shift: result[l] = a[l] &lt;&lt; (counts[l] &amp; 31).
     /// Hardware <c>vpsllvd</c> at 128/256/512-bit widths (AVX2 / AVX-512F); portable loop otherwise.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VInt ShiftLeftVariable(VInt a, VInt counts)
     {
 #if NET8_0_OR_GREATER
@@ -251,6 +252,14 @@ public readonly struct VInt : IEquatable<VInt>
                 Vector128.AsVector128(a.V), Vector128.AsVector128(cnt).AsUInt32())));
         }
 #endif
+        return ShiftLeftVariablePortable(a, counts);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VInt ShiftLeftVariablePortable(VInt a, VInt counts)
+    {
         Span<int> tmp = stackalloc int[LaneCount];
         for (int l = 0; l < LaneCount; l++)
             tmp[l] = a.V[l] << counts.V[l];
@@ -261,6 +270,7 @@ public readonly struct VInt : IEquatable<VInt>
     /// Per-lane arithmetic right shift: result[l] = a[l] &gt;&gt; (counts[l] &amp; 31).
     /// Hardware <c>vpsravd</c> at 128/256/512-bit widths (AVX2 / AVX-512F); portable loop otherwise.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VInt ShiftRightArithmeticVariable(VInt a, VInt counts)
     {
 #if NET8_0_OR_GREATER
@@ -283,6 +293,14 @@ public readonly struct VInt : IEquatable<VInt>
                 Vector128.AsVector128(a.V), Vector128.AsVector128(cnt).AsUInt32())));
         }
 #endif
+        return ShiftRightArithmeticVariablePortable(a, counts);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VInt ShiftRightArithmeticVariablePortable(VInt a, VInt counts)
+    {
         Span<int> tmp = stackalloc int[LaneCount];
         for (int l = 0; l < LaneCount; l++)
             tmp[l] = a.V[l] >> counts.V[l];
@@ -293,6 +311,7 @@ public readonly struct VInt : IEquatable<VInt>
     /// Per-lane logical right shift: result[l] = (uint)a[l] &gt;&gt; (counts[l] &amp; 31).
     /// Hardware <c>vpsrlvd</c> at 128/256/512-bit widths (AVX2 / AVX-512F); portable loop otherwise.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VInt ShiftRightLogicalVariable(VInt a, VInt counts)
     {
 #if NET8_0_OR_GREATER
@@ -315,6 +334,14 @@ public readonly struct VInt : IEquatable<VInt>
                 Vector128.AsVector128(a.V).AsUInt32(), Vector128.AsVector128(cnt).AsUInt32()).AsInt32()));
         }
 #endif
+        return ShiftRightLogicalVariablePortable(a, counts);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VInt ShiftRightLogicalVariablePortable(VInt a, VInt counts)
+    {
         Span<int> tmp = stackalloc int[LaneCount];
         for (int l = 0; l < LaneCount; l++)
             tmp[l] = (int)((uint)a.V[l] >> counts.V[l]);
@@ -328,6 +355,7 @@ public readonly struct VInt : IEquatable<VInt>
     /// byte data at full int-gang width: compute in int lanes (C#'s own promotion rules),
     /// touch memory one byte per lane.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VInt LoadZeroExtend(ReadOnlySpan<byte> source, int offset = 0)
     {
 #if NET8_0_OR_GREATER
@@ -360,6 +388,14 @@ public readonly struct VInt : IEquatable<VInt>
             return new VInt(Vector128.AsVector(w32.AsInt32()));
         }
 #endif
+        return LoadZeroExtendPortable(source, offset);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VInt LoadZeroExtendPortable(ReadOnlySpan<byte> source, int offset)
+    {
         Span<int> tmp = stackalloc int[LaneCount];
         for (int l = 0; l < LaneCount; l++)
             tmp[l] = source[offset + l];
@@ -371,6 +407,7 @@ public readonly struct VInt : IEquatable<VInt>
     /// Reads exactly LaneCount shorts. Hardware <c>vpmovsxwd</c> (SSE4.1/AVX2/AVX-512F) or
     /// NEON <c>sshll</c>; portable loop otherwise. See <see cref="LoadZeroExtend"/>.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VInt LoadSignExtend(ReadOnlySpan<short> source, int offset = 0)
     {
 #if NET8_0_OR_GREATER
@@ -402,6 +439,14 @@ public readonly struct VInt : IEquatable<VInt>
             return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.Arm.AdvSimd.SignExtendWideningLower(s)));
         }
 #endif
+        return LoadSignExtendPortable(source, offset);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VInt LoadSignExtendPortable(ReadOnlySpan<short> source, int offset)
+    {
         Span<int> tmp = stackalloc int[LaneCount];
         for (int l = 0; l < LaneCount; l++)
             tmp[l] = source[offset + l];

@@ -174,6 +174,7 @@ public readonly struct VShort : IEquatable<VShort>
     /// Saturating add: lanes clamp to [-32768, 32767] instead of wrapping.
     /// Hardware <c>paddsw</c> (SSE2/AVX2/AVX-512BW) or NEON <c>sqadd</c>; portable loop otherwise.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VShort AddSaturate(VShort a, VShort b)
     {
 #if NET8_0_OR_GREATER
@@ -201,6 +202,14 @@ public readonly struct VShort : IEquatable<VShort>
                 Vector128.AsVector128(a.V), Vector128.AsVector128(b.V))));
         }
 #endif
+        return AddSaturatePortable(a, b);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VShort AddSaturatePortable(VShort a, VShort b)
+    {
         Span<short> tmp = stackalloc short[LaneCount];
         for (int l = 0; l < LaneCount; l++)
             tmp[l] = (short)Math.Clamp(a.V[l] + b.V[l], short.MinValue, short.MaxValue);
@@ -211,6 +220,7 @@ public readonly struct VShort : IEquatable<VShort>
     /// Saturating subtract: lanes clamp to [-32768, 32767] instead of wrapping.
     /// Hardware <c>psubsw</c> (SSE2/AVX2/AVX-512BW) or NEON <c>sqsub</c>; portable loop otherwise.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VShort SubtractSaturate(VShort a, VShort b)
     {
 #if NET8_0_OR_GREATER
@@ -238,6 +248,14 @@ public readonly struct VShort : IEquatable<VShort>
                 Vector128.AsVector128(a.V), Vector128.AsVector128(b.V))));
         }
 #endif
+        return SubtractSaturatePortable(a, b);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VShort SubtractSaturatePortable(VShort a, VShort b)
+    {
         Span<short> tmp = stackalloc short[LaneCount];
         for (int l = 0; l < LaneCount; l++)
             tmp[l] = (short)Math.Clamp(a.V[l] - b.V[l], short.MinValue, short.MaxValue);
@@ -249,6 +267,7 @@ public readonly struct VShort : IEquatable<VShort>
     /// The core of Q15/Q16 fixed-point multiplies. Hardware <c>pmulhw</c>
     /// (SSE2/AVX2/AVX-512BW); portable loop otherwise.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VShort MultiplyHigh(VShort a, VShort b)
     {
 #if NET8_0_OR_GREATER
@@ -270,6 +289,14 @@ public readonly struct VShort : IEquatable<VShort>
                 Vector128.AsVector128(a.V), Vector128.AsVector128(b.V))));
         }
 #endif
+        return MultiplyHighPortable(a, b);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VShort MultiplyHighPortable(VShort a, VShort b)
+    {
         Span<short> tmp = stackalloc short[LaneCount];
         for (int l = 0; l < LaneCount; l++)
             tmp[l] = (short)((a.V[l] * b.V[l]) >> 16);

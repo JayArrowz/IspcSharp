@@ -1,6 +1,9 @@
 using System;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+#if NET8_0_OR_GREATER
+using System.Runtime.Intrinsics;
+#endif
 
 namespace IspcSharp;
 
@@ -80,19 +83,46 @@ public readonly struct VMask(Vector<int> bits) : IEquatable<VMask>
     public bool NoneActive() => Vector.EqualsAll(Bits, Vector<int>.Zero);
 
     /// <summary>
-    /// Number of active lanes, ISPC's popcnt(lanemask()).
+    /// ISPC's <c>lanemask()</c>: bit <c>l</c> is set when lane <c>l</c> is active.
+    ///
+    /// One <c>vmovmskps</c>-class instruction. This is the bridge out of vector-land — once the
+    /// mask is an integer you can <see cref="System.Numerics.BitOperations.TrailingZeroCount(uint)"/>
+    /// to walk active lanes one at a time, <c>PopCount</c> it for a compaction offset, or test it
+    /// against a constant. Prefer <see cref="Any"/>/<see cref="AllActive"/> for plain branches;
+    /// reach for this when you need the lane <i>positions</i>, not just whether any exist.
     /// </summary>
-    public int CountActive()
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public uint ToBitmask()
     {
-        int c = 0;
+#if NET8_0_OR_GREATER
+        if (LaneCount == 16)
+            return (uint)Vector512.AsVector512(Bits).ExtractMostSignificantBits();   // 16 lanes, always fits
+        if (LaneCount == 8)
+            return Vector256.AsVector256(Bits).ExtractMostSignificantBits();
+        if (LaneCount == 4)
+            return Vector128.AsVector128(Bits).ExtractMostSignificantBits();
+#endif
+        return ToBitmaskPortable();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private uint ToBitmaskPortable()
+    {
+        uint m = 0;
         for (int l = 0; l < LaneCount; l++)
         {
             if (Bits[l] != 0)
-                c++;
+                m |= 1u << l;
         }
 
-        return c;
+        return m;
     }
+
+    /// <summary>
+    /// Number of active lanes, ISPC's popcnt(lanemask()).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int CountActive() => System.Numerics.BitOperations.PopCount(ToBitmask());
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool IsLaneActive(int lane) => Bits[lane] != 0;

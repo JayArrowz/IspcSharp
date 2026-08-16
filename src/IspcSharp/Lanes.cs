@@ -17,6 +17,7 @@ public static class Lanes
     /// <param name="v">The input vector.</param>
     /// <param name="indices">The indices to shuffle.</param>
     /// <returns>The shuffled vector.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VFloat Shuffle(VFloat v, VInt indices)
     {
 #if NET8_0_OR_GREATER
@@ -44,6 +45,14 @@ public static class Lanes
                     System.Runtime.Intrinsics.Vector128.AsVector128(indices.V))));
         }
 #endif
+        return ShufflePortable(v, indices);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VFloat ShufflePortable(VFloat v, VInt indices)
+    {
         Span<float> tmp = stackalloc float[VFloat.LaneCount];
         for (int l = 0; l < VFloat.LaneCount; l++)
         {
@@ -60,6 +69,7 @@ public static class Lanes
     /// <param name="v">The input vector.</param>
     /// <param name="indices">The indices to shuffle.</param>
     /// <returns>The shuffled vector.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VInt Shuffle(VInt v, VInt indices)
     {
 #if NET8_0_OR_GREATER
@@ -87,6 +97,14 @@ public static class Lanes
                     System.Runtime.Intrinsics.Vector128.AsVector128(indices.V))));
         }
 #endif
+        return ShufflePortable(v, indices);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VInt ShufflePortable(VInt v, VInt indices)
+    {
         Span<int> tmp = stackalloc int[VInt.LaneCount];
         for (int l = 0; l < VInt.LaneCount; l++)
         {
@@ -171,6 +189,7 @@ public static class Lanes
     /// <param name="v">The input vector.</param>
     /// <param name="indices">The indices to shuffle.</param>
     /// <returns>The shuffled vector.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VShort Shuffle(VShort v, VShort indices)
     {
 #if NET8_0_OR_GREATER
@@ -198,6 +217,14 @@ public static class Lanes
                     System.Runtime.Intrinsics.Vector128.AsVector128(indices.V))));
         }
 #endif
+        return ShufflePortable(v, indices);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VShort ShufflePortable(VShort v, VShort indices)
+    {
         Span<short> tmp = stackalloc short[VShort.LaneCount];
         for (int l = 0; l < VShort.LaneCount; l++)
         {
@@ -215,6 +242,7 @@ public static class Lanes
     /// <param name="v">The input vector.</param>
     /// <param name="indices">The indices to shuffle.</param>
     /// <returns>The shuffled vector.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VByte Shuffle(VByte v, VByte indices)
     {
 #if NET8_0_OR_GREATER
@@ -242,6 +270,14 @@ public static class Lanes
                     System.Runtime.Intrinsics.Vector128.AsVector128(indices.V))));
         }
 #endif
+        return ShufflePortable(v, indices);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VByte ShufflePortable(VByte v, VByte indices)
+    {
         Span<byte> tmp = stackalloc byte[VByte.LaneCount];
         for (int l = 0; l < VByte.LaneCount; l++)
         {

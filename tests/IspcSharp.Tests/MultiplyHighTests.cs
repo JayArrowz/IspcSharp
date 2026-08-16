@@ -179,3 +179,60 @@ public class MultiplyHighTests
         }
     }
 }
+
+/// <summary>
+/// <see cref="VMask.ToBitmask"/>: the bridge from an execution mask to an integer whose bits
+/// are lane positions. Every active lane must map to exactly its own bit.
+/// </summary>
+public class MaskBitmaskTests
+{
+    private static VMask FromPattern(uint pattern)
+    {
+        int w = VMask.LaneCount;
+        int[] v = new int[w];
+        for (int l = 0; l < w; l++)
+            v[l] = (pattern & (1u << l)) != 0 ? 1 : 0;
+        return VInt.Load(v, 0) > VInt.Zero;
+    }
+
+    [Fact]
+    public void ToBitmask_RoundTripsEveryPattern()
+    {
+        int w = VMask.LaneCount;
+        for (uint p = 0; p < (1u << w); p++)
+            Assert.Equal(p, FromPattern(p).ToBitmask());
+    }
+
+    [Fact]
+    public void ToBitmask_MatchesIsLaneActive()
+    {
+        int w = VMask.LaneCount;
+        for (uint p = 0; p < (1u << w); p++)
+        {
+            VMask m = FromPattern(p);
+            uint bits = m.ToBitmask();
+            for (int l = 0; l < w; l++)
+                Assert.Equal(m.IsLaneActive(l), (bits & (1u << l)) != 0);
+        }
+    }
+
+    [Fact]
+    public void ToBitmask_EdgeMasks()
+    {
+        int w = VMask.LaneCount;
+        uint all = w == 32 ? uint.MaxValue : (1u << w) - 1;
+        Assert.Equal(all, VMask.All.ToBitmask());
+        Assert.Equal(0u, VMask.None.ToBitmask());
+        for (int n = 0; n <= w; n++)
+            Assert.Equal(n == 32 ? uint.MaxValue : (1u << n) - 1, VMask.FirstN(n).ToBitmask());
+    }
+
+    /// <summary>CountActive is now derived from ToBitmask; it must still agree lane by lane.</summary>
+    [Fact]
+    public void CountActive_MatchesPopCount()
+    {
+        int w = VMask.LaneCount;
+        for (uint p = 0; p < (1u << w); p++)
+            Assert.Equal(System.Numerics.BitOperations.PopCount(p), FromPattern(p).CountActive());
+    }
+}

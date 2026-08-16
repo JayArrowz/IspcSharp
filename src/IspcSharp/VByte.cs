@@ -158,6 +158,7 @@ public readonly struct VByte : IEquatable<VByte>
     /// Saturating add: lanes clamp to 255 instead of wrapping (the pixel-brighten primitive).
     /// Hardware <c>paddusb</c> (SSE2/AVX2/AVX-512BW) or NEON <c>uqadd</c>; portable loop otherwise.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VByte AddSaturate(VByte a, VByte b)
     {
 #if NET8_0_OR_GREATER
@@ -185,6 +186,14 @@ public readonly struct VByte : IEquatable<VByte>
                 Vector128.AsVector128(a.V), Vector128.AsVector128(b.V))));
         }
 #endif
+        return AddSaturatePortable(a, b);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VByte AddSaturatePortable(VByte a, VByte b)
+    {
         Span<byte> tmp = stackalloc byte[LaneCount];
         for (int l = 0; l < LaneCount; l++)
             tmp[l] = (byte)Math.Min(a.V[l] + b.V[l], byte.MaxValue);
@@ -195,6 +204,7 @@ public readonly struct VByte : IEquatable<VByte>
     /// Saturating subtract: lanes clamp to 0 instead of wrapping (the pixel-darken primitive).
     /// Hardware <c>psubusb</c> (SSE2/AVX2/AVX-512BW) or NEON <c>uqsub</c>; portable loop otherwise.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VByte SubtractSaturate(VByte a, VByte b)
     {
 #if NET8_0_OR_GREATER
@@ -222,6 +232,14 @@ public readonly struct VByte : IEquatable<VByte>
                 Vector128.AsVector128(a.V), Vector128.AsVector128(b.V))));
         }
 #endif
+        return SubtractSaturatePortable(a, b);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VByte SubtractSaturatePortable(VByte a, VByte b)
+    {
         Span<byte> tmp = stackalloc byte[LaneCount];
         for (int l = 0; l < LaneCount; l++)
             tmp[l] = (byte)Math.Max(a.V[l] - b.V[l], 0);
@@ -233,6 +251,7 @@ public readonly struct VByte : IEquatable<VByte>
     /// Hardware <c>pavgb</c> (SSE2/AVX2/AVX-512BW); portable loop otherwise. The bilinear-blend
     /// / mipmap primitive.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VByte Average(VByte a, VByte b)
     {
 #if NET8_0_OR_GREATER
@@ -260,6 +279,14 @@ public readonly struct VByte : IEquatable<VByte>
                 Vector128.AsVector128(a.V), Vector128.AsVector128(b.V))));
         }
 #endif
+        return AveragePortable(a, b);
+    }
+
+    /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
+    /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VByte AveragePortable(VByte a, VByte b)
+    {
         Span<byte> tmp = stackalloc byte[LaneCount];
         for (int l = 0; l < LaneCount; l++)
             tmp[l] = (byte)((a.V[l] + b.V[l] + 1) >> 1);
