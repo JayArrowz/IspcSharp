@@ -26,4 +26,18 @@ public sealed class SpmdAttribute : Attribute
     /// output buffers. Off by default.
     /// </summary>
     public bool Streaming { get; set; } = false;
+
+    /// <summary>
+    /// Force the vectorized reduction loop's unroll factor (1-4) instead of letting the generator
+    /// choose. 0, the default, means choose automatically.
+    ///
+    /// Unrolling gives each copy its own accumulator set, which breaks the accumulator dependency
+    /// chain — worth it when that chain is the bottleneck, a loss when the copies exhaust the
+    /// vector registers. The automatic choice budgets for the 16 registers x86 has below AVX-512
+    /// and charges a <c>double</c>/<c>long</c> accumulator two registers (it is a VDouble2/VLong2
+    /// pair). On AVX-512, where there are 32, a higher factor may pay: the unroll is baked into
+    /// the generated source, but the register count is only known when the JIT runs, so the
+    /// generator cannot detect that for you. Measure before setting this.
+    /// </summary>
+    public int Unroll { get; set; } = 0;
 }

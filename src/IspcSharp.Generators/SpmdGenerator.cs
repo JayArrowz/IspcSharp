@@ -150,6 +150,35 @@ public sealed class SpmdGenerator : IIncrementalGenerator
     /// <summary>
     /// Read a <c>bool</c> named argument from the method's <c>[Spmd(...)]</c> attribute.
     /// </summary>
+    /// <summary>
+    /// Named <c>int</c> argument on the <c>[Spmd]</c> attribute, or 0 when absent.
+    /// </summary>
+    private static int GetSpmdIntArg(MethodDeclarationSyntax method, string argName)
+    {
+        foreach (var list in method.AttributeLists)
+        {
+            foreach (var attr in list.Attributes)
+            {
+                string n = attr.Name.ToString();
+                int dot = n.LastIndexOf('.');
+                if (dot >= 0)
+                    n = n.Substring(dot + 1);
+                if (n is not ("Spmd" or "SpmdAttribute") || attr.ArgumentList == null)
+                    continue;
+                foreach (var arg in attr.ArgumentList.Arguments)
+                {
+                    if (arg.NameEquals?.Name.Identifier.Text == argName &&
+                        arg.Expression is LiteralExpressionSyntax { Token.Value: int v })
+                    {
+                        return v;
+                    }
+                }
+            }
+        }
+
+        return 0;
+    }
+
     private static bool GetSpmdBoolArg(MethodDeclarationSyntax method, string argName)
     {
         foreach (var list in method.AttributeLists)
@@ -493,7 +522,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
             preLocals.Keys.Where(n => reductions.All(r => r.Name != n)));
 
         string laneCountExpr = doubleMode ? "VDouble.LaneCount" : longMode ? "VLong.LaneCount" : "VFloat.LaneCount";
-        int unroll = UnrollFactor(body, reductions);
+        int unroll = UnrollFactor(body, reductions, fnMap, GetSpmdIntArg(method, "Unroll"));
         bool streaming = GetSpmdBoolArg(method, "Streaming");
 
         var emitter = new VectorBodyEmitter(loopVar, paramInfos, uniformPreLocals, preLocals, reductions, doubleMode, longMode, structMap, fnMap, NameQualifyRewriter.BuildMap(kernel.Consts), streaming);
@@ -852,14 +881,29 @@ public sealed class SpmdGenerator : IIncrementalGenerator
     }
 
     /// <summary>
-    /// Unroll factor for the vectorized loop: 4 for a straight-line reduction body (breaks the
-    /// accumulator dependency chain), else 1. Anything with nested control flow or per-lane exits is
-    /// left un-unrolled, replicating masks/branches isn't worth the complexity.
+    /// Unroll factor for the vectorized loop. One independent accumulator set per copy breaks the
+    /// accumulator dependency chain — but that only pays when the chain is really the bottleneck
+    /// and the copies still fit in the register file.
+    ///
+    /// Two things veto it. A body that calls a helper already has enough independent work per
+    /// element to hide the accumulator latency, and holds plenty of live vectors of its own (a
+    /// Philox round keeps four counter words alive across ten rounds). And a wide accumulator
+    /// costs two vector registers rather than one, because a double or long reduction is a
+    /// VDouble2/VLong2 pair — two double reductions unrolled four ways is sixteen live vectors,
+    /// the entire AVX2 register file, which measured 24% *slower* than not unrolling at all.
+    ///
+    /// Anything with nested control flow or per-lane exits is left un-unrolled; replicating
+    /// masks/branches isn't worth the complexity.
     /// </summary>
-    private static int UnrollFactor(SyntaxList<StatementSyntax> body, List<ReductionInfo> reductions)
+    private static int UnrollFactor(
+        SyntaxList<StatementSyntax> body, List<ReductionInfo> reductions,
+        Dictionary<string, FunctionInfo> fnMap, int explicitUnroll)
     {
+        if (explicitUnroll > 0)
+            return Math.Min(4, explicitUnroll);
         if (reductions.Count == 0)
             return 1;
+
         foreach (var st in body)
         {
             foreach (var node in st.DescendantNodesAndSelf())
@@ -873,8 +917,103 @@ public sealed class SpmdGenerator : IIncrementalGenerator
             }
         }
 
-        return 4;
+        // A big body already holds many live vectors and supplies its own instruction-level
+        // parallelism, so the accumulator chain is not what limits it and extra copies only cost
+        // registers. Cost is charged through helper calls rather than assuming every call is
+        // expensive — a one-line Lerp should not veto unrolling the way a Philox draw must.
+        var memo = new Dictionary<string, int>(StringComparer.Ordinal);
+        int cost = 0;
+        foreach (var st in body)
+            cost += BodyCost(st, fnMap, memo, depth: 0);
+        if (cost > UnrollCostLimit)
+            return 1;
+
+        // A double or long accumulator is a VDouble2/VLong2 pair and so costs two registers —
+        // and two independent dependency chains, since the halves add separately. That second
+        // point is why the budget is far below the architectural register count: the chain is
+        // already partly broken before any unrolling.
+        int regsPerCopy = 0;
+        foreach (var r in reductions)
+            regsPerCopy += r.LaneKind is Kind.D or Kind.L ? 2 : 1;
+
+        return Math.Max(1, Math.Min(4, AccumulatorRegisterBudget / Math.Max(1, regsPerCopy)));
     }
+
+    /// <summary>
+    /// Accumulator registers to spend across all unrolled copies. Measured, not reasoned: on an
+    /// L2-resident reduction (AVX2, 16 vector registers) one float accumulator wants 2-4 copies,
+    /// two float or one double wants 2, and two double accumulators are fastest at 1 copy — 2
+    /// copies there ran 2.2x slower.
+    ///
+    /// Note how far under 16 this lands. The limit is not the architectural register file but
+    /// total live values including the body's own temporaries, which is also why raising it for
+    /// AVX-512's 32 registers would not obviously help.
+    /// </summary>
+    private const int AccumulatorRegisterBudget = 4;
+
+    /// <summary>
+    /// Body size above which unrolling is assumed not to pay. Calibrated, not derived: a
+    /// multiply-accumulate body scores ~15 and a Box-Muller-plus-Philox draw scores in the
+    /// hundreds, so anything in between separates them.
+    /// </summary>
+    private const int UnrollCostLimit = 120;
+
+    /// <summary>Assumed cost of a helper the recursion gave up on (cycle or nesting limit).</summary>
+    private const int OpaqueCallCost = UnrollCostLimit + 1;
+
+    /// <summary>
+    /// Rough size of a vectorized body in syntax nodes, charging each call the size of what it
+    /// calls. Only the comparison against <see cref="UnrollCostLimit"/> matters, not the scale.
+    /// </summary>
+    private static int BodyCost(
+        SyntaxNode root, Dictionary<string, FunctionInfo> fnMap, Dictionary<string, int> memo, int depth)
+    {
+        if (depth > 4)
+            return OpaqueCallCost;
+
+        int cost = 0;
+        foreach (var node in root.DescendantNodesAndSelf())
+        {
+            cost++;
+            if (node is not InvocationExpressionSyntax call)
+                continue;
+
+            string callee = call.Expression.ToString().Replace(" ", "");
+            cost += IntrinsicCost(callee);
+
+            if (!fnMap.TryGetValue(callee, out var fn))
+                continue;
+            if (!memo.TryGetValue(fn.QualifiedName, out int helperCost))
+            {
+                // Seed before recursing so a cycle resolves to "opaque" rather than looping.
+                // [SpmdFunction] recursion is rejected elsewhere; this is belt and braces.
+                memo[fn.QualifiedName] = OpaqueCallCost;
+                helperCost = BodyCost(
+                    CSharpSyntaxTree.ParseText(fn.DeclarationText).GetRoot(), fnMap, memo, depth + 1);
+                memo[fn.QualifiedName] = helperCost;
+            }
+
+            cost += helperCost;
+        }
+
+        return cost;
+    }
+
+    /// <summary>
+    /// What a Math/MathF call expands to. The transcendentals become long polynomial sequences
+    /// with a serial dependency chain; Sqrt/Min/Max/Abs and friends are a single instruction and
+    /// are charged nothing beyond their syntax.
+    /// </summary>
+    private static int IntrinsicCost(string callee) => callee switch
+    {
+        "Math.Exp" or "MathF.Exp" or "Math.Log" or "MathF.Log" or
+        "Math.Sin" or "MathF.Sin" or "Math.Cos" or "MathF.Cos" or
+        "Math.Tan" or "MathF.Tan" or "Math.Tanh" or "MathF.Tanh" or
+        "Math.Pow" or "MathF.Pow" or "Math.Cbrt" or "MathF.Cbrt" or
+        "Math.Atan" or "MathF.Atan" or "Math.Atan2" or "MathF.Atan2" or
+        "Math.Asin" or "MathF.Asin" or "Math.Acos" or "MathF.Acos" => 40,
+        _ => 0,
+    };
 
     /// <summary>
     /// The lane type of a scalar C# type in a float/int gang (structs → varying companion).
