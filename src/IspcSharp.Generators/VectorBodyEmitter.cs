@@ -2109,6 +2109,7 @@ internal sealed class VectorBodyEmitter
             "Math.Acos" or "MathF.Acos" => "Acos",
             "Math.Cbrt" or "MathF.Cbrt" => "Cbrt",
             "MathF.FusedMultiplyAdd" or "Math.FusedMultiplyAdd" => "!FMA",
+            "Spmd.MultiplyHighUnsigned" or "IspcSharp.Spmd.MultiplyHighUnsigned" => "!MULHI",
             _ => null,
         } ?? throw new UnsupportedConstructException($"call to '{callee}' (no VectorMath mapping)", call.GetLocation());
 
@@ -2136,7 +2137,12 @@ internal sealed class VectorBodyEmitter
         // the byte/short clamp path: Math.Min(x + 60, 255) on widened narrow lanes.
         bool intCall = !_l && !_d && fn is "Min" or "Max" or "Abs" or "Clamp" &&
             vecArgs.All(a => a.Value.Kind == Kind.I);
-        var target = _d || vecArgs.Any(a => a.Value.Kind == Kind.D)
+        // Spmd.MultiplyHighUnsigned is int-only in both directions — it reinterprets its
+        // operands as unsigned 32-bit and yields the top 32 bits of the product — so it pins
+        // the call to int lanes instead of joining the float/double promotion above.
+        var target = fn == "!MULHI"
+            ? Kind.I
+            : _d || vecArgs.Any(a => a.Value.Kind == Kind.D)
             ? Kind.D
             : longIntCall
             ? Kind.L
@@ -2144,9 +2150,12 @@ internal sealed class VectorBodyEmitter
             ? Kind.I
             : LaneFloatKind;
         string[] args = [.. vecArgs.Select(a => CoerceCode(a.Value, target, a.Node))];
-        string code = fn == "!FMA"
-            ? $"{VType(target)}.MulAdd({string.Join(", ", args)})"
-            : $"VectorMath.{fn}({string.Join(", ", args)})";
+        string code = fn switch
+        {
+            "!FMA" => $"{VType(target)}.MulAdd({string.Join(", ", args)})",
+            "!MULHI" => $"VInt.MultiplyHighUnsigned({string.Join(", ", args)})",
+            _ => $"VectorMath.{fn}({string.Join(", ", args)})",
+        };
         return (code, target);
     }
 

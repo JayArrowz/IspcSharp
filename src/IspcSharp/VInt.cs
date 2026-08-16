@@ -149,6 +149,83 @@ public readonly struct VInt : IEquatable<VInt>
     }
 
     /// <summary>
+    /// High 32 bits of the <b>unsigned</b> 32x32 → 64 product, per lane:
+    /// <c>result[l] = (int)(((ulong)(uint)a[l] * (uint)b[l]) >> 32)</c>.
+    ///
+    /// The low half is just <c>a * b</c> — the bottom 32 bits of a product are the same
+    /// signed or unsigned — so this plus <c>operator *</c> gives the full widening multiply
+    /// without ever forming 64-bit lanes. That matters: <c>Vector&lt;long&gt;</c> multiply has
+    /// no hardware instruction below AVX-512DQ, so widening to a <see cref="VLong2"/> pair and
+    /// multiplying there costs an emulated sequence per half plus the widen/narrow round trip.
+    /// <c>vpmuludq</c> is precisely a 32x32 → 64 widening multiply and does the whole job.
+    ///
+    /// Counter-based RNGs (Philox, Threefry) and fixed-point scaling are the usual callers.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VInt MultiplyHighUnsigned(VInt a, VInt b)
+    {
+        var au = Vector.AsVectorUInt64(a.V);
+        var bu = Vector.AsVectorUInt64(b.V);
+
+        // vpmuludq multiplies the even-indexed 32-bit lanes and writes 64-bit products, so the
+        // odd lanes get a second pass after being shifted down into even position.
+        var pe = MultiplyEvenUnsigned(au, bu);
+        var po = MultiplyEvenUnsigned(
+            Vector.ShiftRightLogical(au, 32),
+            Vector.ShiftRightLogical(bu, 32));
+
+        // Recombine: >>32 drops each even product's high word into the even 32-bit slot, while
+        // each odd product's high word already sits in the odd slot. The slots each side
+        // contributes are disjoint and the rest are zero, so OR merges them — no blend needed.
+        var hi = Vector.ShiftRightLogical(pe, 32) | (po & new Vector<ulong>(0xFFFFFFFF00000000UL));
+        return new VInt(Vector.AsVectorInt32(hi));
+    }
+
+    /// <summary>
+    /// <c>vpmuludq</c>: 64-bit products of the low halves of each 64-bit lane — that is, of the
+    /// even-indexed 32-bit lanes. Callers pass the odd lanes by shifting them down first.
+    ///
+    /// The portable fallback lives in its own method on purpose: <c>stackalloc</c> emits
+    /// <c>localloc</c>, and RyuJIT refuses to inline <i>any</i> method containing it, no matter
+    /// what <see cref="MethodImplOptions.AggressiveInlining"/> says. Left inline here that would
+    /// turn every multiply into a real call — which is exactly how the per-lane
+    /// <c>VectorMath.Log</c> divide helper this primitive replaces became a bottleneck.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector<ulong> MultiplyEvenUnsigned(Vector<ulong> a, Vector<ulong> b)
+    {
+#if NET8_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx512F.IsSupported && LaneCount == 16)
+        {
+            return Vector512.AsVector(System.Runtime.Intrinsics.X86.Avx512F.Multiply(
+                Vector512.AsVector512(a).AsUInt32(), Vector512.AsVector512(b).AsUInt32()));
+        }
+
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && LaneCount == 8)
+        {
+            return Vector256.AsVector(System.Runtime.Intrinsics.X86.Avx2.Multiply(
+                Vector256.AsVector256(a).AsUInt32(), Vector256.AsVector256(b).AsUInt32()));
+        }
+
+        if (System.Runtime.Intrinsics.X86.Sse2.IsSupported && LaneCount == 4)
+        {
+            return Vector128.AsVector(System.Runtime.Intrinsics.X86.Sse2.Multiply(
+                Vector128.AsVector128(a).AsUInt32(), Vector128.AsVector128(b).AsUInt32()));
+        }
+#endif
+        return MultiplyEvenUnsignedPortable(a, b);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static Vector<ulong> MultiplyEvenUnsignedPortable(Vector<ulong> a, Vector<ulong> b)
+    {
+        Span<ulong> tmp = stackalloc ulong[Vector<ulong>.Count];
+        for (int l = 0; l < tmp.Length; l++)
+            tmp[l] = (ulong)(uint)a[l] * (uint)b[l];
+        return new Vector<ulong>(tmp);
+    }
+
+    /// <summary>
     /// Per-lane left shift: result[l] = a[l] &lt;&lt; (counts[l] &amp; 31).
     /// Hardware <c>vpsllvd</c> at 128/256/512-bit widths (AVX2 / AVX-512F); portable loop otherwise.
     /// </summary>

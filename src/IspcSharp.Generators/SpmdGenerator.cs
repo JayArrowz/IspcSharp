@@ -1016,6 +1016,12 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         _ = src.AppendLine(fn.TypeHeader);
         _ = src.AppendLine("{");
         _ = src.AppendLine($"    /// <summary>Varying companion of <see cref=\"{fn.Name}\"/> (generated).</summary>");
+        // SPMD helpers are meant to fuse into the caller's gang, the way an ISPC function does.
+        // Left to its own judgement the JIT will not inline these: a varying [SpmdStruct] is one
+        // vector per field (a 4-field struct is 128 bytes at 256-bit width), so an un-inlined
+        // helper passes and returns it through memory, and a chain like Draw2 -> Bijection ->
+        // Round pays that on every level of every round.
+        _ = src.AppendLine("    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]");
         _ = src.AppendLine($"    public static {vret} {fn.Name}({vparams})");
         _ = src.AppendLine("    {");
         _ = src.Append(body);

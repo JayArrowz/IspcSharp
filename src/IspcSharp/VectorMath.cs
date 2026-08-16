@@ -107,8 +107,9 @@ public static class VectorMath
     {
         var bits = new VInt(Vector.AsVectorInt32(x.V));
 
-        // exponent = (bits >> 23) - 127; shift emulated with division (positive bits for x > 0)
-        var e = new VInt(Divide(bits.V, MantissaShift)) - 127;
+        // exponent = (bits >> 23) - 127 (bits are positive for x > 0, so a logical shift —
+        // vpsrld, one instruction — replaces the former per-lane scalar divide).
+        var e = VInt.ShiftRightLogical(bits, 23) - 127;
 
         // mantissa in [1, 2): keep fraction bits, force exponent to 0 (0x3F800000)
         var mBits = (bits & new VInt(0x007FFFFF)) | new VInt(0x3F800000);
@@ -281,15 +282,6 @@ public static class VectorMath
         var q = Min(a, b) / m;                       // NaN when m == 0, masked below
         var r = m * Sqrt(VFloat.MulAdd(q, q, VFloat.One));
         return VFloat.Select(VFloat.Eq(m, VFloat.Zero), VFloat.Zero, r);
-    }
-
-    // Portable per-lane integer divide (Vector<int> has no division op).
-    private static Vector<int> Divide(Vector<int> a, int divisor)
-    {
-        Span<int> tmp = stackalloc int[Vector<int>.Count];
-        for (int l = 0; l < Vector<int>.Count; l++)
-            tmp[l] = a[l] / divisor;
-        return new Vector<int>(tmp);
     }
 
     private const double LnTwoD = 0.6931471805599453;

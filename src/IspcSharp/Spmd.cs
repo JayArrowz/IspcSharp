@@ -140,6 +140,24 @@ public static class Spmd
     }
 
     /// <summary>
+    /// High 32 bits of the <b>unsigned</b> 32x32 → 64 product.
+    ///
+    /// Inside a kernel the generator lowers this to <see cref="VInt.MultiplyHighUnsigned"/>
+    /// (<c>vpmuludq</c>), the same way it lowers <c>MathF.Exp</c> to
+    /// <see cref="VectorMath.Exp(VFloat)"/>; called directly it computes the same value
+    /// scalar, so the scalar path stays the reference implementation.
+    ///
+    /// Pair it with plain <c>a * b</c> for the low half to get a full widening multiply
+    /// without ever forming 64-bit lanes. Going through <c>long</c> to recover unsigned
+    /// semantics — the only other option, since lanes have no unsigned type — costs an
+    /// emulated 64-bit multiply below AVX-512DQ plus a widen/narrow round trip. Counter-based
+    /// RNGs (Philox, Threefry) are the usual callers.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int MultiplyHighUnsigned(int a, int b)
+        => unchecked((int)(((ulong)(uint)a * (uint)b) >> 32));
+
+    /// <summary>
     /// 2D domain marker for the [Spmd] source generator:
     /// <c>foreach (var (x, y) in Spmd.Range2D(width, height))</c>. Rows are iterated in
     /// y-major order with x-gangs along each row (contiguous loads). Runs scalar if

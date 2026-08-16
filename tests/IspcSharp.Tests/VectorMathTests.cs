@@ -113,6 +113,53 @@ public class VectorMathTests
         AssertApprox(result, BuildExpected(MathF.Log, x), ApproxTolerance);
     }
 
+    /// <summary>
+    /// Log splits off the exponent by shifting the raw IEEE754 bits, so every distinct
+    /// exponent is a distinct code path input. Sweep the whole normal range rather than the
+    /// handful of exponents a short arithmetic range happens to cover.
+    /// </summary>
+    [Fact]
+    public void Log_MatchesMathF_AcrossFullExponentRange()
+    {
+        int w = VFloat.LaneCount;
+        float[] buf = new float[w];
+
+        // Every normal exponent, from ~1.2e-38 up to ~1.7e38.
+        for (int e = -126; e <= 127; e += w)
+        {
+            for (int l = 0; l < w; l++)
+            {
+                int exp = Math.Min(e + l, 127);
+                buf[l] = MathF.ScaleB(1.4142135f, exp);   // a non-power-of-two mantissa
+            }
+
+            VFloat x = VFloat.Load(buf, 0);
+            AssertApprox(VectorMath.Log(x), BuildExpected(MathF.Log, x), ApproxTolerance);
+        }
+    }
+
+    /// <summary>Random normal positives, mantissas included, not just one per exponent.</summary>
+    [Fact]
+    public void Log_MatchesMathF_OnRandomNormals()
+    {
+        var rnd = new Random(20260816);
+        int w = VFloat.LaneCount;
+        float[] buf = new float[w];
+
+        for (int t = 0; t < 5000; t++)
+        {
+            for (int l = 0; l < w; l++)
+            {
+                // Build a normal float directly from bits: exponent 1..254, random mantissa.
+                int bits = ((rnd.Next(1, 255)) << 23) | (rnd.Next() & 0x007FFFFF);
+                buf[l] = BitConverter.Int32BitsToSingle(bits);
+            }
+
+            VFloat x = VFloat.Load(buf, 0);
+            AssertApprox(VectorMath.Log(x), BuildExpected(MathF.Log, x), ApproxTolerance);
+        }
+    }
+
     [Fact]
     public void Sin_MatchesMathF()
     {
