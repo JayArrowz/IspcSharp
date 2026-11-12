@@ -564,7 +564,10 @@ public readonly struct VInt : IEquatable<VInt>
 
         if (System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported && LaneCount == 4)
         {
-            var b = Vector64.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref p)).AsByte();
+            // CreateScalar, not CreateScalarUnsafe: the unsafe form is an insert into whatever the
+            // register held, which chains every gang's load to the end of the previous gang's
+            // arithmetic and turns an independent loop into a serial one on ARM.
+            var b = Vector64.CreateScalar(Unsafe.ReadUnaligned<uint>(ref p)).AsByte();
             var w16 = System.Runtime.Intrinsics.Arm.AdvSimd.ZeroExtendWideningLower(b);
             return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.Arm.AdvSimd.ZeroExtendWideningLower(w16.GetLower()).AsInt32()));
         }

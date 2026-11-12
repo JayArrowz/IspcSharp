@@ -29,8 +29,20 @@ GENERATED = {
     "GeneratedSimd": ("Generated SIMD, single thread", "`_Simd`: the generated kernel on one core."),
     "GeneratedParallelSimd": ("Generated SIMD, all cores", "`_ParallelSimd`: SIMD on every core. Depends heavily on the runner's core count."),
 }
+# A second pass of the same runner with AVX-512 switched off is uploaded under this suffix.
+NO_AVX512 = "-no-avx512"
 NOISY = 0.10          # relative standard deviation above which a measurement is flagged
 BAR_WIDTH = 10        # characters in a full-length table bar
+# Columns BenchmarkDotNet adds between Method and Mean when one class runs under more than one
+# job (e.g. a [SimpleJob] attribute plus `--job short` on the command line). They describe how
+# the measurement was taken, not what was measured, so they are not kernel parameters.
+JOB_COLUMNS = {
+    "Job", "IterationCount", "LaunchCount", "WarmupCount", "InvocationCount", "UnrollFactor",
+    "RunStrategy", "Runtime", "Toolchain", "Jit", "Platform", "Server", "Concurrent", "Force",
+    "MinIterationCount", "MaxIterationCount", "MinWarmupIterationCount", "MaxWarmupIterationCount",
+    "IterationTime", "MinIterationTime", "Affinity", "PowerPlanMode", "EnvironmentVariables", "Arguments",
+    "BuildConfiguration", "NuGetReferences", "AnalyzeLaunchVariance", "EvaluateOverhead", "OutlierMode",
+}
 UNITS_NS = {"ns": 1.0, "us": 1e3, "μs": 1e3, "µs": 1e3, "ms": 1e6, "s": 1e9}
 
 
@@ -38,6 +50,7 @@ UNITS_NS = {"ns": 1.0, "us": 1e3, "μs": 1e3, "µs": 1e3, "ms": 1e6, "s": 1e9}
 class Measurement:
     mean: float                 # nanoseconds
     stddev: float | None        # nanoseconds
+    rank: float = 0.0           # how thorough the job was; the most thorough one is reported
 
     @property
     def noise(self) -> float:
@@ -95,7 +108,9 @@ def parse_report(path: Path, runner: Runner) -> None:
         return
     mean_i = header.index("Mean")
     sd_i = header.index("StdDev") if "StdDev" in header else None
-    param_names = header[1:mean_i]          # every column between Method and Mean is a [Params]
+    # Columns between Method and Mean are the [Params] — except the job-description ones.
+    param_cols = [(i, n) for i, n in enumerate(header[1:mean_i], start=1) if n not in JOB_COLUMNS]
+    iter_i = header.index("IterationCount") if "IterationCount" in header[:mean_i] else None
 
     for line in lines[start + 2:]:
         if not line.lstrip().startswith("|"):
@@ -107,8 +122,15 @@ def parse_report(path: Path, runner: Runner) -> None:
         if mean is None:
             continue                        # 'NA': the benchmark failed on this runner
         sd = parse_time(cells[sd_i]) if sd_i is not None and sd_i < len(cells) else None
-        params = tuple((n, cells[1 + k]) for k, n in enumerate(param_names))
-        runner.results[(bench, params)][cells[0]] = Measurement(mean, sd)
+        params = tuple((n, cells[i]) for i, n in param_cols)
+        # The same benchmark measured by two jobs: keep the one with more iterations
+        # ("Default" is BenchmarkDotNet's adaptive count, more than any short job).
+        rank = 0.0
+        if iter_i is not None:
+            rank = float(cells[iter_i]) if cells[iter_i].isdigit() else float("inf")
+        row = runner.results[(bench, params)]
+        if cells[0] not in row or rank > row[cells[0]].rank:
+            row[cells[0]] = Measurement(mean, sd, rank)
 
 
 def load(root: Path) -> list[Runner]:
@@ -255,6 +277,50 @@ def build(runners: list[Runner]) -> str:
         cells = [f"{bar(v, smax)} **{fmt_speedup(v)}**" if v else "–" for v in row]
         out.append(f"| {name} | " + " | ".join(cells) + " |")
     out.append("")
+
+    # --- AVX-512 on vs off -------------------------------------------------------------------
+    # Both passes ran on the same machine in the same job, so here raw times ARE comparable.
+    by_label = {r.label: r for r in runners}
+    for on in runners:
+        off = by_label.get(on.label + NO_AVX512)
+        if off is None:
+            continue
+        rows = []
+        for k in keys:
+            a, b = on.results.get(k, {}), off.results.get(k, {})
+            for m in sorted(set(a) & set(b)):
+                if m == BASELINE or m == "GeneratedParallelSimd" or b[m].mean <= 0:
+                    continue        # single-thread only: the all-cores numbers are too noisy to split hairs
+                rows.append((a[m].mean / b[m].mean, k, m, a[m], b[m]))
+        if not rows:
+            continue
+        rows.sort(key=lambda t: -t[0])
+        drift = geomean([on.results[k][BASELINE].mean / off.results[k][BASELINE].mean
+                         for k in keys if BASELINE in on.results.get(k, {}) and BASELINE in off.results.get(k, {})])
+        overall = geomean([t[0] for t in rows])
+        out += [f"## AVX-512 on vs off ({on.label})", ""]
+        out += [
+            f"The same runner ran the suite twice in one job: once as is ({on.jit}), once with AVX-512 "
+            f"disabled ({off.jit}). Same machine, so these are raw single-thread times side by side. "
+            "A ratio above 1 means the kernel is **faster with AVX-512 off**.",
+            "",
+            f"- SIMD methods, geometric mean: **{fmt_speedup(overall)}** (time with AVX-512 on ÷ time with it off).",
+        ]
+        if drift:
+            out.append(f"- Scalar baselines, same ratio: **{fmt_speedup(drift)}**. This is the control: scalar code "
+                       "should not care, so anything far from 1× here is the machine drifting between the two passes.")
+        out += ["", "| Kernel | Method | AVX-512 on | AVX-512 off | on ÷ off |", "|---|---|---:|---:|---|"]
+        rmax = max(max(t[0], 1 / t[0]) for t in rows)
+        for ratio, k, m, x, y in rows:
+            noisy = "≈" if (x.noise > NOISY or y.noise > NOISY) else ""
+            if ratio >= 1.10:
+                verdict = f"{bar(ratio, rmax)} {noisy}{fmt_speedup(ratio)} faster with it off"
+            elif ratio <= 1 / 1.10:
+                verdict = f"{noisy}{fmt_speedup(1 / ratio)} slower with it off"
+            else:
+                verdict = "same"
+            out.append(f"| {kernel_label(k, multi)} | `{m}` | {fmt_time(x.mean)} | {fmt_time(y.mean)} | {verdict} |")
+        out.append("")
 
     # --- One table per method ----------------------------------------------------------------
     def table(method: str, title: str, blurb: str) -> None:
