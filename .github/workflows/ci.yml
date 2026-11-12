@@ -84,6 +84,41 @@ jobs:
           path: BenchmarkDotNet.Artifacts/results/**
           if-no-files-found: warn
 
+      # Hosted runners are sometimes AVX-512 machines (JIT target x86-64-v4) and sometimes not, and
+      # SIMD kernels have measured very differently on the two. When this runner has AVX-512, run
+      # the suite a second time with it switched off: same machine, same job, so the two passes
+      # are directly comparable. The report shows them side by side.
+      - name: Detect AVX-512
+        id: isa
+        shell: pwsh
+        run: |
+          $has = [System.Runtime.Intrinsics.X86.Avx512F]::IsSupported
+          "avx512=$($has.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          Write-Host "AVX-512 available: $has"
+
+      - name: Run benchmarks (AVX-512 disabled)
+        if: steps.isa.outputs.avx512 == 'true'
+        env:
+          # .NET 10+ switch names; AVX10 implies the same instructions, so it goes off too.
+          DOTNET_EnableAVX512: "0"
+          DOTNET_EnableAVX10v1: "0"
+        run: >
+          dotnet run
+          -c Release
+          --project benchmarks/IspcSharp.Benchmarks
+          --
+          --filter '*'
+          --job short
+          --artifacts BenchmarkDotNet.Artifacts.NoAvx512
+
+      - name: Upload benchmark results (AVX-512 disabled)
+        if: steps.isa.outputs.avx512 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ matrix.label }}-no-avx512
+          path: BenchmarkDotNet.Artifacts.NoAvx512/results/**
+          if-no-files-found: warn
+
   combine-benchmarks:
     name: Combine benchmark results
     if: github.event_name == 'workflow_dispatch'
