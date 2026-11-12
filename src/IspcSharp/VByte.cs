@@ -52,6 +52,19 @@ public readonly struct VByte : IEquatable<VByte>
     public static VByte Load(ReadOnlySpan<byte> source, int offset = 0)
         => new(LaneIO.Load(source, offset));
 
+    /// <summary>
+    /// Contiguous load of LaneCount elements from an array (same as the span overload, without
+    /// rebuilding a span on every call).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VByte Load(byte[] source, int offset) => new(LaneIO.Load(source, offset));
+
+    /// <summary>
+    /// Contiguous store of LaneCount elements into an array.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Store(byte[] destination, int offset) => LaneIO.Store(V, destination, offset);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Store(Span<byte> destination, int offset = 0) => LaneIO.Store(V, destination, offset);
 

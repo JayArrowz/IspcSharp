@@ -86,6 +86,13 @@ internal sealed class VectorBodyEmitter
     /// lanes can't raise DivideByZeroException (both branch sides always execute).
     /// </summary>
     private string? _exprMask;
+
+    /// <summary>
+    /// A <c>(byte)</c>/<c>(short)</c> cast that is the whole right-hand side of a store into a
+    /// buffer of that same type. The narrowing store truncates each lane anyway, so wrapping the
+    /// value first (a mask, or two shifts) would be done twice; this cast is lowered as <c>(int)</c>.
+    /// </summary>
+    private CastExpressionSyntax? _redundantNarrowCast;
     public List<Diagnostic> Diagnostics { get; } = [];
     private void Warn(DiagnosticDescriptor d, SyntaxNode at, string arg)
         => Diagnostics.Add(Diagnostic.Create(d, at.GetLocation(), arg));
@@ -665,7 +672,14 @@ internal sealed class VectorBodyEmitter
             var laneKind = narrowStore ? Kind.I : ek;
             string vtype = VType(laneKind);
             string load = LoadBuffer(p, bufName, storeIdx).Item1;
+            if (narrowStore && op == "=" && Unparen(asg.Right) is CastExpressionSyntax narrowCast &&
+                narrowCast.Type.ToString() == (ek == Kind.B ? "byte" : "short"))
+            {
+                _redundantNarrowCast = narrowCast;
+            }
+
             string rhs = CombineCompoundOnExpr(op, load, asg, laneKind);
+            _redundantNarrowCast = null;
             // Streaming: a full-gang, non-compound contiguous write to a float/double buffer can use a
             // non-temporal store (cache-bypassing). Masked/compound/other paths keep the ordinary store.
             string store = narrowStore
@@ -1473,6 +1487,8 @@ internal sealed class VectorBodyEmitter
     {
         var inner = Vec(cast.Expression);
         string t = cast.Type.ToString();
+        if (ReferenceEquals(cast, _redundantNarrowCast))
+            t = "int";   // the store this feeds truncates to the buffer's width itself
         if (_l)
         {
             // Long kernel: (long)/(int) are identity on the 64-bit integer lane; no floats.

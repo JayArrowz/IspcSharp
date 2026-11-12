@@ -432,3 +432,199 @@ public class LaneOperationReferenceTests
         Assert.Equal(0, s[^1]);
     }
 }
+
+/// <summary>
+/// Kernels whose stores into byte/short buffers rely on the store itself to truncate: the
+/// generator drops a <c>(byte)</c>/<c>(short)</c> cast that is the whole right-hand side.
+/// </summary>
+public static partial class NarrowStoreKernels
+{
+    [Spmd(GenerateParallel = false)]
+    public static void TruncatingByteStore(int[] a, byte[] o, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            o[i] = (byte)(a[i] * 3);
+        }
+    }
+
+    [Spmd(GenerateParallel = false)]
+    public static void TruncatingShortStore(int[] a, short[] o, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            o[i] = (short)((a[i] * 1000) + 7);
+        }
+    }
+
+    [Spmd(GenerateParallel = false)]
+    public static void MaskedTruncatingStore(int[] a, byte[] o, short[] s, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            if (a[i] > 0)
+            {
+                o[i] = (byte)(a[i] + 200);
+                s[i] = (short)(a[i] << 9);
+            }
+        }
+    }
+
+    [Spmd(GenerateParallel = false)]
+    public static void FloatToByteStore(float[] a, byte[] o, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            o[i] = (byte)(a[i] * 2f);
+        }
+    }
+
+    [Spmd(GenerateParallel = false)]
+    public static void CastKeptWhenNotTheWholeValue(int[] a, int[] o, short[] s, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            // The (byte) here feeds arithmetic, so it must still wrap.
+            o[i] = (byte)(a[i] * 7) + 1;
+            s[i] = (short)((byte)(a[i] * 7) + 1000);
+        }
+    }
+
+    [Spmd(GenerateParallel = false)]
+    public static void SpanNarrow(ReadOnlySpan<byte> a, ReadOnlySpan<short> b, Span<short> o, Span<byte> ob, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            o[i] = (short)((a[i] * b[i]) >> 3);
+            ob[i] = (byte)(a[i] + b[i]);
+        }
+    }
+}
+
+public class NarrowStoreTests
+{
+    private static int N => (5 * Spmd.LaneCount) + 3;
+
+    private static int[] Values(int n) =>
+        [.. Enumerable.Range(0, n).Select(i => (i % 7) switch { 0 => int.MaxValue - i, 1 => int.MinValue + i, 2 => -i * 37, _ => (i * 9973) - 500 })];
+
+    [Fact]
+    public void StoresTruncateExactlyLikeTheScalarCast()
+    {
+        int n = N;
+        int[] a = Values(n);
+        byte[] eb = new byte[n], ab = new byte[n];
+        short[] es = new short[n], @as = new short[n];
+
+        NarrowStoreKernels.TruncatingByteStore(a, eb, n);
+        NarrowStoreKernels.TruncatingByteStore_Simd(a, ab, n);
+        Assert.Equal(eb, ab);
+
+        NarrowStoreKernels.TruncatingShortStore(a, es, n);
+        NarrowStoreKernels.TruncatingShortStore_Simd(a, @as, n);
+        Assert.Equal(es, @as);
+    }
+
+    [Fact]
+    public void MaskedStoresLeaveInactiveLanesUntouched()
+    {
+        int n = N;
+        int[] a = Values(n);
+        byte[] eb = [.. Enumerable.Repeat((byte)0x5A, n)], ab = [.. Enumerable.Repeat((byte)0x5A, n)];
+        short[] es = [.. Enumerable.Repeat((short)-1234, n)], @as = [.. Enumerable.Repeat((short)-1234, n)];
+        NarrowStoreKernels.MaskedTruncatingStore(a, eb, es, n);
+        NarrowStoreKernels.MaskedTruncatingStore_Simd(a, ab, @as, n);
+        Assert.Equal(eb, ab);
+        Assert.Equal(es, @as);
+    }
+
+    [Fact]
+    public void FloatValuesNarrowLikeTheScalarCast()
+    {
+        int n = N;
+        float[] a = [.. Enumerable.Range(0, n).Select(i => i * 1.75f)];   // stays inside the int range
+        byte[] e = new byte[n], actual = new byte[n];
+        NarrowStoreKernels.FloatToByteStore(a, e, n);
+        NarrowStoreKernels.FloatToByteStore_Simd(a, actual, n);
+        Assert.Equal(e, actual);
+    }
+
+    [Fact]
+    public void InnerCastsStillWrap()
+    {
+        int n = N;
+        int[] a = Values(n);
+        int[] eo = new int[n], ao = new int[n];
+        short[] es = new short[n], @as = new short[n];
+        NarrowStoreKernels.CastKeptWhenNotTheWholeValue(a, eo, es, n);
+        NarrowStoreKernels.CastKeptWhenNotTheWholeValue_Simd(a, ao, @as, n);
+        Assert.Equal(eo, ao);
+        Assert.Equal(es, @as);
+    }
+
+    [Fact]
+    public void SpanParametersBehaveLikeArrays()
+    {
+        int n = N;
+        byte[] a = [.. Enumerable.Range(0, n).Select(i => (byte)(i * 11))];
+        short[] b = [.. Enumerable.Range(0, n).Select(i => (short)((i * 3001) - 20000))];
+        short[] eo = new short[n], ao = new short[n];
+        byte[] eb = new byte[n], ab = new byte[n];
+        NarrowStoreKernels.SpanNarrow(a, b, eo, eb, n);
+        NarrowStoreKernels.SpanNarrow_Simd(a, b, ao, ab, n);
+        Assert.Equal(eo, ao);
+        Assert.Equal(eb, ab);
+    }
+
+    [Fact]
+    public void ArrayOverloads_MatchSpanOverloads_AndRangeCheck()
+    {
+        int w = VInt.LaneCount;
+        byte[] bytes = [.. Enumerable.Range(0, w + 3).Select(i => (byte)(200 + i))];
+        short[] shorts = [.. Enumerable.Range(0, w + 3).Select(i => (short)(-30000 + (i * 7000)))];
+        float[] floats = [.. Enumerable.Range(0, w + 3).Select(i => i + 0.5f)];
+
+        for (int off = 0; off <= 3; off++)
+        {
+            Assert.Equal(VInt.LoadZeroExtend(bytes.AsSpan(), off), VInt.LoadZeroExtend(bytes, off));
+            Assert.Equal(VInt.LoadSignExtend(shorts.AsSpan(), off), VInt.LoadSignExtend(shorts, off));
+            Assert.Equal(VFloat.Load(floats.AsSpan(), off), VFloat.Load(floats, off));
+            for (int l = 0; l < w; l++)
+            {
+                Assert.Equal(bytes[off + l], VInt.LoadZeroExtend(bytes, off).GetLane(l));
+                Assert.Equal(shorts[off + l], VInt.LoadSignExtend(shorts, off).GetLane(l));
+            }
+
+            byte[] viaArray = new byte[w + 3], viaSpan = new byte[w + 3];
+            short[] sArray = new short[w + 3], sSpan = new short[w + 3];
+            VInt v = VInt.ProgramIndex * 70001;
+            v.StoreNarrow(viaArray, off);
+            v.StoreNarrow(viaSpan.AsSpan(), off);
+            v.StoreNarrow(sArray, off);
+            v.StoreNarrow(sSpan.AsSpan(), off);
+            Assert.Equal(viaSpan, viaArray);
+            Assert.Equal(sSpan, sArray);
+            for (int l = 0; l < w; l++)
+            {
+                Assert.Equal((byte)v.GetLane(l), viaArray[off + l]);
+                Assert.Equal((short)v.GetLane(l), sArray[off + l]);
+            }
+
+            float[] fArray = new float[w + 3];
+            VFloat.Load(floats, off).Store(fArray, off);
+            Assert.Equal(floats.AsSpan(off, w).ToArray(), fArray.AsSpan(off, w).ToArray());
+        }
+
+        foreach (int bad in new[] { 4, -1, int.MaxValue, int.MinValue })
+        {
+            _ = Assert.ThrowsAny<ArgumentException>(() => VInt.LoadZeroExtend(bytes, bad));
+            _ = Assert.ThrowsAny<ArgumentException>(() => VInt.LoadSignExtend(shorts, bad));
+            _ = Assert.ThrowsAny<ArgumentException>(() => VInt.One.StoreNarrow(bytes, bad));
+            _ = Assert.ThrowsAny<ArgumentException>(() => VInt.One.StoreNarrow(shorts, bad));
+            _ = Assert.ThrowsAny<ArgumentException>(() => VFloat.Load(floats, bad));
+            _ = Assert.ThrowsAny<ArgumentException>(() => VFloat.One.Store(floats, bad));
+            _ = Assert.ThrowsAny<ArgumentException>(() => VInt.LoadZeroExtend(bytes.AsSpan(), bad));
+            _ = Assert.ThrowsAny<ArgumentException>(() => VInt.One.StoreNarrow(shorts.AsSpan(), bad));
+        }
+    }
+}

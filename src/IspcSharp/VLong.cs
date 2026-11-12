@@ -45,6 +45,19 @@ public readonly struct VLong : IEquatable<VLong>
     public static VLong Load(ReadOnlySpan<long> source, int offset = 0)
         => new(LaneIO.Load(source, offset));
 
+    /// <summary>
+    /// Contiguous load of LaneCount elements from an array (same as the span overload, without
+    /// rebuilding a span on every call).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VLong Load(long[] source, int offset) => new(LaneIO.Load(source, offset));
+
+    /// <summary>
+    /// Contiguous store of LaneCount elements into an array.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Store(long[] destination, int offset) => LaneIO.Store(V, destination, offset);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Store(Span<long> destination, int offset = 0) => LaneIO.Store(V, destination, offset);
 

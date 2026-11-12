@@ -45,6 +45,19 @@ public readonly struct VFloat : IEquatable<VFloat>
         => new(LaneIO.Load(source, offset));
 
     /// <summary>
+    /// Contiguous load of LaneCount elements from an array (same as the span overload, without
+    /// rebuilding a span on every call).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VFloat Load(float[] source, int offset) => new(LaneIO.Load(source, offset));
+
+    /// <summary>
+    /// Contiguous store of LaneCount elements into an array.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Store(float[] destination, int offset) => LaneIO.Store(V, destination, offset);
+
+    /// <summary>
     /// Masked load: inactive lanes receive <paramref name="fallback"/>. Safe at buffer tails.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -153,6 +153,19 @@ public readonly struct VDouble : IEquatable<VDouble>
     public static VDouble Load(ReadOnlySpan<double> source, int offset = 0)
         => new(LaneIO.Load(source, offset));
 
+    /// <summary>
+    /// Contiguous load of LaneCount elements from an array (same as the span overload, without
+    /// rebuilding a span on every call).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VDouble Load(double[] source, int offset) => new(LaneIO.Load(source, offset));
+
+    /// <summary>
+    /// Contiguous store of LaneCount elements into an array.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Store(double[] destination, int offset) => LaneIO.Store(V, destination, offset);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VDouble LoadMasked(ReadOnlySpan<double> source, int offset, VMaskD mask, double fallback = 0d)
         // A full gang that fits is one plain load; the per-lane path is only for real tails.

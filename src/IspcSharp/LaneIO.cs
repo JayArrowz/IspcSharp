@@ -22,6 +22,38 @@ internal static class LaneIO
         where T : struct
         => (ulong)(uint)offset + (uint)Vector<T>.Count <= (uint)length;
 
+    /// <summary>
+    /// True when <paramref name="count"/> elements fit at <paramref name="offset"/> (for accesses
+    /// whose element count is not the buffer type's own gang width, e.g. bytes at int-gang width).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool Fits(int length, int offset, int count)
+        => (ulong)(uint)offset + (uint)count <= (uint)length;
+
+    /// <summary>
+    /// Array flavour of <see cref="Load{T}(ReadOnlySpan{T}, int)"/>: a kernel that was handed an
+    /// array reads its length and data directly, instead of building a span (null test, pointer,
+    /// length) again on every gang.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector<T> Load<T>(T[] source, int offset)
+        where T : struct
+    {
+        if (!Fits<T>(source.Length, offset))
+            ThrowGangOutOfRange();
+        return Vector.LoadUnsafe(ref MemoryMarshal.GetArrayDataReference(source), (uint)offset);
+    }
+
+    /// <inheritdoc cref="Load{T}(T[], int)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Store<T>(Vector<T> value, T[] destination, int offset)
+        where T : struct
+    {
+        if (!Fits<T>(destination.Length, offset))
+            ThrowGangOutOfRange();
+        value.StoreUnsafe(ref MemoryMarshal.GetArrayDataReference(destination), (uint)offset);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Vector<T> Load<T>(ReadOnlySpan<T> source, int offset)
         where T : struct

@@ -47,6 +47,19 @@ public readonly struct VInt : IEquatable<VInt>
     public static VInt Load(ReadOnlySpan<int> source, int offset = 0)
         => new(LaneIO.Load(source, offset));
 
+    /// <summary>
+    /// Contiguous load of LaneCount elements from an array (same as the span overload, without
+    /// rebuilding a span on every call).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VInt Load(int[] source, int offset) => new(LaneIO.Load(source, offset));
+
+    /// <summary>
+    /// Contiguous store of LaneCount elements into an array.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Store(int[] destination, int offset) => LaneIO.Store(V, destination, offset);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Store(Span<int> destination, int offset = 0) => LaneIO.Store(V, destination, offset);
 
@@ -499,6 +512,13 @@ public readonly struct VInt : IEquatable<VInt>
         return new VInt(new Vector<int>(tmp));
     }
 
+    // ------------------------------------------------------------------------------------------
+    // Narrow (byte/short) buffers at int-gang width: one int lane per element. Every entry point
+    // does a single range check, then hands a ref to the first element to a core routine that
+    // loads or stores straight through a vector register. Array overloads exist so a kernel that
+    // was handed arrays does not rebuild a span (null test, pointer, length) on every gang.
+    // ------------------------------------------------------------------------------------------
+
     /// <summary>
     /// Widening load from a byte buffer: one int lane per byte, zero-extended (0..255).
     /// Reads exactly LaneCount bytes. Hardware <c>vpmovzxbd</c> (SSE4.1/AVX2/AVX-512F) or
@@ -509,199 +529,242 @@ public readonly struct VInt : IEquatable<VInt>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VInt LoadZeroExtend(ReadOnlySpan<byte> source, int offset = 0)
     {
+        if (!LaneIO.Fits(source.Length, offset, LaneCount))
+            LaneIO.ThrowGangOutOfRange();
+        return LoadZeroExtendCore(ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(source), (nint)(uint)offset));
+    }
+
+    /// <inheritdoc cref="LoadZeroExtend(ReadOnlySpan{byte}, int)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VInt LoadZeroExtend(byte[] source, int offset)
+    {
+        if (!LaneIO.Fits(source.Length, offset, LaneCount))
+            LaneIO.ThrowGangOutOfRange();
+        return LoadZeroExtendCore(ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(source), (nint)(uint)offset));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static VInt LoadZeroExtendCore(ref byte p)
+    {
 #if NET8_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Avx512F.IsSupported && LaneCount == 16)
-        {
-            var b = Vector128.Create(source.Slice(offset, 16));
-            return new VInt(Vector512.AsVector(System.Runtime.Intrinsics.X86.Avx512F.ConvertToVector512Int32(b)));
-        }
+            return new VInt(Vector512.AsVector(System.Runtime.Intrinsics.X86.Avx512F.ConvertToVector512Int32(Vector128.LoadUnsafe(ref p))));
 
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && LaneCount == 8)
         {
-            ulong bits = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(source[offset..]);
-            var b = Vector128.CreateScalar(bits).AsByte();
+            var b = Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref p)).AsByte();
             return new VInt(Vector256.AsVector(System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int32(b)));
         }
 
         if (System.Runtime.Intrinsics.X86.Sse41.IsSupported && LaneCount == 4)
         {
-            uint bits = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(source[offset..]);
-            var b = Vector128.CreateScalar(bits).AsByte();
+            var b = Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref p)).AsByte();
             return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.X86.Sse41.ConvertToVector128Int32(b)));
         }
 
         if (System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported && LaneCount == 4)
         {
-            uint bits = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(source[offset..]);
-            var b = Vector64.CreateScalar(bits).AsByte();
+            var b = Vector64.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref p)).AsByte();
             var w16 = System.Runtime.Intrinsics.Arm.AdvSimd.ZeroExtendWideningLower(b);
-            var w32 = System.Runtime.Intrinsics.Arm.AdvSimd.ZeroExtendWideningLower(w16.GetLower());
-            return new VInt(Vector128.AsVector(w32.AsInt32()));
+            return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.Arm.AdvSimd.ZeroExtendWideningLower(w16.GetLower()).AsInt32()));
         }
 #endif
-        return LoadZeroExtendPortable(source, offset);
+        return LoadZeroExtendPortable(ref p);
     }
 
     /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
     /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static VInt LoadZeroExtendPortable(ReadOnlySpan<byte> source, int offset)
+    private static VInt LoadZeroExtendPortable(ref byte p)
     {
         Span<int> tmp = stackalloc int[LaneCount];
-        for (int l = 0; l < LaneCount; l++)
-            tmp[l] = source[offset + l];
+        for (int l = 0; l < tmp.Length; l++)
+            tmp[l] = Unsafe.Add(ref p, l);
         return new VInt(new Vector<int>(tmp));
     }
 
     /// <summary>
     /// Widening load from a short buffer: one int lane per short, sign-extended.
     /// Reads exactly LaneCount shorts. Hardware <c>vpmovsxwd</c> (SSE4.1/AVX2/AVX-512F) or
-    /// NEON <c>sshll</c>; portable loop otherwise. See <see cref="LoadZeroExtend"/>.
+    /// NEON <c>sshll</c>; portable loop otherwise. See <see cref="LoadZeroExtend(ReadOnlySpan{byte}, int)"/>.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VInt LoadSignExtend(ReadOnlySpan<short> source, int offset = 0)
     {
+        if (!LaneIO.Fits(source.Length, offset, LaneCount))
+            LaneIO.ThrowGangOutOfRange();
+        return LoadSignExtendCore(ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(source), (nint)(uint)offset));
+    }
+
+    /// <inheritdoc cref="LoadSignExtend(ReadOnlySpan{short}, int)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VInt LoadSignExtend(short[] source, int offset)
+    {
+        if (!LaneIO.Fits(source.Length, offset, LaneCount))
+            LaneIO.ThrowGangOutOfRange();
+        return LoadSignExtendCore(ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(source), (nint)(uint)offset));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static VInt LoadSignExtendCore(ref short p)
+    {
 #if NET8_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Avx512F.IsSupported && LaneCount == 16)
-        {
-            var s = Vector256.Create(source.Slice(offset, 16));
-            return new VInt(Vector512.AsVector(System.Runtime.Intrinsics.X86.Avx512F.ConvertToVector512Int32(s)));
-        }
+            return new VInt(Vector512.AsVector(System.Runtime.Intrinsics.X86.Avx512F.ConvertToVector512Int32(Vector256.LoadUnsafe(ref p))));
 
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && LaneCount == 8)
-        {
-            var s = Vector128.Create(source.Slice(offset, 8));
-            return new VInt(Vector256.AsVector(System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int32(s)));
-        }
+            return new VInt(Vector256.AsVector(System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref p))));
 
         if (System.Runtime.Intrinsics.X86.Sse41.IsSupported && LaneCount == 4)
         {
-            ulong bits = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(
-                System.Runtime.InteropServices.MemoryMarshal.AsBytes(source.Slice(offset, 4)));
-            var s = Vector128.CreateScalar(bits).AsInt16();
+            var s = Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<ulong>(ref Unsafe.As<short, byte>(ref p))).AsInt16();
             return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.X86.Sse41.ConvertToVector128Int32(s)));
         }
 
+        // NEON: four shorts are exactly one 64-bit vector register (ldr d), widened by sshll.
         if (System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported && LaneCount == 4)
-        {
-            ulong bits = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(
-                System.Runtime.InteropServices.MemoryMarshal.AsBytes(source.Slice(offset, 4)));
-            var s = Vector64.CreateScalar(bits).AsInt16();
-            return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.Arm.AdvSimd.SignExtendWideningLower(s)));
-        }
+            return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.Arm.AdvSimd.SignExtendWideningLower(Vector64.LoadUnsafe(ref p))));
 #endif
-        return LoadSignExtendPortable(source, offset);
+        return LoadSignExtendPortable(ref p);
     }
 
     /// <summary>Portable fallback, kept out of line: <c>stackalloc</c> emits <c>localloc</c>,
     /// which makes the enclosing method un-inlinable no matter what path actually runs.</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static VInt LoadSignExtendPortable(ReadOnlySpan<short> source, int offset)
+    private static VInt LoadSignExtendPortable(ref short p)
     {
         Span<int> tmp = stackalloc int[LaneCount];
-        for (int l = 0; l < LaneCount; l++)
-            tmp[l] = source[offset + l];
+        for (int l = 0; l < tmp.Length; l++)
+            tmp[l] = Unsafe.Add(ref p, l);
         return new VInt(new Vector<int>(tmp));
     }
 
     /// <summary>
     /// Truncating narrowing store to a byte buffer: each int lane's low 8 bits, exactly
     /// C#'s <c>(byte)</c> cast. Writes exactly LaneCount bytes. Hardware <c>vpmovdb</c>
-    /// (AVX-512F) or a mask+pack sequence (SSE2/AVX2) or NEON <c>xtn</c>; portable otherwise.
+    /// (AVX-512F), a byte shuffle (SSSE3/AVX2) or NEON <c>xtn</c>; portable otherwise.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void StoreNarrow(Span<byte> destination, int offset = 0)
     {
+        if (!LaneIO.Fits(destination.Length, offset, LaneCount))
+            LaneIO.ThrowGangOutOfRange();
+        StoreNarrowCore(ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(destination), (nint)(uint)offset));
+    }
+
+    /// <inheritdoc cref="StoreNarrow(Span{byte}, int)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void StoreNarrow(byte[] destination, int offset)
+    {
+        if (!LaneIO.Fits(destination.Length, offset, LaneCount))
+            LaneIO.ThrowGangOutOfRange();
+        StoreNarrowCore(ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(destination), (nint)(uint)offset));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void StoreNarrowCore(ref byte p)
+    {
 #if NET8_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Avx512F.IsSupported && LaneCount == 16)
         {
-            var b = System.Runtime.Intrinsics.X86.Avx512F.ConvertToVector128Byte(Vector512.AsVector512(V));
-            b.CopyTo(destination.Slice(offset, 16));
+            System.Runtime.Intrinsics.X86.Avx512F.ConvertToVector128Byte(Vector512.AsVector512(V)).StoreUnsafe(ref p);
             return;
         }
 
-        if (System.Runtime.Intrinsics.X86.Sse2.IsSupported && LaneCount == 8)
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && LaneCount == 8)
         {
-            // Mask to 0..255 so the saturating packs are exact truncation.
-            var v = Vector256.AsVector256(V) & Vector256.Create(0xFF);
-            var p16 = System.Runtime.Intrinsics.X86.Sse2.PackSignedSaturate(v.GetLower(), v.GetUpper());
-            var p8 = System.Runtime.Intrinsics.X86.Sse2.PackUnsignedSaturate(p16, p16);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(destination[offset..], p8.AsUInt64().ToScalar());
+            // Byte 0 of each int (bytes 0,4,8,12; 0x80 zeroes) to the bottom of its 128-bit half,
+            // then the two halves' low dwords side by side: one vpshufb + one vpermd, no masking and
+            // no saturating packs. The control vector is written here, not shared through a static:
+            // the JIT folds a Create call into a constant but calls a property getter every gang.
+            var picked = System.Runtime.Intrinsics.X86.Avx2.Shuffle(Vector256.AsVector256(V).AsByte(), Vector256.Create(
+                (byte)0, 4, 8, 12, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                0, 4, 8, 12, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80));
+            var packed = System.Runtime.Intrinsics.X86.Avx2.PermuteVar8x32(picked.AsInt32(), Vector256.Create(0, 4, 0, 0, 0, 0, 0, 0));
+            Unsafe.WriteUnaligned(ref p, packed.AsUInt64().ToScalar());
             return;
         }
 
-        if (System.Runtime.Intrinsics.X86.Sse2.IsSupported && LaneCount == 4)
+        if (System.Runtime.Intrinsics.X86.Ssse3.IsSupported && LaneCount == 4)
         {
-            var v = Vector128.AsVector128(V) & Vector128.Create(0xFF);
-            var p16 = System.Runtime.Intrinsics.X86.Sse2.PackSignedSaturate(v, v);
-            var p8 = System.Runtime.Intrinsics.X86.Sse2.PackUnsignedSaturate(p16, p16);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(destination[offset..], p8.AsUInt32().ToScalar());
+            var picked = System.Runtime.Intrinsics.X86.Ssse3.Shuffle(Vector128.AsVector128(V).AsByte(), Vector128.Create(
+                (byte)0, 4, 8, 12, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80));
+            Unsafe.WriteUnaligned(ref p, picked.AsUInt32().ToScalar());
             return;
         }
 
         if (System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported && LaneCount == 4)
         {
             var n16 = System.Runtime.Intrinsics.Arm.AdvSimd.ExtractNarrowingLower(Vector128.AsVector128(V));
-            var n8 = System.Runtime.Intrinsics.Arm.AdvSimd.ExtractNarrowingLower(
-                Vector128.Create(n16, Vector64<short>.Zero));
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(destination[offset..], n8.AsUInt32().ToScalar());
+            var n8 = System.Runtime.Intrinsics.Arm.AdvSimd.ExtractNarrowingLower(Vector128.Create(n16, Vector64<short>.Zero));
+            Unsafe.WriteUnaligned(ref p, n8.AsUInt32().ToScalar());
             return;
         }
 #endif
         for (int l = 0; l < LaneCount; l++)
-            destination[offset + l] = (byte)V[l];
+            Unsafe.Add(ref p, l) = (byte)V[l];
     }
 
     /// <summary>
     /// Truncating narrowing store to a short buffer: each int lane's low 16 bits, exactly
     /// C#'s <c>(short)</c> cast. Writes exactly LaneCount shorts. Hardware <c>vpmovdw</c>
-    /// (AVX-512F) or a sign-fit+pack sequence (SSE2/AVX2) or NEON <c>xtn</c>; portable otherwise.
+    /// (AVX-512F), a byte shuffle (SSSE3/AVX2) or NEON <c>xtn</c>; portable otherwise.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void StoreNarrow(Span<short> destination, int offset = 0)
     {
+        if (!LaneIO.Fits(destination.Length, offset, LaneCount))
+            LaneIO.ThrowGangOutOfRange();
+        StoreNarrowCore(ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(destination), (nint)(uint)offset));
+    }
+
+    /// <inheritdoc cref="StoreNarrow(Span{short}, int)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void StoreNarrow(short[] destination, int offset)
+    {
+        if (!LaneIO.Fits(destination.Length, offset, LaneCount))
+            LaneIO.ThrowGangOutOfRange();
+        StoreNarrowCore(ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(destination), (nint)(uint)offset));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void StoreNarrowCore(ref short p)
+    {
 #if NET8_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Avx512F.IsSupported && LaneCount == 16)
         {
-            var s = System.Runtime.Intrinsics.X86.Avx512F.ConvertToVector256Int16(Vector512.AsVector512(V));
-            s.CopyTo(destination.Slice(offset, 16));
+            System.Runtime.Intrinsics.X86.Avx512F.ConvertToVector256Int16(Vector512.AsVector512(V)).StoreUnsafe(ref p);
             return;
         }
 
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && LaneCount == 8)
         {
-            // Sign-fit each lane into short range so the saturating pack is exact truncation.
-            var v = Vector256.AsVector256(V);
-            var t = System.Runtime.Intrinsics.X86.Avx2.ShiftRightArithmetic(
-                System.Runtime.Intrinsics.X86.Avx2.ShiftLeftLogical(v, 16), 16);
-            var p = System.Runtime.Intrinsics.X86.Sse2.PackSignedSaturate(t.GetLower(), t.GetUpper());
-            p.CopyTo(destination.Slice(offset, 8));
+            // Low word of each int to the bottom of its 128-bit half (vpshufb), then the two
+            // halves' low qwords side by side (vpermq): plain truncation, no sign-fit shifts.
+            var picked = System.Runtime.Intrinsics.X86.Avx2.Shuffle(Vector256.AsVector256(V).AsByte(), Vector256.Create(
+                (byte)0, 1, 4, 5, 8, 9, 12, 13, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                0, 1, 4, 5, 8, 9, 12, 13, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80));
+            System.Runtime.Intrinsics.X86.Avx2.Permute4x64(picked.AsInt64(), 0b_10_00).GetLower().AsInt16().StoreUnsafe(ref p);
             return;
         }
 
-        if (System.Runtime.Intrinsics.X86.Sse2.IsSupported && LaneCount == 4)
+        if (System.Runtime.Intrinsics.X86.Ssse3.IsSupported && LaneCount == 4)
         {
-            var v = Vector128.AsVector128(V);
-            var t = System.Runtime.Intrinsics.X86.Sse2.ShiftRightArithmetic(
-                System.Runtime.Intrinsics.X86.Sse2.ShiftLeftLogical(v, 16), 16);
-            var p = System.Runtime.Intrinsics.X86.Sse2.PackSignedSaturate(t, t);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(
-                System.Runtime.InteropServices.MemoryMarshal.AsBytes(destination.Slice(offset, 4)),
-                p.AsUInt64().ToScalar());
+            var picked = System.Runtime.Intrinsics.X86.Ssse3.Shuffle(Vector128.AsVector128(V).AsByte(), Vector128.Create(
+                (byte)0, 1, 4, 5, 8, 9, 12, 13, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80));
+            Unsafe.WriteUnaligned(ref Unsafe.As<short, byte>(ref p), picked.AsUInt64().ToScalar());
             return;
         }
 
+        // NEON: xtn leaves four shorts in one 64-bit vector register, stored as is (str d).
         if (System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported && LaneCount == 4)
         {
-            var n = System.Runtime.Intrinsics.Arm.AdvSimd.ExtractNarrowingLower(Vector128.AsVector128(V));
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(
-                System.Runtime.InteropServices.MemoryMarshal.AsBytes(destination.Slice(offset, 4)),
-                n.AsUInt64().ToScalar());
+            System.Runtime.Intrinsics.Arm.AdvSimd.ExtractNarrowingLower(Vector128.AsVector128(V)).StoreUnsafe(ref p);
             return;
         }
 #endif
         for (int l = 0; l < LaneCount; l++)
-            destination[offset + l] = (short)V[l];
+            Unsafe.Add(ref p, l) = (short)V[l];
     }
 
     /// <summary>

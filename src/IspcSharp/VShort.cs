@@ -52,6 +52,19 @@ public readonly struct VShort : IEquatable<VShort>
     public static VShort Load(ReadOnlySpan<short> source, int offset = 0)
         => new(LaneIO.Load(source, offset));
 
+    /// <summary>
+    /// Contiguous load of LaneCount elements from an array (same as the span overload, without
+    /// rebuilding a span on every call).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VShort Load(short[] source, int offset) => new(LaneIO.Load(source, offset));
+
+    /// <summary>
+    /// Contiguous store of LaneCount elements into an array.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Store(short[] destination, int offset) => LaneIO.Store(V, destination, offset);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Store(Span<short> destination, int offset = 0) => LaneIO.Store(V, destination, offset);
 
