@@ -277,7 +277,7 @@ def build(runners: list[Runner]) -> str:
                     continue
                 x, noisy = v
                 text = f"{bar(x, vmax)} {'≈' if noisy else ''}{fmt_speedup(x)}"
-                cells.append(text + (" ⚠️" if x < 0.95 else ""))
+                cells.append(text + (" ⚠️" if x < 1.0 else ""))
             out.append(f"| {kernel_label(k, multi)} | " + " | ".join(cells) + " |")
         out.append("")
 
