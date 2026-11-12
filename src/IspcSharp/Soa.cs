@@ -40,7 +40,18 @@ public sealed class SoaFloat2(int length)
     {
         int n = xy.Length / 2;
         var soa = new SoaFloat2(n);
-        for (int i = 0; i < n; i++)
+        int i = 0;
+#if NET11_0_OR_GREATER
+        // Two gangs of interleaved pairs un-zip into one gang of X and one of Y.
+        int w = System.Numerics.Vector<float>.Count;
+        for (; i <= n - w; i += w)
+        {
+            var (x, y) = System.Numerics.Vector.Unzip(LaneIO.Load(xy, 2 * i), LaneIO.Load(xy, (2 * i) + w));
+            LaneIO.Store(x, soa.X, i);
+            LaneIO.Store(y, soa.Y, i);
+        }
+#endif
+        for (; i < n; i++)
         { soa.X[i] = xy[2 * i]; soa.Y[i] = xy[(2 * i) + 1]; }
 
         return soa;
@@ -51,7 +62,17 @@ public sealed class SoaFloat2(int length)
     /// </summary>
     public void ToInterleaved(Span<float> xy)
     {
-        for (int i = 0; i < Length; i++)
+        int i = 0;
+#if NET11_0_OR_GREATER
+        int w = System.Numerics.Vector<float>.Count;
+        for (; i <= Length - w; i += w)
+        {
+            var (lo, hi) = System.Numerics.Vector.Zip(LaneIO.Load<float>(X, i), LaneIO.Load<float>(Y, i));
+            LaneIO.Store(lo, xy, 2 * i);
+            LaneIO.Store(hi, xy, (2 * i) + w);
+        }
+#endif
+        for (; i < Length; i++)
         { xy[2 * i] = X[i]; xy[(2 * i) + 1] = Y[i]; }
     }
 }

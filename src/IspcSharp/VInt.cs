@@ -88,8 +88,9 @@ public readonly struct VInt : IEquatable<VInt>
     public static VInt operator %(VInt a, VInt b) => Remainder(a, b);
 
     /// <summary>
-    /// Per-lane integer division, truncating toward zero like C#'s <c>/</c>. On x86 the quotient
-    /// is computed in double precision (<c>vcvtdq2pd</c> / <c>vdivpd</c> / <c>vcvttpd2dq</c>): a
+    /// Per-lane integer division, truncating toward zero like C#'s <c>/</c>. On x86 and ARM64 the
+    /// quotient is computed in double precision (<c>vcvtdq2pd</c> / <c>vdivpd</c> / <c>vcvttpd2dq</c>,
+    /// or NEON <c>scvtf</c> / <c>fdiv</c> / <c>fcvtzs</c>): a
     /// double holds every int exactly and the correctly rounded quotient of two ints truncates
     /// to the exact integer quotient, so this is bit-identical to the scalar divide at roughly a
     /// tenth of the cost of a per-lane <c>idiv</c>. Throws exactly where the scalar code does:
@@ -99,7 +100,8 @@ public readonly struct VInt : IEquatable<VInt>
     public static VInt Divide(VInt a, VInt b)
     {
 #if NET8_0_OR_GREATER
-        if (System.Runtime.Intrinsics.X86.Sse2.IsSupported && LaneCount is 8 or 4)
+        if ((System.Runtime.Intrinsics.X86.Sse2.IsSupported && LaneCount is 8 or 4) ||
+            (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && LaneCount == 4))
         {
             ThrowIfDivideFaults(a, b);
             return new VInt(QuotientViaDouble(a.V, b.V));
@@ -115,7 +117,8 @@ public readonly struct VInt : IEquatable<VInt>
     public static VInt Remainder(VInt a, VInt b)
     {
 #if NET8_0_OR_GREATER
-        if (System.Runtime.Intrinsics.X86.Sse2.IsSupported && LaneCount is 8 or 4)
+        if ((System.Runtime.Intrinsics.X86.Sse2.IsSupported && LaneCount is 8 or 4) ||
+            (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && LaneCount == 4))
         {
             ThrowIfDivideFaults(a, b);
             return new VInt(a.V - (QuotientViaDouble(a.V, b.V) * b.V));
@@ -148,6 +151,20 @@ public readonly struct VInt : IEquatable<VInt>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector<int> QuotientViaDouble(Vector<int> a, Vector<int> b)
     {
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported)
+        {
+            // Sign-extend each half to 64-bit lanes, convert, divide, truncate, narrow back.
+            var x = Vector128.AsVector128(a);
+            var y = Vector128.AsVector128(b);
+            var qLo = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.ConvertToInt64RoundToZero(System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Divide(
+                System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.ConvertToDouble(System.Runtime.Intrinsics.Arm.AdvSimd.SignExtendWideningLower(x.GetLower())),
+                System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.ConvertToDouble(System.Runtime.Intrinsics.Arm.AdvSimd.SignExtendWideningLower(y.GetLower()))));
+            var qHi = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.ConvertToInt64RoundToZero(System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Divide(
+                System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.ConvertToDouble(System.Runtime.Intrinsics.Arm.AdvSimd.SignExtendWideningUpper(x)),
+                System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.ConvertToDouble(System.Runtime.Intrinsics.Arm.AdvSimd.SignExtendWideningUpper(y))));
+            return Vector128.AsVector(System.Runtime.Intrinsics.Arm.AdvSimd.ExtractNarrowingUpper(System.Runtime.Intrinsics.Arm.AdvSimd.ExtractNarrowingLower(qLo), qHi));
+        }
+
         if (LaneCount == 8)
         {
             var a256 = Vector256.AsVector256(a);
@@ -264,6 +281,19 @@ public readonly struct VInt : IEquatable<VInt>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VInt MultiplyHighUnsigned(VInt a, VInt b)
     {
+#if NET8_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported && LaneCount == 4)
+        {
+            // NEON: umull / umull2 give all four 64-bit products directly, and shift-and-narrow
+            // by 32 (shrn / shrn2) keeps each one's high word.
+            var x = Vector128.AsVector128(a.V).AsUInt32();
+            var y = Vector128.AsVector128(b.V).AsUInt32();
+            var lo = System.Runtime.Intrinsics.Arm.AdvSimd.MultiplyWideningLower(x.GetLower(), y.GetLower());
+            var hi32 = System.Runtime.Intrinsics.Arm.AdvSimd.MultiplyWideningUpper(x, y);
+            return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.Arm.AdvSimd.ShiftRightLogicalNarrowingUpper(
+                System.Runtime.Intrinsics.Arm.AdvSimd.ShiftRightLogicalNarrowingLower(lo, 32), hi32, 32).AsInt32()));
+        }
+#endif
         var au = Vector.AsVectorUInt64(a.V);
         var bu = Vector.AsVectorUInt64(b.V);
 
@@ -351,6 +381,13 @@ public readonly struct VInt : IEquatable<VInt>
             return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.X86.Avx2.ShiftLeftLogicalVariable(
                 Vector128.AsVector128(a.V), Vector128.AsVector128(cnt).AsUInt32())));
         }
+
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported && LaneCount == 4)
+        {
+            // NEON ushl: a positive per-lane count shifts left.
+            return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.Arm.AdvSimd.ShiftLogical(
+                Vector128.AsVector128(a.V), Vector128.AsVector128(cnt))));
+        }
 #endif
         return ShiftLeftVariablePortable(a, counts);
     }
@@ -392,6 +429,13 @@ public readonly struct VInt : IEquatable<VInt>
             return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.X86.Avx2.ShiftRightArithmeticVariable(
                 Vector128.AsVector128(a.V), Vector128.AsVector128(cnt).AsUInt32())));
         }
+
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported && LaneCount == 4)
+        {
+            // NEON has no right-shift-by-vector: sshl with a negated count shifts right, sign-filling.
+            return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.Arm.AdvSimd.ShiftArithmetic(
+                Vector128.AsVector128(a.V), System.Runtime.Intrinsics.Arm.AdvSimd.Negate(Vector128.AsVector128(cnt)))));
+        }
 #endif
         return ShiftRightArithmeticVariablePortable(a, counts);
     }
@@ -432,6 +476,13 @@ public readonly struct VInt : IEquatable<VInt>
         {
             return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.X86.Avx2.ShiftRightLogicalVariable(
                 Vector128.AsVector128(a.V).AsUInt32(), Vector128.AsVector128(cnt).AsUInt32()).AsInt32()));
+        }
+
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported && LaneCount == 4)
+        {
+            // NEON ushl with a negated count shifts right, zero-filling.
+            return new VInt(Vector128.AsVector(System.Runtime.Intrinsics.Arm.AdvSimd.ShiftLogical(
+                Vector128.AsVector128(a.V).AsUInt32(), System.Runtime.Intrinsics.Arm.AdvSimd.Negate(Vector128.AsVector128(cnt))).AsInt32()));
         }
 #endif
         return ShiftRightLogicalVariablePortable(a, counts);
@@ -558,6 +609,7 @@ public readonly struct VInt : IEquatable<VInt>
     /// C#'s <c>(byte)</c> cast. Writes exactly LaneCount bytes. Hardware <c>vpmovdb</c>
     /// (AVX-512F) or a mask+pack sequence (SSE2/AVX2) or NEON <c>xtn</c>; portable otherwise.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void StoreNarrow(Span<byte> destination, int offset = 0)
     {
 #if NET8_0_OR_GREATER
@@ -605,6 +657,7 @@ public readonly struct VInt : IEquatable<VInt>
     /// C#'s <c>(short)</c> cast. Writes exactly LaneCount shorts. Hardware <c>vpmovdw</c>
     /// (AVX-512F) or a sign-fit+pack sequence (SSE2/AVX2) or NEON <c>xtn</c>; portable otherwise.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void StoreNarrow(Span<short> destination, int offset = 0)
     {
 #if NET8_0_OR_GREATER

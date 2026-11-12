@@ -2146,7 +2146,7 @@ internal sealed class VectorBodyEmitter
     /// <summary>
     /// Load one field of a gang of struct-buffer elements. The struct buffer is viewed as a
     /// flat array of its (single) field type; field <c>f</c> of element e sits at <c>e*N + f</c>, a
-    /// stride-N slice, a contiguous gang load when N==1, else a strided gather.
+    /// stride-N slice, a contiguous gang load when N==1, else a strided load (<c>Memory.LoadStrided</c>).
     /// </summary>
     private string StructFieldGather(string bufName, string structType, string field, string baseIdx)
     {
@@ -2157,10 +2157,14 @@ internal sealed class VectorBodyEmitter
         string flat = SpmdGenerator.StructFlatView(bufName, k, !si.AllSameKind);
         if (n == 1)
             return $"{VType(k)}.Load({flat}, {baseIdx})";
+        // Field fi of structs base..base+w-1: a regular stride-n pattern. For float/int fields the
+        // runtime picks a de-interleave (NEON ld2/ld3/ld4, Vector.Unzip on .NET 11) where one
+        // exists, else gathers. 64-bit fields in a 32-bit kernel are VDouble2/VLong2 pairs, which
+        // only the widening gather produces.
+        if (!Wide && k is Kind.F or Kind.I)
+            return $"Memory.LoadStrided({flat}, {baseIdx}, {n}, {fi})";
         string idxVec = $"(({IntT}.ProgramIndex + ({baseIdx})) * {n} + {fi})";
-        return k == Kind.F
-            ? $"Memory.Gather({flat}, {idxVec})"
-            : $"Memory.Gather({flat}, {idxVec}, VMask.All, 0)";
+        return $"Memory.Gather({flat}, {idxVec}, VMask.All, 0)";
     }
 
     /// <summary>
@@ -2200,6 +2204,12 @@ internal sealed class VectorBodyEmitter
             _ = sb.AppendLine(mask == null
                 ? $"{indent}({valueCode}).Store({flat}, {baseIdx});"
                 : $"{indent}{vt}.Select({mask}, {valueCode}, {vt}.Load({flat}, {baseIdx})).Store({flat}, {baseIdx});");
+            return;
+        }
+
+        if (!Wide && k is Kind.F or Kind.I)
+        {
+            _ = sb.AppendLine($"{indent}Memory.StoreStrided({flat}, {baseIdx}, {n}, {fi}, {valueCode}, {mask ?? MTAll});");
             return;
         }
 

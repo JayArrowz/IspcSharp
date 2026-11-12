@@ -269,11 +269,16 @@ public static class Reduce
     /// <summary>
     /// Sum of all byte lanes, widened to int (a full gang can exceed 255).
     /// One hardware <c>psadbw</c> against zero (SSE2/AVX2/AVX-512BW) sums 8 bytes per
-    /// 64-bit lane in a single instruction; portable loop otherwise.
+    /// 64-bit lane in a single instruction, and NEON <c>uaddlv</c> sums the whole gang in one;
+    /// portable loop otherwise.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int Add(VByte v)
     {
 #if NET8_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && VByte.LaneCount == 16)
+            return System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.AddAcrossWidening(Vector128.AsVector128(v.V)).ToScalar();
+
         if (System.Runtime.Intrinsics.X86.Avx512BW.IsSupported && VByte.LaneCount == 64)
         {
             var sad = System.Runtime.Intrinsics.X86.Avx512BW.SumAbsoluteDifferences(
@@ -343,9 +348,13 @@ public static class Reduce
     /// Sum of all short lanes, widened to int (a full gang can exceed short range).
     /// SIMD widen + one vector add + horizontal sum on net8.0+; portable loop otherwise.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int Add(VShort v)
     {
 #if NET8_0_OR_GREATER
+        // NEON saddlv: one widening across-vector add.
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && VShort.LaneCount == 8)
+            return System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.AddAcrossWidening(Vector128.AsVector128(v.V)).ToScalar();
         Vector.Widen(v.V, out var lo, out var hi);
         return Vector.Sum(lo + hi);
 #else
@@ -951,6 +960,393 @@ public static class Memory
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Scatter(Span<long> destination, VLong indices, VLong values)
         => Scatter(destination, indices, values, VMaskD.All);
+
+    // ------------------------------------------------------------------------------------------
+    // Strided (Array-of-Structs field) access: element l of the gang is source[(base + l) * stride
+    // + field]. This is how 'buf[i].field' on a [SpmdStruct] buffer is lowered. A gather works on
+    // any shape, but the layout is perfectly regular, so where the platform has a de-interleave it
+    // is used instead: NEON ld2/ld3/ld4 + st2/st3/st4 (.NET 9+), or Vector.Unzip/Zip for strides
+    // 2 and 4 (.NET 11+, any ISA). Everything else keeps the gather/scatter.
+    // ------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Strided load: <c>result[l] = source[(baseIndex + l) * stride + field]</c> for every lane —
+    /// one field of a gang of consecutive structs viewed as a flat buffer.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VFloat LoadStrided(ReadOnlySpan<float> source, int baseIndex, int stride, int field)
+    {
+        // These tests are spelled out here (not behind a helper) so the JIT folds them while
+        // importing this method: stride is a constant at the call site, and a branch that is
+        // already dead never charges its callee to the caller's inlining budget.
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && VFloat.LaneCount * sizeof(float) == 16 && stride is 2 or 3 or 4)
+            return new VFloat(LoadStridedFast(source, baseIndex, stride, field));
+#endif
+#if NET11_0_OR_GREATER
+        if (stride is 2 or 4)
+            return new VFloat(LoadStridedFast(source, baseIndex, stride, field));
+#endif
+        return Gather(source, ((VInt.ProgramIndex + baseIndex) * stride) + field);
+    }
+
+    /// <inheritdoc cref="LoadStrided(ReadOnlySpan{float}, int, int, int)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VInt LoadStrided(ReadOnlySpan<int> source, int baseIndex, int stride, int field)
+    {
+        // These tests are spelled out here (not behind a helper) so the JIT folds them while
+        // importing this method: stride is a constant at the call site, and a branch that is
+        // already dead never charges its callee to the caller's inlining budget.
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && VInt.LaneCount * sizeof(int) == 16 && stride is 2 or 3 or 4)
+            return new VInt(LoadStridedFast(source, baseIndex, stride, field));
+#endif
+#if NET11_0_OR_GREATER
+        if (stride is 2 or 4)
+            return new VInt(LoadStridedFast(source, baseIndex, stride, field));
+#endif
+        return Gather(source, ((VInt.ProgramIndex + baseIndex) * stride) + field, VMask.All, 0);
+    }
+
+    /// <inheritdoc cref="LoadStrided(ReadOnlySpan{float}, int, int, int)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VDouble LoadStrided(ReadOnlySpan<double> source, int baseIndex, int stride, int field)
+    {
+        // These tests are spelled out here (not behind a helper) so the JIT folds them while
+        // importing this method: stride is a constant at the call site, and a branch that is
+        // already dead never charges its callee to the caller's inlining budget.
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && VDouble.LaneCount * sizeof(double) == 16 && stride is 2 or 3 or 4)
+            return new VDouble(LoadStridedFast(source, baseIndex, stride, field));
+#endif
+#if NET11_0_OR_GREATER
+        if (stride is 2 or 4)
+            return new VDouble(LoadStridedFast(source, baseIndex, stride, field));
+#endif
+        return Gather(source, ((VLong.ProgramIndex + baseIndex) * stride) + field);
+    }
+
+    /// <inheritdoc cref="LoadStrided(ReadOnlySpan{float}, int, int, int)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VLong LoadStrided(ReadOnlySpan<long> source, int baseIndex, int stride, int field)
+    {
+        // These tests are spelled out here (not behind a helper) so the JIT folds them while
+        // importing this method: stride is a constant at the call site, and a branch that is
+        // already dead never charges its callee to the caller's inlining budget.
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && VLong.LaneCount * sizeof(long) == 16 && stride is 2 or 3 or 4)
+            return new VLong(LoadStridedFast(source, baseIndex, stride, field));
+#endif
+#if NET11_0_OR_GREATER
+        if (stride is 2 or 4)
+            return new VLong(LoadStridedFast(source, baseIndex, stride, field));
+#endif
+        return Gather(source, ((VLong.ProgramIndex + baseIndex) * stride) + field);
+    }
+
+    /// <summary>
+    /// Strided store: <c>destination[(baseIndex + l) * stride + field] = values[l]</c> for active
+    /// lanes — one field of a gang of consecutive structs. The other fields of those structs are
+    /// left as they are.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void StoreStrided(Span<float> destination, int baseIndex, int stride, int field, VFloat values, VMask mask)
+    {
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && VFloat.LaneCount * sizeof(float) == 16 && stride is 2 or 3 or 4)
+        {
+            StoreStridedFast(destination, baseIndex, stride, field, values.V, Vector.AsVectorSingle(mask.Bits));
+            return;
+        }
+#endif
+#if NET11_0_OR_GREATER
+        if (stride == 2)
+        {
+            StoreStridedFast(destination, baseIndex, stride, field, values.V, Vector.AsVectorSingle(mask.Bits));
+            return;
+        }
+#endif
+        Scatter(destination, ((VInt.ProgramIndex + baseIndex) * stride) + field, values, mask);
+    }
+
+    /// <inheritdoc cref="StoreStrided(Span{float}, int, int, int, VFloat, VMask)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void StoreStrided(Span<int> destination, int baseIndex, int stride, int field, VInt values, VMask mask)
+    {
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && VInt.LaneCount * sizeof(int) == 16 && stride is 2 or 3 or 4)
+        {
+            StoreStridedFast(destination, baseIndex, stride, field, values.V, mask.Bits);
+            return;
+        }
+#endif
+#if NET11_0_OR_GREATER
+        if (stride == 2)
+        {
+            StoreStridedFast(destination, baseIndex, stride, field, values.V, mask.Bits);
+            return;
+        }
+#endif
+        Scatter(destination, ((VInt.ProgramIndex + baseIndex) * stride) + field, values, mask);
+    }
+
+    /// <inheritdoc cref="StoreStrided(Span{float}, int, int, int, VFloat, VMask)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void StoreStrided(Span<double> destination, int baseIndex, int stride, int field, VDouble values, VMaskD mask)
+    {
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && VDouble.LaneCount * sizeof(double) == 16 && stride is 2 or 3 or 4)
+        {
+            StoreStridedFast(destination, baseIndex, stride, field, values.V, Vector.AsVectorDouble(mask.Bits));
+            return;
+        }
+#endif
+#if NET11_0_OR_GREATER
+        if (stride == 2)
+        {
+            StoreStridedFast(destination, baseIndex, stride, field, values.V, Vector.AsVectorDouble(mask.Bits));
+            return;
+        }
+#endif
+        Scatter(destination, ((VLong.ProgramIndex + baseIndex) * stride) + field, values, mask);
+    }
+
+    /// <inheritdoc cref="StoreStrided(Span{float}, int, int, int, VFloat, VMask)"/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void StoreStrided(Span<long> destination, int baseIndex, int stride, int field, VLong values, VMaskD mask)
+    {
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && VLong.LaneCount * sizeof(long) == 16 && stride is 2 or 3 or 4)
+        {
+            StoreStridedFast(destination, baseIndex, stride, field, values.V, mask.Bits);
+            return;
+        }
+#endif
+#if NET11_0_OR_GREATER
+        if (stride == 2)
+        {
+            StoreStridedFast(destination, baseIndex, stride, field, values.V, mask.Bits);
+            return;
+        }
+#endif
+        Scatter(destination, ((VLong.ProgramIndex + baseIndex) * stride) + field, values, mask);
+    }
+
+    /// <summary>
+    /// Range check for a de-interleaving access: the whole block of <c>stride * LaneCount</c>
+    /// elements starting at <c>baseIndex * stride</c> must be inside the buffer. Returns the
+    /// block's first element index.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int StridedStart<T>(int length, int baseIndex, int stride)
+        where T : struct
+    {
+        ulong start = (ulong)(uint)baseIndex * (uint)stride;
+        if (baseIndex < 0 || start + (ulong)(stride * Vector<T>.Count) > (uint)length)
+            ThrowGatherIndexOutOfRange();
+        return (int)start;
+    }
+
+    /// <summary>De-interleaving load; the caller has checked that this stride has one here.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe Vector<T> LoadStridedFast<T>(ReadOnlySpan<T> source, int baseIndex, int stride, int field)
+        where T : unmanaged
+    {
+        int start = StridedStart<T>(source.Length, baseIndex, stride);
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && Vector<T>.Count * sizeof(T) == 16)
+        {
+            fixed (T* p = source)
+            {
+                return sizeof(T) == 4
+                    ? Vector128.AsVector(LoadFieldNeon((float*)(p + start), stride, field)).As<float, T>()
+                    : Vector128.AsVector(LoadFieldNeon((double*)(p + start), stride, field)).As<double, T>();
+            }
+        }
+#endif
+#if NET11_0_OR_GREATER
+        int w = Vector<T>.Count;
+        if (stride == 2)
+        {
+            var lo = LaneIO.LoadUnchecked(source, start);
+            var hi = LaneIO.LoadUnchecked(source, start + w);
+            return field == 0 ? Vector.UnzipEven(lo, hi) : Vector.UnzipOdd(lo, hi);
+        }
+
+        // Stride 4: one unzip separates fields {0,2} from {1,3}, a second separates the pair.
+        var v0 = LaneIO.LoadUnchecked(source, start);
+        var v1 = LaneIO.LoadUnchecked(source, start + w);
+        var v2 = LaneIO.LoadUnchecked(source, start + (2 * w));
+        var v3 = LaneIO.LoadUnchecked(source, start + (3 * w));
+        Vector<T> a, b;
+        if ((field & 1) == 0)
+        {
+            a = Vector.UnzipEven(v0, v1);
+            b = Vector.UnzipEven(v2, v3);
+        }
+        else
+        {
+            a = Vector.UnzipOdd(v0, v1);
+            b = Vector.UnzipOdd(v2, v3);
+        }
+
+        return (field & 2) == 0 ? Vector.UnzipEven(a, b) : Vector.UnzipOdd(a, b);
+#else
+        return default;   // unreachable: callers only come here when a path above exists
+#endif
+    }
+
+    /// <summary>De-interleaving store; the caller has checked that this stride has one here.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void StoreStridedFast<T>(Span<T> destination, int baseIndex, int stride, int field, Vector<T> values, Vector<T> mask)
+        where T : unmanaged
+    {
+        int start = StridedStart<T>(destination.Length, baseIndex, stride);
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported && Vector<T>.Count * sizeof(T) == 16)
+        {
+            fixed (T* p = destination)
+            {
+                if (sizeof(T) == 4)
+                    StoreFieldNeon((float*)(p + start), stride, field, Vector128.AsVector128(values).As<T, float>(), Vector128.AsVector128(mask).As<T, float>());
+                else
+                    StoreFieldNeon((double*)(p + start), stride, field, Vector128.AsVector128(values).As<T, double>(), Vector128.AsVector128(mask).As<T, double>());
+            }
+
+            return;
+        }
+#endif
+#if NET11_0_OR_GREATER
+        // Stride 2: split the block into its two fields, blend the new values into one, zip back.
+        int w = Vector<T>.Count;
+        var (even, odd) = Vector.Unzip(LaneIO.LoadUnchecked<T>(destination, start), LaneIO.LoadUnchecked<T>(destination, start + w));
+        if (field == 0)
+            even = Vector.ConditionalSelect(mask, values, even);
+        else
+            odd = Vector.ConditionalSelect(mask, values, odd);
+        var (lo, hi) = Vector.Zip(even, odd);
+        LaneIO.StoreUnchecked(lo, destination, start);
+        LaneIO.StoreUnchecked(hi, destination, start + w);
+#endif
+    }
+
+#if NET9_0_OR_GREATER
+    // NEON de-interleaving loads/stores. They only look at the element size, so int and long
+    // buffers go through the float and double entry points.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe Vector128<float> LoadFieldNeon(float* p, int stride, int field)
+    {
+        if (stride == 2)
+        {
+            var (a, b) = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Load2xVector128AndUnzip(p);
+            return field == 0 ? a : b;
+        }
+
+        if (stride == 3)
+        {
+            var (a, b, c) = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Load3xVector128AndUnzip(p);
+            return field == 0 ? a : field == 1 ? b : c;
+        }
+
+        var (q0, q1, q2, q3) = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Load4xVector128AndUnzip(p);
+        return field == 0 ? q0 : field == 1 ? q1 : field == 2 ? q2 : q3;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe Vector128<double> LoadFieldNeon(double* p, int stride, int field)
+    {
+        if (stride == 2)
+        {
+            var (a, b) = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Load2xVector128AndUnzip(p);
+            return field == 0 ? a : b;
+        }
+
+        if (stride == 3)
+        {
+            var (a, b, c) = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Load3xVector128AndUnzip(p);
+            return field == 0 ? a : field == 1 ? b : c;
+        }
+
+        var (q0, q1, q2, q3) = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Load4xVector128AndUnzip(p);
+        return field == 0 ? q0 : field == 1 ? q1 : field == 2 ? q2 : q3;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void StoreFieldNeon(float* p, int stride, int field, Vector128<float> values, Vector128<float> mask)
+    {
+        if (stride == 2)
+        {
+            var (a, b) = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Load2xVector128AndUnzip(p);
+            if (field == 0)
+                a = Vector128.ConditionalSelect(mask, values, a);
+            else
+                b = Vector128.ConditionalSelect(mask, values, b);
+            System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.StoreVectorAndZip(p, (a, b));
+        }
+        else if (stride == 3)
+        {
+            var (a, b, c) = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Load3xVector128AndUnzip(p);
+            if (field == 0)
+                a = Vector128.ConditionalSelect(mask, values, a);
+            else if (field == 1)
+                b = Vector128.ConditionalSelect(mask, values, b);
+            else
+                c = Vector128.ConditionalSelect(mask, values, c);
+            System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.StoreVectorAndZip(p, (a, b, c));
+        }
+        else
+        {
+            var (q0, q1, q2, q3) = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Load4xVector128AndUnzip(p);
+            if (field == 0)
+                q0 = Vector128.ConditionalSelect(mask, values, q0);
+            else if (field == 1)
+                q1 = Vector128.ConditionalSelect(mask, values, q1);
+            else if (field == 2)
+                q2 = Vector128.ConditionalSelect(mask, values, q2);
+            else
+                q3 = Vector128.ConditionalSelect(mask, values, q3);
+            System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.StoreVectorAndZip(p, (q0, q1, q2, q3));
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void StoreFieldNeon(double* p, int stride, int field, Vector128<double> values, Vector128<double> mask)
+    {
+        if (stride == 2)
+        {
+            var (a, b) = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Load2xVector128AndUnzip(p);
+            if (field == 0)
+                a = Vector128.ConditionalSelect(mask, values, a);
+            else
+                b = Vector128.ConditionalSelect(mask, values, b);
+            System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.StoreVectorAndZip(p, (a, b));
+        }
+        else if (stride == 3)
+        {
+            var (a, b, c) = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Load3xVector128AndUnzip(p);
+            if (field == 0)
+                a = Vector128.ConditionalSelect(mask, values, a);
+            else if (field == 1)
+                b = Vector128.ConditionalSelect(mask, values, b);
+            else
+                c = Vector128.ConditionalSelect(mask, values, c);
+            System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.StoreVectorAndZip(p, (a, b, c));
+        }
+        else
+        {
+            var (q0, q1, q2, q3) = System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.Load4xVector128AndUnzip(p);
+            if (field == 0)
+                q0 = Vector128.ConditionalSelect(mask, values, q0);
+            else if (field == 1)
+                q1 = Vector128.ConditionalSelect(mask, values, q1);
+            else if (field == 2)
+                q2 = Vector128.ConditionalSelect(mask, values, q2);
+            else
+                q3 = Vector128.ConditionalSelect(mask, values, q3);
+            System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.StoreVectorAndZip(p, (q0, q1, q2, q3));
+        }
+    }
+#endif
 
     /// <summary>
     /// Turns a strided access into a contiguous one. Classic use: matmul's b[k, col] is a

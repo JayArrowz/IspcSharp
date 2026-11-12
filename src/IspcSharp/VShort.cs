@@ -260,7 +260,7 @@ public readonly struct VShort : IEquatable<VShort>
     /// <summary>
     /// Per-lane high half of the 32-bit product: result[l] = (short)((a[l] * b[l]) &gt;&gt; 16).
     /// The core of Q15/Q16 fixed-point multiplies. Hardware <c>pmulhw</c>
-    /// (SSE2/AVX2/AVX-512BW); portable loop otherwise.
+    /// (SSE2/AVX2/AVX-512BW) or NEON <c>smull</c>/<c>smull2</c> + <c>shrn</c>; portable loop otherwise.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VShort MultiplyHigh(VShort a, VShort b)
@@ -282,6 +282,18 @@ public readonly struct VShort : IEquatable<VShort>
         {
             return new VShort(Vector128.AsVector(System.Runtime.Intrinsics.X86.Sse2.MultiplyHigh(
                 Vector128.AsVector128(a.V), Vector128.AsVector128(b.V))));
+        }
+
+        if (System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported && LaneCount == 8)
+        {
+            // NEON has no pmulhw: widen each half to the full 32-bit products (smull / smull2),
+            // then shift-and-narrow keeps bits 16..31 of each (shrn / shrn2).
+            var x = Vector128.AsVector128(a.V);
+            var y = Vector128.AsVector128(b.V);
+            var lo = System.Runtime.Intrinsics.Arm.AdvSimd.MultiplyWideningLower(x.GetLower(), y.GetLower());
+            var hi = System.Runtime.Intrinsics.Arm.AdvSimd.MultiplyWideningUpper(x, y);
+            return new VShort(Vector128.AsVector(System.Runtime.Intrinsics.Arm.AdvSimd.ShiftRightLogicalNarrowingUpper(
+                System.Runtime.Intrinsics.Arm.AdvSimd.ShiftRightLogicalNarrowingLower(lo, 16), hi, 16)));
         }
 #endif
         return MultiplyHighPortable(a, b);
