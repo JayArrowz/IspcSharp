@@ -45,19 +45,19 @@ public readonly struct VInt : IEquatable<VInt>
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VInt Load(ReadOnlySpan<int> source, int offset = 0)
-        => new(new Vector<int>(source[offset..]));
+        => new(LaneIO.Load(source, offset));
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void Store(Span<int> destination, int offset = 0) => V.CopyTo(destination[offset..]);
+    public void Store(Span<int> destination, int offset = 0) => LaneIO.Store(V, destination, offset);
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void StoreMasked(Span<int> destination, int offset, VMask mask)
     {
-        for (int l = 0; l < LaneCount; l++)
-        {
-            int idx = offset + l;
-            if (mask.IsLaneActive(l) && idx < destination.Length)
-                destination[idx] = V[l];
-        }
+        // A full gang that fits is one plain store; the per-lane path is only for real tails.
+        if (mask.AllActive() && LaneIO.Fits<int>(destination.Length, offset))
+            LaneIO.StoreUnchecked(V, destination, offset);
+        else
+            LaneIO.StoreMaskedSlow(V, destination, offset, mask.ToBitmask());
     }
 
     public int GetLane(int lane) => V[lane];
@@ -75,7 +75,7 @@ public readonly struct VInt : IEquatable<VInt>
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VInt operator -(VInt a) => new(-a.V);
 
     /// <summary>
-    /// Per-lane integer division (no SIMD integer divide exists, scalar loop).
+    /// Per-lane integer division (see <see cref="Divide"/>).
     /// Throws <see cref="DivideByZeroException"/> if ANY lane's divisor is zero, in masked
     /// SPMD code, select a nonzero divisor into inactive lanes first (the [Spmd] generator
     /// does this automatically).
@@ -83,24 +83,124 @@ public readonly struct VInt : IEquatable<VInt>
     public static VInt operator /(VInt a, VInt b) => Divide(a, b);
 
     /// <summary>
-    /// Per-lane integer remainder (scalar loop; see <see cref="op_Division"/> about zero divisors).
+    /// Per-lane integer remainder (see <see cref="Remainder"/>; <see cref="op_Division"/> about zero divisors).
     /// </summary>
     public static VInt operator %(VInt a, VInt b) => Remainder(a, b);
 
+    /// <summary>
+    /// Per-lane integer division, truncating toward zero like C#'s <c>/</c>. On x86 the quotient
+    /// is computed in double precision (<c>vcvtdq2pd</c> / <c>vdivpd</c> / <c>vcvttpd2dq</c>): a
+    /// double holds every int exactly and the correctly rounded quotient of two ints truncates
+    /// to the exact integer quotient, so this is bit-identical to the scalar divide at roughly a
+    /// tenth of the cost of a per-lane <c>idiv</c>. Throws exactly where the scalar code does:
+    /// <see cref="DivideByZeroException"/> for a zero divisor in any lane, <see cref="OverflowException"/>
+    /// for <c>int.MinValue / -1</c>.
+    /// </summary>
     public static VInt Divide(VInt a, VInt b)
     {
-        Span<int> tmp = stackalloc int[LaneCount];
-        for (int l = 0; l < LaneCount; l++)
-            tmp[l] = a.V[l] / b.V[l];
-        return new VInt(new Vector<int>(tmp));
+#if NET8_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Sse2.IsSupported && LaneCount is 8 or 4)
+        {
+            ThrowIfDivideFaults(a, b);
+            return new VInt(QuotientViaDouble(a.V, b.V));
+        }
+#endif
+        return DividePortable(a, b);
     }
 
+    /// <summary>
+    /// Per-lane integer remainder with the sign of the dividend, like C#'s <c>%</c>
+    /// (<c>a - (a / b) * b</c> on x86; see <see cref="Divide"/> for the method and the exceptions).
+    /// </summary>
     public static VInt Remainder(VInt a, VInt b)
     {
-        Span<int> tmp = stackalloc int[LaneCount];
-        for (int l = 0; l < LaneCount; l++)
-            tmp[l] = a.V[l] % b.V[l];
-        return new VInt(new Vector<int>(tmp));
+#if NET8_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Sse2.IsSupported && LaneCount is 8 or 4)
+        {
+            ThrowIfDivideFaults(a, b);
+            return new VInt(a.V - (QuotientViaDouble(a.V, b.V) * b.V));
+        }
+#endif
+        return RemainderPortable(a, b);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ThrowIfDivideFaults(VInt a, VInt b)
+    {
+        if (Vector.EqualsAny(b.V, Vector<int>.Zero))
+            ThrowDivideByZero();
+        var minusOne = new Vector<int>(-1);
+        if (Vector.EqualsAny(b.V, minusOne) &&
+            (Vector.Equals(a.V, new Vector<int>(int.MinValue)) & Vector.Equals(b.V, minusOne)) != Vector<int>.Zero)
+        {
+            ThrowDivideOverflow();
+        }
+    }
+
+    private static void ThrowDivideByZero() => throw new DivideByZeroException();
+    private static void ThrowDivideOverflow() => throw new OverflowException();
+
+#if NET8_0_OR_GREATER
+    /// <summary>
+    /// trunc(a / b) per lane through double precision. Callers have ruled out b == 0 and
+    /// MinValue / -1, the only pairs whose quotient does not fit an int.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector<int> QuotientViaDouble(Vector<int> a, Vector<int> b)
+    {
+        if (LaneCount == 8)
+        {
+            var a256 = Vector256.AsVector256(a);
+            var b256 = Vector256.AsVector256(b);
+            var lo = System.Runtime.Intrinsics.X86.Avx.ConvertToVector128Int32WithTruncation(
+                System.Runtime.Intrinsics.X86.Avx.Divide(
+                    System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(a256.GetLower()),
+                    System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(b256.GetLower())));
+            var hi = System.Runtime.Intrinsics.X86.Avx.ConvertToVector128Int32WithTruncation(
+                System.Runtime.Intrinsics.X86.Avx.Divide(
+                    System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(a256.GetUpper()),
+                    System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(b256.GetUpper())));
+            return Vector256.AsVector(Vector256.Create(lo, hi));
+        }
+
+        // 128-bit gang: cvtdq2pd converts the low two ints, so the upper pair is moved down first.
+        var a128 = Vector128.AsVector128(a);
+        var b128 = Vector128.AsVector128(b);
+        var q01 = System.Runtime.Intrinsics.X86.Sse2.ConvertToVector128Int32WithTruncation(
+            System.Runtime.Intrinsics.X86.Sse2.Divide(
+                System.Runtime.Intrinsics.X86.Sse2.ConvertToVector128Double(a128),
+                System.Runtime.Intrinsics.X86.Sse2.ConvertToVector128Double(b128)));
+        var q23 = System.Runtime.Intrinsics.X86.Sse2.ConvertToVector128Int32WithTruncation(
+            System.Runtime.Intrinsics.X86.Sse2.Divide(
+                System.Runtime.Intrinsics.X86.Sse2.ConvertToVector128Double(System.Runtime.Intrinsics.X86.Sse2.Shuffle(a128, 0xEE)),
+                System.Runtime.Intrinsics.X86.Sse2.ConvertToVector128Double(System.Runtime.Intrinsics.X86.Sse2.Shuffle(b128, 0xEE))));
+        return Vector128.AsVector(System.Runtime.Intrinsics.X86.Sse2.UnpackLow(q01.AsInt64(), q23.AsInt64()).AsInt32());
+    }
+#endif
+
+    /// <summary>Per-lane scalar divide for ISAs without a vector path.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VInt DividePortable(VInt a, VInt b)
+    {
+        Span<int> x = stackalloc int[LaneCount];
+        Span<int> y = stackalloc int[LaneCount];
+        a.V.CopyTo(x);
+        b.V.CopyTo(y);
+        for (int l = 0; l < x.Length; l++)
+            x[l] /= y[l];
+        return new VInt(new Vector<int>(x));
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VInt RemainderPortable(VInt a, VInt b)
+    {
+        Span<int> x = stackalloc int[LaneCount];
+        Span<int> y = stackalloc int[LaneCount];
+        a.V.CopyTo(x);
+        b.V.CopyTo(y);
+        for (int l = 0; l < x.Length; l++)
+            x[l] %= y[l];
+        return new VInt(new Vector<int>(x));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -29,13 +29,11 @@ public static class Reduce
     public static float Add(VFloat v, VMask mask)
         => Add(VFloat.Select(mask, v, VFloat.Zero));
 
-    public static int Add(VInt v)
-    {
-        int sum = 0;
-        for (int l = 0; l < VInt.LaneCount; l++)
-            sum += v.V[l];
-        return sum;
-    }
+    /// <summary>
+    /// Sum of all lanes (wrapping, like the scalar loop).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int Add(VInt v) => Vector.Sum(v.V);
 
     /// <summary>
     /// Minimum across all lanes.
@@ -201,13 +199,8 @@ public static class Reduce
     /// <summary>
     /// Sum of all lanes.
     /// </summary>
-    public static long Add(VLong v)
-    {
-        long sum = 0;
-        for (int l = 0; l < VLong.LaneCount; l++)
-            sum += v.V[l];
-        return sum;
-    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long Add(VLong v) => Vector.Sum(v.V);
 
     /// <summary>
     /// Sum of active lanes only (inactive lanes contribute 0).
@@ -424,9 +417,79 @@ public static class Memory
     }
 
     /// <summary>
+    /// How many leading elements to process one at a time so that <c>buffer[index + result]</c>
+    /// starts on a vector-width boundary — the alignment a non-temporal store needs to take
+    /// effect. Never more than <paramref name="maxCount"/>; 0 where streaming stores have no
+    /// hardware path. Emitted before the vector loop of a <see cref="SpmdAttribute.Streaming"/>
+    /// kernel. (Advisory: if the GC later moves the buffer the stores fall back to ordinary
+    /// ones, they never fault.)
+    /// </summary>
+    public static unsafe int StreamingPeel(ReadOnlySpan<float> buffer, int index, int maxCount)
+    {
+        fixed (float* p = buffer)
+            return StreamingPeel((nuint)p, sizeof(float), Vector<float>.Count, buffer.Length, index, maxCount);
+    }
+
+    /// <inheritdoc cref="StreamingPeel(ReadOnlySpan{float}, int, int)"/>
+    public static unsafe int StreamingPeel(ReadOnlySpan<double> buffer, int index, int maxCount)
+    {
+        fixed (double* p = buffer)
+            return StreamingPeel((nuint)p, sizeof(double), Vector<double>.Count, buffer.Length, index, maxCount);
+    }
+
+    private static int StreamingPeel(nuint start, int elemSize, int laneCount, int length, int index, int maxCount)
+    {
+#if NET8_0_OR_GREATER
+        if (!System.Runtime.Intrinsics.X86.Sse.IsSupported || (uint)index >= (uint)length || maxCount <= 0)
+            return 0;
+        nuint vectorBytes = (nuint)(elemSize * laneCount);
+        nuint misaligned = (start + ((nuint)index * (nuint)elemSize)) & (vectorBytes - 1);
+        if (misaligned == 0)
+            return 0;
+        nuint bytesToBoundary = vectorBytes - misaligned;
+        // A buffer that is not even element-aligned can never reach a vector boundary.
+        if (bytesToBoundary % (nuint)elemSize != 0)
+            return 0;
+        return Math.Min((int)(bytesToBoundary / (nuint)elemSize), maxCount);
+#else
+        return 0;
+#endif
+    }
+
+    /// <summary>
+    /// Bounds check for the hardware gather paths, which read through a raw pointer: throws
+    /// <see cref="IndexOutOfRangeException"/> if any <b>active</b> lane's index is outside
+    /// [0, <paramref name="length"/>), exactly as the per-lane paths (and the scalar loop the
+    /// kernel was written as) would. One unsigned compare catches negative and too-large indices.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void CheckGatherIndices(VInt indices, VMask mask, int length)
+    {
+        // index >= length (unsigned)  <=>  max(index, length) == index: vpmaxud + vpcmpeqd,
+        // cheaper than an unsigned compare, which AVX2 has to synthesize.
+        var idx = Vector.AsVectorUInt32(indices.V);
+        var outOfRange = Vector.Equals(Vector.Max(idx, new Vector<uint>((uint)length)), idx);
+        if ((Vector.AsVectorInt32(outOfRange) & mask.Bits) != Vector<int>.Zero)
+            ThrowGatherIndexOutOfRange();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void CheckGatherIndices(VLong indices, VMaskD mask, int length)
+    {
+        var outOfRange = Vector.GreaterThanOrEqual(Vector.AsVectorUInt64(indices.V), new Vector<ulong>((ulong)length));
+        if ((Vector.AsVectorInt64(outOfRange) & mask.Bits) != Vector<long>.Zero)
+            ThrowGatherIndexOutOfRange();
+    }
+
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowGatherIndexOutOfRange()
+        => throw new IndexOutOfRangeException("Gather index was outside the bounds of the source buffer.");
+
+    /// <summary>
     /// Gather: result[lane] = source[indices[lane]] for active lanes; <paramref name="fallback"/> otherwise.
-    /// Uses AVX-512 (16-wide) or AVX2 (8-wide) hardware gather on net8.0+ when available (indices of
-    /// active lanes must still be in bounds).
+    /// Uses AVX2 hardware gather on net8.0+ when available (8-wide, doubled for a 16-wide AVX-512
+    /// gang). Inactive lanes are never read; an out-of-range index in an active lane throws
+    /// <see cref="IndexOutOfRangeException"/> on every path.
     /// </summary>
     public static unsafe VFloat Gather(ReadOnlySpan<float> source, VInt indices, VMask mask, float fallback = 0f)
     {
@@ -436,6 +499,7 @@ public static class Memory
         // drop to the portable per-lane path, the Linux/AVX-512 gather regression.
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && VFloat.LaneCount == 16)
         {
+            CheckGatherIndices(indices, mask, source.Length);
             fixed (float* p = source)
             {
                 var idx = Vector512.AsVector512(indices.V);
@@ -453,6 +517,7 @@ public static class Memory
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && VFloat.LaneCount == 8)
         {
             // Hardware masked gather: inactive lanes are not read (safe even if their index is junk).
+            CheckGatherIndices(indices, mask, source.Length);
             fixed (float* p = source)
             {
                 var idx = Vector256.AsVector256(indices.V);
@@ -528,6 +593,7 @@ public static class Memory
 #if NET8_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && VInt.LaneCount == 16)
         {
+            CheckGatherIndices(indices, mask, source.Length);
             fixed (int* p = source)
             {
                 var idx = Vector512.AsVector512(indices.V);
@@ -542,6 +608,7 @@ public static class Memory
 
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && VInt.LaneCount == 8)
         {
+            CheckGatherIndices(indices, mask, source.Length);
             fixed (int* p = source)
             {
                 var idx = Vector256.AsVector256(indices.V);
@@ -595,6 +662,7 @@ public static class Memory
         // on each 4-lane half (otherwise a 16-wide double gang drops to the portable path).
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && VDouble.LaneCount == 8)
         {
+            CheckGatherIndices(indices, mask, source.Length);
             fixed (double* p = source)
             {
                 var idx = Vector512.AsVector512(indices.V);
@@ -609,6 +677,7 @@ public static class Memory
 
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && VDouble.LaneCount == 4)
         {
+            CheckGatherIndices(indices, mask, source.Length);
             fixed (double* p = source)
             {
                 var idx = Vector256.AsVector256(indices.V);
@@ -669,6 +738,7 @@ public static class Memory
         // AVX-512 gang (8 long lanes): run the AVX2 vpgatherqq on each 4-lane half.
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && VLong.LaneCount == 8)
         {
+            CheckGatherIndices(indices, mask, source.Length);
             fixed (long* p = source)
             {
                 var idx = Vector512.AsVector512(indices.V);
@@ -683,6 +753,7 @@ public static class Memory
 
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && VLong.LaneCount == 4)
         {
+            CheckGatherIndices(indices, mask, source.Length);
             fixed (long* p = source)
             {
                 var idx = Vector256.AsVector256(indices.V);

@@ -16,7 +16,8 @@ internal sealed class ScaffoldContext(
     bool doubleMode,
     bool longMode,
     int unroll,
-    bool hasLaneReturns)
+    bool hasLaneReturns,
+    string? peelBuffer)
 {
     public readonly CommonForEachStatementSyntax Fe = fe;
     public readonly string LoopVar = loopVar;
@@ -30,4 +31,5 @@ internal sealed class ScaffoldContext(
     public readonly bool LongMode = longMode;
     public readonly bool HasLaneReturns = hasLaneReturns;
     public readonly int Unroll = unroll;
+    public readonly string? PeelBuffer = peelBuffer;
 }

@@ -42,22 +42,17 @@ public readonly struct VFloat : IEquatable<VFloat>
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VFloat Load(ReadOnlySpan<float> source, int offset)
-        => new(new Vector<float>(source[offset..]));
+        => new(LaneIO.Load(source, offset));
 
     /// <summary>
     /// Masked load: inactive lanes receive <paramref name="fallback"/>. Safe at buffer tails.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VFloat LoadMasked(ReadOnlySpan<float> source, int offset, VMask mask, float fallback = 0f)
-    {
-        Span<float> tmp = stackalloc float[LaneCount];
-        for (int l = 0; l < LaneCount; l++)
-        {
-            int idx = offset + l;
-            tmp[l] = (mask.IsLaneActive(l) && idx < source.Length) ? source[idx] : fallback;
-        }
-
-        return Load(tmp);
-    }
+        // A full gang that fits is one plain load; the per-lane path is only for real tails.
+        => mask.AllActive() && LaneIO.Fits<float>(source.Length, offset)
+            ? new(LaneIO.LoadUnchecked(source, offset))
+            : new(LaneIO.LoadMaskedSlow(source, offset, mask.ToBitmask(), fallback));
 
     /// <summary>
     /// Contiguous store of LaneCount floats.
@@ -66,7 +61,7 @@ public readonly struct VFloat : IEquatable<VFloat>
     public void Store(Span<float> destination) => V.CopyTo(destination);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void Store(Span<float> destination, int offset) => V.CopyTo(destination[offset..]);
+    public void Store(Span<float> destination, int offset) => LaneIO.Store(V, destination, offset);
 
     /// <summary>
     /// Non-temporal (streaming) store: bypasses the cache when the target is 32-byte aligned,
@@ -75,11 +70,15 @@ public readonly struct VFloat : IEquatable<VFloat>
     /// </summary>
     public unsafe void StoreNonTemporal(Span<float> destination, int offset = 0)
     {
+        // The streaming instructions write through a raw pointer, so the whole gang has to be
+        // inside the buffer before anything else happens.
+        if (!LaneIO.Fits<float>(destination.Length, offset))
+            LaneIO.ThrowGangOutOfRange();
 #if NET8_0_OR_GREATER
-        var slice = destination[offset..];
-        if (System.Runtime.Intrinsics.X86.Avx.IsSupported && LaneCount == 8)
+        fixed (float* start = destination)
         {
-            fixed (float* p = slice)
+            float* p = start + offset;
+            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && LaneCount == 8)
             {
                 if (((nuint)p & 31u) == 0)
                 {
@@ -87,10 +86,7 @@ public readonly struct VFloat : IEquatable<VFloat>
                     return;
                 }
             }
-        }
-        else if (System.Runtime.Intrinsics.X86.Avx512F.IsSupported && LaneCount == 16)
-        {
-            fixed (float* p = slice)
+            else if (System.Runtime.Intrinsics.X86.Avx512F.IsSupported && LaneCount == 16)
             {
                 if (((nuint)p & 63u) == 0)
                 {
@@ -98,10 +94,7 @@ public readonly struct VFloat : IEquatable<VFloat>
                     return;
                 }
             }
-        }
-        else if (System.Runtime.Intrinsics.X86.Sse.IsSupported && LaneCount == 4)
-        {
-            fixed (float* p = slice)
+            else if (System.Runtime.Intrinsics.X86.Sse.IsSupported && LaneCount == 4)
             {
                 if (((nuint)p & 15u) == 0)
                 {
@@ -111,20 +104,20 @@ public readonly struct VFloat : IEquatable<VFloat>
             }
         }
 #endif
-        V.CopyTo(destination[offset..]);
+        LaneIO.StoreUnchecked(V, destination, offset);
     }
 
     /// <summary>
     /// Masked store: only active lanes write. Safe at buffer tails.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void StoreMasked(Span<float> destination, int offset, VMask mask)
     {
-        for (int l = 0; l < LaneCount; l++)
-        {
-            int idx = offset + l;
-            if (mask.IsLaneActive(l) && idx < destination.Length)
-                destination[idx] = V[l];
-        }
+        // A full gang that fits is one plain store; the per-lane path is only for real tails.
+        if (mask.AllActive() && LaneIO.Fits<float>(destination.Length, offset))
+            LaneIO.StoreUnchecked(V, destination, offset);
+        else
+            LaneIO.StoreMaskedSlow(V, destination, offset, mask.ToBitmask());
     }
 
     /// <summary>

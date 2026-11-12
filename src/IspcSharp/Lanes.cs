@@ -171,15 +171,13 @@ public static class Lanes
     public static VInt ShiftLanes(VInt v, int offset)
         => Shuffle(v, VInt.ProgramIndex + offset);
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static VInt RotateIndices(int offset)
     {
+        // (l + offset) mod w. The lane count is a power of two, so the wrap is a mask — which
+        // also folds negative offsets the right way, with no per-lane loop.
         int w = VInt.LaneCount;
-        // ((l + offset) mod w + w) mod w, branch-free for negative offsets.
-        int normalized = ((offset % w) + w) % w;
-        Span<int> tmp = stackalloc int[w];
-        for (int l = 0; l < w; l++)
-            tmp[l] = (l + normalized) % w;
-        return VInt.Load(tmp);
+        return (VInt.ProgramIndex + (offset & (w - 1))) & new VInt(w - 1);
     }
 
     /// <summary>
@@ -332,7 +330,13 @@ public static class Lanes
     /// <returns>The shifted vector.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VShort ShiftLanes(VShort v, int offset)
-        => Shuffle(v, VShort.ProgramIndex + (short)offset);   // wrapped negatives land out of range → 0
+    {
+        // The index gang is only 16 bits wide, so an offset beyond the gang must be answered
+        // here: truncated to short it could wrap back into range and return live lanes.
+        if ((uint)(offset + VShort.LaneCount) >= (uint)(2 * VShort.LaneCount))
+            return VShort.Zero;
+        return Shuffle(v, VShort.ProgramIndex + (short)offset);   // wrapped negatives land out of range → 0
+    }
 
     /// <summary>
     /// result[l] = v[l + offset], lanes shifted past the edge become 0, ISPC's shift.
@@ -342,25 +346,25 @@ public static class Lanes
     /// <returns>The shifted vector.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VByte ShiftLanes(VByte v, int offset)
-        => Shuffle(v, VByte.ProgramIndex + unchecked((byte)offset));   // wrapped negatives land out of range → 0
+    {
+        // The index gang is only 8 bits wide, so an offset beyond the gang must be answered
+        // here: truncated to byte it could wrap back into range and return live lanes.
+        if ((uint)(offset + VByte.LaneCount) >= (uint)(2 * VByte.LaneCount))
+            return VByte.Zero;
+        return Shuffle(v, VByte.ProgramIndex + unchecked((byte)offset));   // wrapped negatives land out of range → 0
+    }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static VShort RotateIndicesS(int offset)
     {
         int w = VShort.LaneCount;
-        int normalized = ((offset % w) + w) % w;
-        Span<short> tmp = stackalloc short[w];
-        for (int l = 0; l < w; l++)
-            tmp[l] = (short)((l + normalized) % w);
-        return VShort.Load(tmp);
+        return (VShort.ProgramIndex + (short)(offset & (w - 1))) & new VShort((short)(w - 1));
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static VByte RotateIndicesB(int offset)
     {
         int w = VByte.LaneCount;
-        int normalized = ((offset % w) + w) % w;
-        Span<byte> tmp = stackalloc byte[w];
-        for (int l = 0; l < w; l++)
-            tmp[l] = (byte)((l + normalized) % w);
-        return VByte.Load(tmp);
+        return (VByte.ProgramIndex + (byte)(offset & (w - 1))) & new VByte((byte)(w - 1));
     }
 }

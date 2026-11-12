@@ -40,13 +40,10 @@ public readonly struct VMaskS(Vector<short> bits) : IEquatable<VMaskS>
     /// <summary>
     /// Mask with the first <paramref name="count"/> lanes active, used for remainder/tail iterations.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VMaskS FirstN(int count)
-    {
-        Span<short> tmp = stackalloc short[LaneCount];
-        for (int i = 0; i < LaneCount; i++)
-            tmp[i] = i < count ? (short)-1 : (short)0;
-        return new VMaskS(new Vector<short>(tmp));
-    }
+        // lane l active iff l < count; the count is clamped so it survives the cast to short.
+        => new(Vector.LessThan(VShort.ProgramIndex.V, new Vector<short>((short)Math.Clamp(count, 0, LaneCount))));
 
     /// <summary>
     /// Widen a short-gang mask into its two int-gang halves (cross-gang-width bridge).

@@ -40,6 +40,20 @@ internal sealed class VectorBodyEmitter
     /// </summary>
     private readonly Dictionary<string, string> _affineOffset = [];
 
+    /// <summary>
+    /// Lane locals declared with a narrow C# type (byte/sbyte/short/ushort). They live in int
+    /// lanes, so every implicit narrowing C# performs on them (compound assignment, ++/--) has
+    /// to be re-applied explicitly. Maps name → declared type.
+    /// </summary>
+    private readonly Dictionary<string, string> _narrowLocals = [];
+
+    /// <summary>
+    /// The first buffer written with a non-temporal store at the gang base, or null. The loop
+    /// driver peels scalar iterations until this buffer is vector-aligned, since non-temporal
+    /// stores only take effect on an aligned destination.
+    /// </summary>
+    public string? StreamingTarget { get; private set; }
+
     private readonly Dictionary<string, ReductionInfo> _reductions;
     private readonly bool _d;                       // double-lane kernel (VDouble/VMaskD gangs)
     private readonly bool _l;                       // long-lane kernel (VLong/VMaskD gangs)
@@ -413,6 +427,10 @@ internal sealed class VectorBodyEmitter
         foreach (var v in decl.Declaration.Variables)
         {
             _locals[v.Identifier.Text] = kind;
+            if (t is "byte" or "sbyte" or "short" or "ushort")
+                _narrowLocals[v.Identifier.Text] = t;
+            else
+                _ = _narrowLocals.Remove(v.Identifier.Text);
             // Record affine-in-lane int locals declared unmasked, so uses as array indices
             // become contiguous loads/stores. (In a masked branch the initializer is blended
             // with 0 for inactive lanes, which breaks the affine property, so skip those.)
@@ -615,6 +633,10 @@ internal sealed class VectorBodyEmitter
             }
 
             string rhs = CombineCompound(op, name, asg, lkind);
+            // C# narrows a compound assignment on a byte/short local back to its declared type
+            // ('b += 100' is 'b = (byte)(b + 100)'); the int lane has to wrap the same way.
+            if (op != "=")
+                rhs = NarrowWrap(name, rhs);
             _ = sb.AppendLine(mask == null
                 ? $"{indent}{name} = {rhs};"
                 : $"{indent}{name} = {SelectOf(lkind)}({mask}, {rhs}, {name});");
@@ -651,6 +673,10 @@ internal sealed class VectorBodyEmitter
                 : _streaming && op == "=" && ek is Kind.F or Kind.D
                 ? "StoreNonTemporal" : "Store";
             string maskedStore = narrowStore ? "StoreNarrow" : "Store";
+            // Only a store at the gang base ('buf[i]') can steer the alignment peel: an offset
+            // may name loop-local uniforms that are not in scope where the peel is emitted.
+            if (mask == null && store == "StoreNonTemporal" && storeIdx == "__i")
+                StreamingTarget ??= bufName;
             _ = mask == null
                 ? sb.AppendLine($"{indent}({rhs}).{store}({bufName}, {storeIdx});")
                 : sb.AppendLine($"{indent}{vtype}.Select({mask}, {rhs}, {load}).{maskedStore}({bufName}, {storeIdx});");
@@ -755,7 +781,7 @@ internal sealed class VectorBodyEmitter
             Kind.L => $"new {VType(Kind.L)}(1)",
             _ => "new VInt(1)",
         };
-        string rhs = $"({name} {(op == "++" ? "+" : "-")} {one})";
+        string rhs = NarrowWrap(name, $"({name} {(op == "++" ? "+" : "-")} {one})");
         _ = sb.AppendLine(mask == null
             ? $"{indent}{name} = {rhs};"
             : $"{indent}{name} = {SelectOf(kind)}({mask}, {rhs}, {name});");
@@ -763,6 +789,47 @@ internal sealed class VectorBodyEmitter
 
     private string CombineCompound(string op, string currentName, AssignmentExpressionSyntax asg, Kind kind)
         => CombineCompoundOnExpr(op, currentName, asg, kind);
+
+    /// <summary>
+    /// Re-apply the implicit narrowing C# performs when a byte/sbyte/short/ushort local is
+    /// updated in place (compound assignment, ++/--). Other locals pass through unchanged.
+    /// </summary>
+    private string NarrowWrap(string localName, string code)
+        => _narrowLocals.TryGetValue(localName, out string? nt)
+            ? nt switch
+            {
+                "byte" => $"(({code}) & new VInt(0xFF))",
+                "ushort" => $"(({code}) & new VInt(0xFFFF))",
+                "sbyte" => $"((({code}) << 24) >> 24)",
+                _ => $"((({code}) << 16) >> 16)",
+            }
+            : code;
+
+    /// <summary>
+    /// Drop the affine-in-lane property of every lane local assigned anywhere inside
+    /// <paramref name="scope"/>. Affine tracking follows emission order, which is only the
+    /// execution order for straight-line code: a loop body runs again after its own later
+    /// assignments (the back edge), and a uniform <c>if</c> may not run at all. Calling this
+    /// before and after such a region keeps 'a[j]' from lowering to a contiguous load at a
+    /// stale offset.
+    /// </summary>
+    private void InvalidateAffineAssignedIn(SyntaxNode? scope)
+    {
+        if (scope == null || _affineOffset.Count == 0)
+            return;
+        foreach (var node in scope.DescendantNodesAndSelf())
+        {
+            ExpressionSyntax? target = node switch
+            {
+                AssignmentExpressionSyntax a => a.Left,
+                PostfixUnaryExpressionSyntax { OperatorToken.Text: "++" or "--" } post => post.Operand,
+                PrefixUnaryExpressionSyntax { OperatorToken.Text: "++" or "--" } pre => pre.Operand,
+                _ => null,
+            };
+            if (target is IdentifierNameSyntax id)
+                _ = _affineOffset.Remove(id.Identifier.Text);
+        }
+    }
 
     private string CombineCompoundOnExpr(string op, string current, AssignmentExpressionSyntax asg, Kind kind)
     {
@@ -790,22 +857,28 @@ internal sealed class VectorBodyEmitter
         // around each branch so whole gangs skip a branch no lane takes.
         bool coherent = TryUnwrapCoherent(ifs.Condition, out var condition);
 
-        // If the condition is uniform (no lane variables) and we're inside a uniform
-        // loop context, emit a plain C# if/else, break/continue inside need C# semantics.
-        bool inUniformLoop = _loopStack.Count > 0 && _loopStack.Peek().IsUniform;
-        if (inUniformLoop && IsUniformExpression(condition))
+        // A uniform condition (no lane variables) is the same for every lane, so it is a plain
+        // C# if/else around the vectorized branches: only the taken branch runs, instead of
+        // both being computed and blended. Inside a uniform loop this is also what gives
+        // break/continue their C# semantics.
+        if (IsUniformExpression(condition))
         {
+            // Which branch runs is not known here, so a lane local assigned in either one
+            // is no longer affine afterwards (see InvalidateAffineAssignedIn).
+            InvalidateAffineAssignedIn(ifs);
             string condExpr = condition.ToString();
             _ = sb.AppendLine($"{indent}if ({condExpr})");
             _ = sb.AppendLine($"{indent}{{");
             EmitStatement(ifs.Statement, mask, indent + "    ", sb);
             _ = sb.AppendLine($"{indent}}}");
+            InvalidateAffineAssignedIn(ifs);
             if (ifs.Else != null)
             {
                 _ = sb.AppendLine($"{indent}else");
                 _ = sb.AppendLine($"{indent}{{");
                 EmitStatement(ifs.Else.Statement, mask, indent + "    ", sb);
                 _ = sb.AppendLine($"{indent}}}");
+                InvalidateAffineAssignedIn(ifs);
             }
 
             return;
@@ -875,6 +948,7 @@ internal sealed class VectorBodyEmitter
     /// </summary>
     private void EmitWhile(WhileStatementSyntax whs, string? mask, string indent, StringBuilder sb)
     {
+        InvalidateAffineAssignedIn(whs);
         string m = $"__loop{_maskCounter++}";
         string cond = Mask(whs.Condition);
         _ = sb.AppendLine(mask == null
@@ -904,6 +978,7 @@ internal sealed class VectorBodyEmitter
         _ = sb.AppendLine($"{indent}}}");
 
         _ = _loopStack.Pop();
+        InvalidateAffineAssignedIn(whs);
     }
 
     /// <summary>
@@ -935,8 +1010,19 @@ internal sealed class VectorBodyEmitter
             }
         }
 
+        // A lane local assigned anywhere in the loop is not affine across the back edge.
+        InvalidateAffineAssignedIn(fors);
+
         // Check if the condition is uniform (no lane variables).
-        bool isUniform = IsUniformExpression(fors.Condition);
+        bool isUniform = fors.Condition == null || IsUniformExpression(fors.Condition);
+
+        // Initializers/incrementors that touch lane locals ('for (k = 0; ...; j += 2)') need the
+        // masked lowering below; emitted verbatim they would also update inactive lanes.
+        if (isUniform && (fors.Initializers.Any(e => !IsUniformExpression(e)) ||
+                          fors.Incrementors.Any(e => !IsUniformExpression(e))))
+        {
+            isUniform = false;
+        }
 
         // Even if the loop condition is uniform, if break/continue inside the body
         // are guarded by varying conditions (references to lane variables), we must
@@ -971,6 +1057,21 @@ internal sealed class VectorBodyEmitter
         {
             // Varying for loop: lower as a divergent while loop.
             // The condition depends on lane variables, so we need mask iteration.
+            if (fors.Condition == null)
+            {
+                throw new UnsupportedConstructException(
+                    "'for' loop without a condition whose body or header is lane-varying (add a loop condition)",
+                    fors.GetLocation());
+            }
+
+            // The loop variable is declared in its own block, exactly like the C# 'for' scope,
+            // so two sibling loops can reuse the same variable name.
+            string outerIndent = indent;
+            if (fors.Declaration != null)
+            {
+                _ = sb.AppendLine($"{outerIndent}{{");
+                indent += "    ";
+            }
 
             // Emit the initializer before the while loop.
             if (fors.Declaration != null)
@@ -983,8 +1084,28 @@ internal sealed class VectorBodyEmitter
             }
             else if (fors.Initializers.Count > 0)
             {
+                // Lane-local initializers run under the enclosing mask ('k = 0' must not reset
+                // lanes that never enter the loop); uniform ones emit verbatim.
                 foreach (var init in fors.Initializers)
-                    _ = sb.AppendLine($"{indent}{init};");
+                {
+                    if (init is AssignmentExpressionSyntax iasg &&
+                        iasg.Left is IdentifierNameSyntax iid && _locals.ContainsKey(iid.Identifier.Text))
+                    {
+                        EmitAssignment(iasg, mask, indent, sb);
+                    }
+                    else if (IsUniformExpression(init))
+                    {
+                        _ = sb.AppendLine($"{indent}{init};");
+                    }
+                    else
+                    {
+                        throw new UnsupportedConstructException(
+                            $"for-loop initializer '{Trunc(init)}' (use an assignment to a lane local or a uniform expression)",
+                            init.GetLocation());
+                    }
+                }
+
+                _exprMask = mask;
             }
 
             string m = $"__loop{_maskCounter++}";
@@ -1012,21 +1133,25 @@ internal sealed class VectorBodyEmitter
 
             // Emit incrementors (they run at the end of each iteration).
             // Lane-local ++/-- gets masked lowering; scalar (uniform) incrementors emit verbatim.
+            // A lane that hit 'break' (or 'return') this iteration leaves without running the
+            // incrementor, exactly as in C#; a lane that hit 'continue' still runs it.
+            string incMask = $"{m} & !{breakMask}";
             foreach (var inc in fors.Incrementors)
             {
-                if (inc is AssignmentExpressionSyntax asg)
+                if (inc is AssignmentExpressionSyntax asg &&
+                    !(asg.Left is IdentifierNameSyntax aid && IsUniformExpression(aid)))
                 {
-                    EmitAssignment(asg, m, indent + "    ", sb);
+                    EmitAssignment(asg, incMask, indent + "    ", sb);
                 }
                 else if (inc is PostfixUnaryExpressionSyntax { Operand: IdentifierNameSyntax pid } post &&
                          post.OperatorToken.Text is "++" or "--" && _locals.ContainsKey(pid.Identifier.Text))
                 {
-                    EmitIncDec(post.Operand, post.OperatorToken.Text, m, indent + "    ", sb, post.GetLocation());
+                    EmitIncDec(post.Operand, post.OperatorToken.Text, incMask, indent + "    ", sb, post.GetLocation());
                 }
                 else if (inc is PrefixUnaryExpressionSyntax { Operand: IdentifierNameSyntax nid } pre &&
                          pre.OperatorToken.Text is "++" or "--" && _locals.ContainsKey(nid.Identifier.Text))
                 {
-                    EmitIncDec(pre.Operand, pre.OperatorToken.Text, m, indent + "    ", sb, pre.GetLocation());
+                    EmitIncDec(pre.Operand, pre.OperatorToken.Text, incMask, indent + "    ", sb, pre.GetLocation());
                 }
                 else
                 {
@@ -1039,7 +1164,11 @@ internal sealed class VectorBodyEmitter
             _ = sb.AppendLine($"{indent}}}");
 
             _ = _loopStack.Pop();
+            if (fors.Declaration != null)
+                _ = sb.AppendLine($"{outerIndent}}}");
         }
+
+        InvalidateAffineAssignedIn(fors);
     }
 
     private void EmitBreak(string? mask, string indent, StringBuilder sb, Location loc)
@@ -1460,8 +1589,12 @@ internal sealed class VectorBodyEmitter
             };
         }
 
-        var l = Vec(bin.Left);
-        var r = Vec(bin.Right);
+        // For '+', an operand that is itself a product keeps its two lowered factors around so
+        // the FMA check below can reuse them. (Lowering the factors a second time just to test
+        // for a fusable product doubled the work at every level of a Horner chain: exponential.)
+        ((string Code, Kind Kind) A, (string Code, Kind Kind) B)? lFactors = null, rFactors = null;
+        var l = op == "+" ? VecKeepingFactors(bin.Left, out lFactors) : Vec(bin.Left);
+        var r = op == "+" ? VecKeepingFactors(bin.Right, out rFactors) : Vec(bin.Right);
 
         // Implicit int->long->float->double promotion when kinds are mixed (mirrors C#).
         var kind = Promote(l.Kind, r.Kind);
@@ -1475,12 +1608,14 @@ internal sealed class VectorBodyEmitter
             Warn(Descriptors.IntDividePerf, bin, bin.ToString());
 
         // 'a * b + c' on float/double lanes fuses into one FMA (higher throughput, single rounding).
-        if (op == "+")
+        // Only when neither factor needs a precision-changing coercion (both already the target
+        // kind), so MulAdd still tracks the scalar reference.
+        if (op == "+" && kind is Kind.F or Kind.D)
         {
-            if (TryFmaFactors(bin.Left, kind, out string? fla, out string? flb))
-                return ($"{VType(kind)}.MulAdd({fla}, {flb}, {rc})", kind);
-            if (TryFmaFactors(bin.Right, kind, out string? fra, out string? frb))
-                return ($"{VType(kind)}.MulAdd({fra}, {frb}, {lc})", kind);
+            if (lFactors is { } lf && lf.A.Kind == kind && lf.B.Kind == kind)
+                return ($"{VType(kind)}.MulAdd({lf.A.Code}, {lf.B.Code}, {rc})", kind);
+            if (rFactors is { } rf && rf.A.Kind == kind && rf.B.Kind == kind)
+                return ($"{VType(kind)}.MulAdd({rf.A.Code}, {rf.B.Code}, {lc})", kind);
         }
 
         return op switch
@@ -1496,6 +1631,26 @@ internal sealed class VectorBodyEmitter
             "&" or "|" or "^" when isInt => ($"({lc} {op} {rc})", kind),
             _ => throw new UnsupportedConstructException($"operator '{op}'", bin.GetLocation()),
         };
+    }
+
+    /// <summary>
+    /// Lower <paramref name="e"/> exactly as <see cref="Vec"/> does, and when it is a (possibly
+    /// parenthesized) product also hand back its two lowered factors.
+    /// </summary>
+    private (string Code, Kind Kind) VecKeepingFactors(
+        ExpressionSyntax e, out ((string Code, Kind Kind) A, (string Code, Kind Kind) B)? factors)
+    {
+        factors = null;
+        if (e is ParenthesizedExpressionSyntax p)
+            return WrapParen(VecKeepingFactors(p.Expression, out factors));
+        if (e is not BinaryExpressionSyntax { OperatorToken.Text: "*" } mul)
+            return Vec(e);
+
+        var a = Vec(mul.Left);
+        var b = Vec(mul.Right);
+        factors = (a, b);
+        var kind = Promote(a.Kind, b.Kind);
+        return ($"({CoerceCode(a, kind, mul.Left)} * {CoerceCode(b, kind, mul.Right)})", kind);
     }
 
     /// <summary>
@@ -1535,10 +1690,18 @@ internal sealed class VectorBodyEmitter
 
     private (string, Kind) TernExpr(ConditionalExpressionSyntax tern)
     {
+        // Both arms are computed for every lane, so each arm's faulting operations (integer
+        // divide, gather) are guarded by the lanes that actually select it — the scalar code
+        // only evaluates the chosen arm ('d != 0 ? n / d : 0' must not divide by zero).
+        string cond = Mask(tern.Condition);
+        string? outer = _exprMask;
+        _exprMask = outer == null ? cond : $"({outer} & {cond})";
         var t = Vec(tern.WhenTrue);
+        _exprMask = outer == null ? $"(!{cond})" : $"({outer} & !{cond})";
         var f = Vec(tern.WhenFalse);
+        _exprMask = outer;
         var kind = Promote(t.Kind, f.Kind);
-        return ($"{SelectOf(kind)}({Mask(tern.Condition)}, {CoerceCode(t, kind, tern.WhenTrue)}, {CoerceCode(f, kind, tern.WhenFalse)})", kind);
+        return ($"{SelectOf(kind)}({cond}, {CoerceCode(t, kind, tern.WhenTrue)}, {CoerceCode(f, kind, tern.WhenFalse)})", kind);
     }
 
     /// <summary>
@@ -2101,7 +2264,8 @@ internal sealed class VectorBodyEmitter
             "Math.Pow" or "MathF.Pow" => "Pow",
             "Math.Tanh" or "MathF.Tanh" => "Tanh",
             "Math.Floor" or "MathF.Floor" => "Floor",
-            "Math.Round" or "MathF.Round" => "Round",
+            // C#'s one-argument Round rounds ties to even; VectorMath.Round is ties-away-from-zero.
+            "Math.Round" or "MathF.Round" => "RoundToEven",
             "Math.Clamp" or "MathF.Clamp" => "Clamp",
             "Math.Atan" or "MathF.Atan" => "Atan",
             "Math.Atan2" or "MathF.Atan2" => "Atan2",
@@ -2124,8 +2288,21 @@ internal sealed class VectorBodyEmitter
         // so the emitted call text is identical, only the argument coercion differs.
         // If any argument is double (a VDouble2 in float kernels), the whole call is
         // computed in double precision, mirroring C# overload resolution.
-        var vecArgs = call.ArgumentList.Arguments
-            .Select(a => (Value: Vec(a.Expression), Node: a.Expression))
+        var callArgs2 = call.ArgumentList.Arguments.Select(a => a.Expression).ToList();
+        if (fn == "RoundToEven" && callArgs2.Count == 2)
+        {
+            // Math.Round(x, MidpointRounding.X): the mode is a compile-time choice of function.
+            string mode = callArgs2[1].ToString().Replace(" ", "");
+            fn = mode.EndsWith("MidpointRounding.AwayFromZero") ? "Round"
+                : mode.EndsWith("MidpointRounding.ToEven") ? "RoundToEven"
+                : throw new UnsupportedConstructException(
+                    $"'{callee}' with second argument '{Trunc(callArgs2[1])}' (only MidpointRounding.ToEven / MidpointRounding.AwayFromZero)",
+                    call.GetLocation());
+            callArgs2.RemoveAt(1);
+        }
+
+        var vecArgs = callArgs2
+            .Select(a => (Value: Vec(a), Node: a))
             .ToArray();
         // Min/Max/Abs over 64-bit integer lanes stay in long precision (VLong2), the same way
         // a double argument pins the call to double, VectorMath has matching VLong2 overloads.
@@ -2170,10 +2347,18 @@ internal sealed class VectorBodyEmitter
     private string MaskBin(BinaryExpressionSyntax bin)
     {
         string op = bin.OperatorToken.Text;
-        if (op is "&&")
-            return $"({Mask(bin.Left)} & {Mask(bin.Right)})";
-        if (op is "||")
-            return $"({Mask(bin.Left)} | {Mask(bin.Right)})";
+        if (op is "&&" or "||")
+        {
+            // Short-circuit: the right operand only "runs" for lanes the left one lets through,
+            // so its faulting operations (integer divide, gather) are guarded by that lane set.
+            string left = Mask(bin.Left);
+            string? outer = _exprMask;
+            string pass = op == "&&" ? left : $"!{left}";
+            _exprMask = outer == null ? (op == "&&" ? left : $"({pass})") : $"({outer} & {pass})";
+            string right = Mask(bin.Right);
+            _exprMask = outer;
+            return op == "&&" ? $"({left} & {right})" : $"({left} | {right})";
+        }
 
         var l = Vec(bin.Left);
         var r = Vec(bin.Right);
@@ -2250,31 +2435,41 @@ internal sealed class VectorBodyEmitter
     private bool TryClassifyAffine(ExpressionSyntax e, out string offset)
     {
         offset = "0";
-        var terms = new List<ExpressionSyntax>();
-        FlattenAdditive(e, terms);
+        var terms = new List<(ExpressionSyntax Expr, bool Negative)>();
+        FlattenAdditive(e, terms, negative: false);
 
         var uniformParts = new List<string>();
         int unitStride = 0;
-        foreach (var t in terms)
+        foreach (var (t, negative) in terms)
         {
             var tt = Unparen(t);
             if (tt is IdentifierNameSyntax lv && lv.Identifier.Text == _loopVar)
             {
+                if (negative)
+                    return false;   // 'u - i' walks backwards: stride -1, not a contiguous gang
                 unitStride++;
                 continue;
             }
 
             if (tt is IdentifierNameSyntax al && _affineOffset.TryGetValue(al.Identifier.Text, out string? innerOff))
             {
+                if (negative)
+                    return false;
                 unitStride++;
                 if (innerOff != "0")
-                    uniformParts.Add(innerOff);
+                    uniformParts.Add(innerOff.Contains(' ') ? $"({innerOff})" : innerOff);
                 continue;
             }
 
             if (IsUniformExpression(tt))
             {
-                uniformParts.Add(tt.ToString());
+                // A subtracted uniform term ('i - 1', 'i - half') is just a negative offset.
+                // Anything but a simple operand is parenthesized so joining the terms with '+'
+                // can't regroup it ('i + k + (a << 1)' must not become 'k + a << 1').
+                bool simple = tt is IdentifierNameSyntax or LiteralExpressionSyntax or MemberAccessExpressionSyntax
+                    or InvocationExpressionSyntax or ElementAccessExpressionSyntax;
+                string part = simple ? tt.ToString() : $"({tt})";
+                uniformParts.Add(negative ? $"-{part}" : part);
                 continue;
             }
 
@@ -2288,17 +2483,21 @@ internal sealed class VectorBodyEmitter
         return true;
     }
 
-    private static void FlattenAdditive(ExpressionSyntax e, List<ExpressionSyntax> terms)
+    /// <summary>
+    /// Split an index expression into its signed additive terms: 'i + a - (b - c)' yields
+    /// +i, +a, -b, +c.
+    /// </summary>
+    private static void FlattenAdditive(ExpressionSyntax e, List<(ExpressionSyntax Expr, bool Negative)> terms, bool negative)
     {
         e = Unparen(e);
-        if (e is BinaryExpressionSyntax { OperatorToken.Text: "+" } b)
+        if (e is BinaryExpressionSyntax { OperatorToken.Text: "+" or "-" } b)
         {
-            FlattenAdditive(b.Left, terms);
-            FlattenAdditive(b.Right, terms);
+            FlattenAdditive(b.Left, terms, negative);
+            FlattenAdditive(b.Right, terms, b.OperatorToken.Text == "-" ? !negative : negative);
         }
         else
         {
-            terms.Add(e);
+            terms.Add((e, negative));
         }
     }
 
@@ -2337,27 +2536,30 @@ internal sealed class VectorBodyEmitter
         }
 
         // Long kernels index with VLong directly (the lane expression is already 64-bit).
+        // Inside divergent flow the gather takes the execution mask: inactive lanes carry
+        // whatever index they had (often the very value the branch tests for, as in
+        // 'if (j >= 0) x = table[j]'), so they must not be read.
+        string gmask = _exprMask ?? MTAll;
         if (_l)
         {
             string idxL = Coerce(Vec(idxExpr), Kind.L, idxExpr);
-            return ($"Memory.Gather({bufName}, {idxL})", Kind.L);
+            return ($"Memory.Gather({bufName}, {idxL}, {gmask}, 0L)", Kind.L);
         }
 
         // Double kernels index with VLong (truncated from the double lane expression).
         if (_d)
         {
             string idxD = Coerce(Vec(idxExpr), Kind.D, idxExpr);
-            return ($"Memory.Gather({bufName}, VLong.FromDoubleTruncate({idxD}))", Kind.D);
+            return ($"Memory.Gather({bufName}, VLong.FromDoubleTruncate({idxD}), {gmask}, 0d)", Kind.D);
         }
 
         string idx = Coerce(Vec(idxExpr), Kind.I, idxExpr);
 
-        // Memory.Gather(ReadOnlySpan<float>, VInt) → VFloat
+        // Memory.Gather(ReadOnlySpan<float>, VInt, VMask, float) → VFloat
         // Memory.Gather(ReadOnlySpan<int>, VInt, VMask, int) → VInt
-        if (p.ElemKind == Kind.F)
-            return ($"Memory.Gather({bufName}, {idx})", Kind.F);
-        else
-            return ($"Memory.Gather({bufName}, {idx}, VMask.All, 0)", Kind.I);
+        return p.ElemKind == Kind.F
+            ? ($"Memory.Gather({bufName}, {idx}, {gmask}, 0f)", Kind.F)
+            : ($"Memory.Gather({bufName}, {idx}, {gmask}, 0)", Kind.I);
     }
 
     /// <summary>
@@ -2402,13 +2604,14 @@ internal sealed class VectorBodyEmitter
 
         Warn(Descriptors.GatherPerf, ea, ea.ToString());
         string flatIdx = Build2DFlatIndex(idx0, idx1, p.ColsName);
+        string gmask = _exprMask ?? MTAll;
         if (_l)
-            return ($"Memory.Gather({p.FlatName}, {flatIdx})", Kind.L);
+            return ($"Memory.Gather({p.FlatName}, {flatIdx}, {gmask}, 0L)", Kind.L);
         if (_d)
-            return ($"Memory.Gather({p.FlatName}, {flatIdx})", Kind.D);
+            return ($"Memory.Gather({p.FlatName}, {flatIdx}, {gmask}, 0d)", Kind.D);
         if (p.ElemKind == Kind.F)
-            return ($"Memory.Gather({p.FlatName}, {flatIdx})", Kind.F);
-        return ($"Memory.Gather({p.FlatName}, {flatIdx}, VMask.All, 0)", Kind.I);
+            return ($"Memory.Gather({p.FlatName}, {flatIdx}, {gmask}, 0f)", Kind.F);
+        return ($"Memory.Gather({p.FlatName}, {flatIdx}, {gmask}, 0)", Kind.I);
     }
 
     /// <summary>

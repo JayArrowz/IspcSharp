@@ -50,37 +50,32 @@ public readonly struct VByte : IEquatable<VByte>
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VByte Load(ReadOnlySpan<byte> source, int offset = 0)
-        => new(new Vector<byte>(source[offset..]));
+        => new(LaneIO.Load(source, offset));
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void Store(Span<byte> destination, int offset = 0) => V.CopyTo(destination[offset..]);
+    public void Store(Span<byte> destination, int offset = 0) => LaneIO.Store(V, destination, offset);
 
     /// <summary>
     /// Masked load: inactive lanes receive <paramref name="fallback"/>. Safe at buffer tails.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VByte LoadMasked(ReadOnlySpan<byte> source, int offset, VMaskB mask, byte fallback = 0)
-    {
-        Span<byte> tmp = stackalloc byte[LaneCount];
-        for (int l = 0; l < LaneCount; l++)
-        {
-            int idx = offset + l;
-            tmp[l] = (mask.IsLaneActive(l) && idx < source.Length) ? source[idx] : fallback;
-        }
-
-        return Load(tmp);
-    }
+        // A full gang that fits is one plain load; the per-lane path is only for real tails.
+        => mask.AllActive() && LaneIO.Fits<byte>(source.Length, offset)
+            ? new(LaneIO.LoadUnchecked(source, offset))
+            : new(LaneIO.LoadMaskedSlow(source, offset, mask.ToBitmask(), fallback));
 
     /// <summary>
     /// Masked store: only active lanes write. Safe at buffer tails.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void StoreMasked(Span<byte> destination, int offset, VMaskB mask)
     {
-        for (int l = 0; l < LaneCount; l++)
-        {
-            int idx = offset + l;
-            if (mask.IsLaneActive(l) && idx < destination.Length)
-                destination[idx] = V[l];
-        }
+        // A full gang that fits is one plain store; the per-lane path is only for real tails.
+        if (mask.AllActive() && LaneIO.Fits<byte>(destination.Length, offset))
+            LaneIO.StoreUnchecked(V, destination, offset);
+        else
+            LaneIO.StoreMaskedSlow(V, destination, offset, mask.ToBitmask());
     }
 
     public byte GetLane(int lane) => V[lane];

@@ -40,13 +40,10 @@ public readonly struct VMaskB(Vector<byte> bits) : IEquatable<VMaskB>
     /// <summary>
     /// Mask with the first <paramref name="count"/> lanes active, used for remainder/tail iterations.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VMaskB FirstN(int count)
-    {
-        Span<byte> tmp = stackalloc byte[LaneCount];
-        for (int i = 0; i < LaneCount; i++)
-            tmp[i] = i < count ? (byte)0xFF : (byte)0;
-        return new VMaskB(new Vector<byte>(tmp));
-    }
+        // lane l active iff l < count; the count is clamped so it survives the cast to byte.
+        => new(Vector.LessThan(VByte.ProgramIndex.V, new Vector<byte>((byte)Math.Clamp(count, 0, LaneCount))));
 
     /// <summary>
     /// Widen a byte-gang mask into its two short-gang halves (cross-gang-width bridge).

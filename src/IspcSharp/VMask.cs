@@ -40,13 +40,9 @@ public readonly struct VMask(Vector<int> bits) : IEquatable<VMask>
     /// <summary>
     /// Mask with the first <paramref name="count"/> lanes active, used for remainder/tail iterations.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VMask FirstN(int count)
-    {
-        Span<int> tmp = stackalloc int[LaneCount];
-        for (int i = 0; i < LaneCount; i++)
-            tmp[i] = i < count ? -1 : 0;
-        return new VMask(new Vector<int>(tmp));
-    }
+        => new(Vector.LessThan(VInt.ProgramIndex.V, new Vector<int>(count)));   // lane l active iff l < count
 
     /// <summary>
     /// Narrow two double-gang masks back into one float-gang mask (cross-gang-width bridge).

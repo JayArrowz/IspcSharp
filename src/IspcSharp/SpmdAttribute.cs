@@ -20,10 +20,11 @@ public sealed class SpmdAttribute : Attribute
     /// Emit non-temporal (streaming, <c>movntps</c>) stores for the contiguous buffer writes, plus a
     /// store fence after the loop. This bypasses the cache, a win only for large, write-once output
     /// that won't be re-read soon (it avoids read-for-ownership traffic), and a loss if the data is
-    /// reused. NT stores need an aligned destination; the runtime falls back to an ordinary store
-    /// when a buffer isn't aligned, so it is always safe but only speeds up aligned buffers (large
-    /// arrays, where streaming helps, are commonly page-aligned in practice). Applies to float/double
-    /// output buffers. Off by default.
+    /// reused. NT stores need a vector-aligned destination, which a .NET array's first element
+    /// usually is not, so the generated loop first runs the scalar body up to the first aligned
+    /// element of the output buffer (at most LaneCount - 1 iterations) and streams from there. A
+    /// store that still finds itself unaligned falls back to an ordinary store, so it is always
+    /// safe. Applies to float/double output buffers written as <c>buf[i] = ...</c>. Off by default.
     /// </summary>
     public bool Streaming { get; set; } = false;
 

@@ -19,13 +19,9 @@ public readonly struct VMaskD(Vector<long> bits) : IEquatable<VMaskD>
     public static VMaskD All => new(Vector.Equals(Vector<long>.Zero, Vector<long>.Zero));
     public static VMaskD None => new(Vector<long>.Zero);
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VMaskD FirstN(int count)
-    {
-        Span<long> tmp = stackalloc long[LaneCount];
-        for (int i = 0; i < LaneCount; i++)
-            tmp[i] = i < count ? -1L : 0L;
-        return new VMaskD(new Vector<long>(tmp));
-    }
+        => new(Vector.LessThan(VLong.ProgramIndex.V, new Vector<long>(count)));   // lane l active iff l < count
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VMaskD operator &(VMaskD a, VMaskD b) => new(a.Bits & b.Bits);
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VMaskD operator |(VMaskD a, VMaskD b) => new(a.Bits | b.Bits);
@@ -155,22 +151,17 @@ public readonly struct VDouble : IEquatable<VDouble>
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VDouble Load(ReadOnlySpan<double> source, int offset = 0)
-        => new(new Vector<double>(source[offset..]));
-
-    public static VDouble LoadMasked(ReadOnlySpan<double> source, int offset, VMaskD mask, double fallback = 0d)
-    {
-        Span<double> tmp = stackalloc double[LaneCount];
-        for (int l = 0; l < LaneCount; l++)
-        {
-            int idx = offset + l;
-            tmp[l] = (mask.IsLaneActive(l) && idx < source.Length) ? source[idx] : fallback;
-        }
-
-        return Load(tmp);
-    }
+        => new(LaneIO.Load(source, offset));
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void Store(Span<double> destination, int offset = 0) => V.CopyTo(destination[offset..]);
+    public static VDouble LoadMasked(ReadOnlySpan<double> source, int offset, VMaskD mask, double fallback = 0d)
+        // A full gang that fits is one plain load; the per-lane path is only for real tails.
+        => mask.AllActive() && LaneIO.Fits<double>(source.Length, offset)
+            ? new(LaneIO.LoadUnchecked(source, offset))
+            : new(LaneIO.LoadMaskedSlow(source, offset, mask.ToBitmask(), fallback));
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Store(Span<double> destination, int offset = 0) => LaneIO.Store(V, destination, offset);
 
     /// <summary>
     /// Non-temporal (streaming) store when the target is aligned, else an ordinary store.
@@ -178,11 +169,15 @@ public readonly struct VDouble : IEquatable<VDouble>
     /// </summary>
     public unsafe void StoreNonTemporal(Span<double> destination, int offset = 0)
     {
+        // The streaming instructions write through a raw pointer, so the whole gang has to be
+        // inside the buffer before anything else happens.
+        if (!LaneIO.Fits<double>(destination.Length, offset))
+            LaneIO.ThrowGangOutOfRange();
 #if NET8_0_OR_GREATER
-        var slice = destination[offset..];
-        if (System.Runtime.Intrinsics.X86.Avx.IsSupported && LaneCount == 4)
+        fixed (double* start = destination)
         {
-            fixed (double* p = slice)
+            double* p = start + offset;
+            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && LaneCount == 4)
             {
                 if (((nuint)p & 31u) == 0)
                 {
@@ -190,10 +185,7 @@ public readonly struct VDouble : IEquatable<VDouble>
                     return;
                 }
             }
-        }
-        else if (System.Runtime.Intrinsics.X86.Avx512F.IsSupported && LaneCount == 8)
-        {
-            fixed (double* p = slice)
+            else if (System.Runtime.Intrinsics.X86.Avx512F.IsSupported && LaneCount == 8)
             {
                 if (((nuint)p & 63u) == 0)
                 {
@@ -201,10 +193,7 @@ public readonly struct VDouble : IEquatable<VDouble>
                     return;
                 }
             }
-        }
-        else if (System.Runtime.Intrinsics.X86.Sse2.IsSupported && LaneCount == 2)
-        {
-            fixed (double* p = slice)
+            else if (System.Runtime.Intrinsics.X86.Sse2.IsSupported && LaneCount == 2)
             {
                 if (((nuint)p & 15u) == 0)
                 {
@@ -214,17 +203,17 @@ public readonly struct VDouble : IEquatable<VDouble>
             }
         }
 #endif
-        V.CopyTo(destination[offset..]);
+        LaneIO.StoreUnchecked(V, destination, offset);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void StoreMasked(Span<double> destination, int offset, VMaskD mask)
     {
-        for (int l = 0; l < LaneCount; l++)
-        {
-            int idx = offset + l;
-            if (mask.IsLaneActive(l) && idx < destination.Length)
-                destination[idx] = V[l];
-        }
+        // A full gang that fits is one plain store; the per-lane path is only for real tails.
+        if (mask.AllActive() && LaneIO.Fits<double>(destination.Length, offset))
+            LaneIO.StoreUnchecked(V, destination, offset);
+        else
+            LaneIO.StoreMaskedSlow(V, destination, offset, mask.ToBitmask());
     }
 
     public double GetLane(int lane) => V[lane];

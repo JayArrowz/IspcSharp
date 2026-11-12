@@ -18,7 +18,19 @@ public static class VectorMath
     private const float Pi = 3.14159265358979323846f;
     private const float TwoPi = 6.28318530717958647692f;
     private const float InvTwoPi = 0.15915494309189533577f;
-    private const int MantissaShift = 1 << 23;
+    // ln2 split (Cody–Waite): Ln2Hi has 9 significant bits, so k*Ln2Hi is exact for any exponent k.
+    private const float Ln2Hi = 0.693359375f;
+    private const float Ln2Lo = -2.12194440e-4f;
+    // 2π split in three (Cody–Waite): TwoPiA has 8 significant bits and TwoPiB 11, so k*TwoPiA
+    // and k*TwoPiB are exact products even without a fused multiply-add (k up to 2^16 / 2^13);
+    // TwoPiC is the rest. A + B + C == 2π to ~7e-15.
+    private const float TwoPiA = 6.28125f;
+    private const float TwoPiB = 0.0019350051879882812f;
+    private const float TwoPiC = 3.019916050561733e-07f;
+    // 1.5 * 2^23: adding it to |v| < 2^22 rounds v to the nearest integer (ties to even).
+    private const float RoundMagicF = 12582912f;
+    private const float MinNormalF = 1.17549435e-38f;
+    private const double MinNormalD = 2.2250738585072014e-308;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VFloat Sqrt(VFloat x) => new(Vector.SquareRoot(x.V));
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VFloat Abs(VFloat x) => new(Vector.Abs(x.V));
@@ -53,35 +65,67 @@ public static class VectorMath
     public static VFloat Rsqrt(VFloat x) => VFloat.One / Sqrt(x);
 
     /// <summary>
-    /// Per-lane floor. Correct for |x| &lt; 2^31.
+    /// Per-lane floor (hardware <c>roundps</c>/<c>frintm</c>). Exact for every input, including
+    /// values beyond the int range, infinities and NaN.
     /// </summary>
-    public static VFloat Floor(VFloat x)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VFloat Floor(VFloat x) => new(Vector.Floor(x.V));
+
+    /// <summary>
+    /// Per-lane round to nearest, ties to even: the same result as <see cref="MathF.Round(float)"/>
+    /// (2.5 → 2, 3.5 → 4), which is what a plain <c>MathF.Round(x)</c> in a [Spmd] kernel lowers
+    /// to. Exact for every input. <see cref="Round(VFloat)"/> is the ties-away-from-zero variant.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VFloat RoundToEven(VFloat x)
     {
-        var truncated = VInt.FromFloatTruncate(x).ToFloat();          // rounds toward zero
-        var needsFix = truncated > x;                                  // negative non-integers
-        return VFloat.Select(needsFix, truncated - VFloat.One, truncated);
+        // Adding and subtracting ±2^23 snaps |x| < 2^23 onto the integer grid in the FPU's own
+        // round-to-nearest-even mode. The sign is OR-ed back so -0.4 rounds to -0, like MathF.
+        var sign = Vector.AsVectorInt32(x.V) & new Vector<int>(int.MinValue);
+        var magic = Vector.AsVectorSingle(sign | new Vector<int>(0x4B000000));   // ±2^23
+        var r = Vector.AsVectorSingle(Vector.AsVectorInt32(x.V + magic - magic) | sign);
+        // |x| >= 2^23 is already integral (and NaN compares false): pass those through.
+        var small = Vector.LessThan(Vector.Abs(x.V), new Vector<float>(8388608f));
+        return new VFloat(Vector.ConditionalSelect(small, r, x.V));
     }
 
     /// <summary>
-    /// Per-lane round-to-nearest (half away from zero). Correct for |x| &lt; 2^31.
+    /// Per-lane round to nearest, ties away from zero (2.5 → 3, -2.5 → -3): the same result as
+    /// <c>MathF.Round(x, MidpointRounding.AwayFromZero)</c>. Exact for every input. Note that a
+    /// plain <c>MathF.Round(x)</c> rounds ties to even instead: see <see cref="RoundToEven(VFloat)"/>.
     /// </summary>
     public static VFloat Round(VFloat x)
     {
-        var half = new VFloat(0.5f);
-        var sign = VFloat.Select(x < VFloat.Zero, new VFloat(-1f), VFloat.One);
-        return VInt.FromFloatTruncate(x + (sign * half)).ToFloat();
+        var a = Abs(x);
+        var t = Floor(a);
+        var r = t + VFloat.Select((a - t) >= new VFloat(0.5f), VFloat.One, VFloat.Zero);
+        var sign = Vector.AsVectorInt32(x.V) & new Vector<int>(int.MinValue);
+        return new VFloat(Vector.AsVectorSingle(Vector.AsVectorInt32(r.V) | sign));
     }
 
     /// <summary>
-    /// Per-lane e^x. Range-reduced (x = k*ln2 + r) + degree-5 polynomial + exponent bit assembly.
-    /// Accurate to ~1-2 ulp for x in [-87, 88]; clamps outside to avoid Inf/denormal bit tricks.
+    /// Per-lane e^x over the whole float range: range-reduced (x = k*ln2 + r, split-constant
+    /// subtraction) + degree-5 polynomial + exponent bit assembly, ~2e-6 relative. Like
+    /// <see cref="MathF.Exp(float)"/> it overflows to +Inf (x &gt; 88.72), underflows through the
+    /// denormals to 0 (x &lt; -103.97), and returns NaN for NaN.
     /// </summary>
+    // Inlined into the caller's loop on purpose: out of line, every gang pays a call with the
+    // vector passed through memory and reloads all of the constants below.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VFloat Exp(VFloat x)
     {
-        x = Clamp(x, new VFloat(-87.0f), new VFloat(88.0f));
+        // Beyond these the result is already +Inf / 0; clamping keeps k inside the range the
+        // two-step scaling below can represent, and turns ±Inf into ordinary lanes.
+        var xc = Clamp(x, new VFloat(-104.0f), new VFloat(89.0f));
 
-        var k = Round(x * new VFloat(Log2E));                 // nearest integer multiple of ln2
-        var r = x - (k * new VFloat(Ln2));                      // r in [-ln2/2, ln2/2]
+        // k = round(x * log2e) without a float→int→float round trip: adding 1.5*2^23 lands in
+        // [2^23, 2^24) where the spacing is 1, so the FPU rounds to an integer for us.
+        var t = (xc * new VFloat(Log2E)) + new VFloat(RoundMagicF);
+        var k = t - new VFloat(RoundMagicF);
+        // r = x - k*ln2 with ln2 split in two (Cody–Waite): k*Ln2Hi is exact, so r keeps its
+        // precision at large |x| instead of losing the low bits of the product.
+        var r = VFloat.MulAdd(k, new VFloat(-Ln2Hi), xc);
+        r = VFloat.MulAdd(k, new VFloat(-Ln2Lo), r);               // r in [-ln2/2, ln2/2]
 
         // exp(r) ≈ 1 + r + r²/2! + r³/3! + r⁴/4! + r⁵/5!
         var r2 = r * r;
@@ -91,18 +135,25 @@ public static class VectorMath
         p = VFloat.MulAdd(p, r, new VFloat(0.5f));
         p = VFloat.MulAdd(p, r2, r + VFloat.One);
 
-        // 2^k via IEEE754 bits: ((k + 127) << 23), shift done as integer multiply.
-        var ki = VInt.FromFloatTruncate(k);
-        var bits = (ki + 127) * MantissaShift;
-        var scale = new VFloat(Vector.AsVectorSingle(bits.V));
+        // 2^k as 2^k1 * 2^k2 (k1 + k2 = k): one factor cannot hold 2^128 (the exponent field
+        // would read as Inf even where the result is still finite) or anything below 2^-126.
+        // kb = k + 2*127 is positive, so the halves are valid biased exponents as they stand.
+        var kb = VInt.FromFloatTruncate(k) + 254;
+        var k1 = kb >> 1;
+        var k2 = kb - k1;
+        var result = p * (k1 << 23).AsFloat() * (k2 << 23).AsFloat();
 
-        return p * scale;
+        return VFloat.Select(VFloat.Eq(x, x), result, x);           // NaN in, NaN out
     }
 
     /// <summary>
-    /// Per-lane natural log. Valid for x &gt; 0 (lanes &lt;= 0 produce garbage, mask them).
-    /// Mantissa/exponent split via IEEE754 bits + atanh-form polynomial; ~2 ulp.
+    /// Per-lane natural log, ~2 ulp. Mantissa/exponent split via IEEE754 bits + atanh-form
+    /// polynomial. Matches <see cref="MathF.Log(float)"/> on the edges too: log(0) = -Inf,
+    /// log(negative) = NaN, log(+Inf) = +Inf, log(NaN) = NaN, and denormals are exact.
     /// </summary>
+    // Inlined into the caller's loop on purpose: out of line, every gang pays a call with the
+    // vector passed through memory and reloads all of the constants below.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VFloat Log(VFloat x)
     {
         var bits = new VInt(Vector.AsVectorInt32(x.V));
@@ -130,25 +181,111 @@ public static class VectorMath
         p = VFloat.MulAdd(p, t2, new VFloat(2.0f));
         var logM = p * t;
 
-        return (ef * new VFloat(Ln2)) + logM;
+        var r = (ef * new VFloat(Ln2)) + logM;
+
+        // The bit tricks above only hold for positive normal finite x: bit patterns
+        // 0x00800000..0x7F7FFFFF. That is every lane of almost every gang, so it is one add and
+        // one signed compare (adding 0x7F800000 maps exactly that range onto the bottom of the
+        // int range); anything else is patched up out of line.
+        if (Vector.LessThanAll(bits.V + new Vector<int>(0x7F800000), new Vector<int>(unchecked((int)0xFF000000))))
+            return r;
+
+        return LogSpecialLanes(x, r);
     }
 
     /// <summary>
-    /// Per-lane x^y for x &gt; 0 (uses exp(y*log(x))).
+    /// The IEEE results for the inputs the bit-level log cannot handle: +Inf and NaN pass
+    /// through, 0 → -Inf, negatives → NaN, and denormals (no implicit leading 1, so the
+    /// mantissa split is wrong) are recomputed per lane. Ordinary lanes keep <paramref name="r"/>.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static VFloat Pow(VFloat x, VFloat y) => Exp(y * Log(x));
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VFloat LogSpecialLanes(VFloat x, VFloat r)
+    {
+        r = VFloat.Select(x < new VFloat(float.PositiveInfinity), r, x);          // +Inf, NaN
+        var positive = x > VFloat.Zero;
+        var nonPositive = VFloat.Select(VFloat.Eq(x, VFloat.Zero), new VFloat(float.NegativeInfinity), new VFloat(float.NaN));
+        r = VFloat.Select(positive, r, nonPositive);                               // 0, negatives
+
+        var denormal = positive & (x < new VFloat(MinNormalF));
+        if (!denormal.Any())
+            return r;
+
+        Span<float> xs = stackalloc float[VFloat.LaneCount];
+        Span<float> rs = stackalloc float[VFloat.LaneCount];
+        x.V.CopyTo(xs);
+        r.V.CopyTo(rs);
+        for (ulong b = denormal.ToBitmask(); b != 0; b &= b - 1)
+        {
+            int l = BitOperations.TrailingZeroCount(b);
+            rs[l] = MathF.Log(xs[l]);
+        }
+
+        return VFloat.Load(rs);
+    }
 
     /// <summary>
-    /// Per-lane sine. Range-reduced to [-π/2, π/2] then degree-9 minimax polynomial; ~1e-6 abs error.
+    /// Per-lane x^y (exp(y*log|x|) with the sign and edge cases of <see cref="MathF.Pow(float, float)"/>):
+    /// a negative base works for integer exponents (<c>Pow(-2, 2) = 4</c>, <c>Pow(-2, 3) = -8</c>)
+    /// and is NaN otherwise; <c>Pow(x, 0) = 1</c>; <c>Pow(0, y)</c> is 0 or +Inf by the sign of y.
     /// </summary>
-    public static VFloat Sin(VFloat x)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VFloat Pow(VFloat x, VFloat y)
     {
-        // Reduce to [-π, π]: x -= 2π * round(x / 2π)
-        var k = Round(x * new VFloat(InvTwoPi));
-        var r = x - (k * new VFloat(TwoPi));
+        var r = Exp(y * Log(Abs(x)));
 
-        // Further reduce to [-π/2, π/2] for polynomial accuracy.
+        // Negative base: defined only for integer y, negative when that integer is odd.
+        // (Every float >= 2^24 is an even integer, which is what the halving test reports.)
+        var negative = x < VFloat.Zero;
+        var yIsInt = VFloat.Eq(Floor(y), y);
+        var halfY = Floor(y * new VFloat(0.5f));
+        var yIsOdd = yIsInt & VFloat.Neq(halfY + halfY, y);
+        r = VFloat.Select(negative & yIsOdd, -r, r);
+        r = VFloat.Select(VMask.AndNot(negative, yIsInt), new VFloat(float.NaN), r);
+        // x^0 is 1 for every x (the log route gives 0 * -Inf = NaN at x = 0).
+        return VFloat.Select(VFloat.Eq(y, VFloat.Zero), VFloat.One, r);
+    }
+
+    /// <summary>
+    /// Per-lane sine. Reduced to [-π/2, π/2] (split-constant 2π subtraction, so accuracy holds
+    /// for large arguments) then a degree-9 minimax polynomial; ~3e-6 abs error for |x| up to
+    /// ~1e7 with hardware FMA (~1e5 without). Beyond that a float's spacing approaches the
+    /// period and the result is meaningless.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VFloat Sin(VFloat x) => SinReduced(ReduceTwoPi(x));
+
+    /// <summary>
+    /// Per-lane cosine: sin(r + π/2), with the quarter turn added <i>after</i> range reduction
+    /// so large arguments keep their precision.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VFloat Cos(VFloat x)
+    {
+        var r = ReduceTwoPi(x) + new VFloat(Pi * 0.5f);             // [-π/2, 3π/2]
+        var wrapped = r - new VFloat(TwoPi);
+        return SinReduced(VFloat.Select(r > new VFloat(Pi), wrapped, r));
+    }
+
+    /// <summary>
+    /// x - 2π*round(x / 2π), in [-π, π]. 2π is subtracted in three parts whose products with k
+    /// are exact, so the cancellation against x keeps the digits that matter once |x| is large
+    /// (a single rounded k*2π loses them: sin(1000) was off by 1e-5, sin(1e6) by 0.02).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static VFloat ReduceTwoPi(VFloat x)
+    {
+        var t = (x * new VFloat(InvTwoPi)) + new VFloat(RoundMagicF);   // round via 1.5*2^23
+        var k = t - new VFloat(RoundMagicF);
+        var r = VFloat.MulAdd(k, new VFloat(-TwoPiA), x);
+        r = VFloat.MulAdd(k, new VFloat(-TwoPiB), r);
+        return VFloat.MulAdd(k, new VFloat(-TwoPiC), r);
+    }
+
+    /// <summary>sin(r) for r already in [-π, π].</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static VFloat SinReduced(VFloat r)
+    {
+        // Fold to [-π/2, π/2] for polynomial accuracy.
         //   sin(r) = sin(π - r)   for r in [π/2, π]
         //   sin(r) = sin(-π - r)  for r in [-π, -π/2]
         var pi = new VFloat(Pi);
@@ -166,12 +303,6 @@ public static class VectorMath
         p = VFloat.MulAdd(p, r2, new VFloat(-1.6666568e-1f)); // ~ -x³/3!
         return VFloat.MulAdd(p * r2, r, r);
     }
-
-    /// <summary>
-    /// Per-lane cosine (sin(x + π/2)).
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static VFloat Cos(VFloat x) => Sin(x + new VFloat(Pi * 0.5f));
 
     /// <summary>
     /// Per-lane tangent (sin/cos, loses accuracy near odd multiples of π/2).
@@ -296,9 +427,6 @@ public static class VectorMath
     private const double TwoPiLoD = 2.43084020260247689973e-10;
     private const double InvTwoPiD = 0.15915494309189533577;
 
-    // (x << 52) == x * 2^52 for long lanes, double's exponent-field shift.
-    private const long MantissaShiftD = 1L << 52;
-
     // "Magic number" for branchless double→integer rounding. Adding 2^52+2^51 to a double
     // (|value| < 2^51) snaps it onto integer boundaries, the FPU does round-to-nearest-even —
     // and the low mantissa bits then hold the integer. This lets the double transcendentals
@@ -332,37 +460,57 @@ public static class VectorMath
     public static VDouble Rsqrt(VDouble x) => VDouble.One / Sqrt(x);
 
     /// <summary>
-    /// Per-lane floor. Correct for |x| &lt; 2^52.
+    /// Per-lane floor (hardware <c>roundpd</c>/<c>frintm</c>). Exact for every input.
     /// </summary>
-    public static VDouble Floor(VDouble x)
-    {
-        var truncated = new VDouble(Vector.ConvertToDouble(Vector.ConvertToInt64(x.V))); // rounds toward zero
-        var needsFix = truncated > x;                                                     // negative non-integers
-        return VDouble.Select(needsFix, truncated - VDouble.One, truncated);
-    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VDouble Floor(VDouble x) => new(Vector.Floor(x.V));
 
     /// <summary>
-    /// Per-lane truncation toward zero. Correct for |x| &lt; 2^52. This is what
+    /// Per-lane truncation toward zero, exact for every input. This is what
     /// <c>(int)</c>/<c>(long)</c> casts lower to in double [Spmd] kernels.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VDouble Truncate(VDouble x)
-        => new(Vector.ConvertToDouble(Vector.ConvertToInt64(x.V)));
+        // Two hardware rounds and a blend — no double↔int64 conversion, which has no encoding
+        // before AVX-512DQ and used to run per lane.
+        => new(Vector.ConditionalSelect(Vector.LessThan(x.V, Vector<double>.Zero), Vector.Ceiling(x.V), Vector.Floor(x.V)));
 
     /// <summary>
-    /// Per-lane round-to-nearest (half away from zero). Correct for |x| &lt; 2^52.
+    /// Per-lane round to nearest, ties to even: the same result as <see cref="Math.Round(double)"/>
+    /// (2.5 → 2, 3.5 → 4), which is what a plain <c>Math.Round(x)</c> in a [Spmd] kernel lowers to.
+    /// Exact for every input. <see cref="Round(VDouble)"/> is the ties-away-from-zero variant.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static VDouble RoundToEven(VDouble x)
+    {
+        // ±2^52 add/subtract snaps |x| < 2^52 onto the integer grid (round-to-nearest-even);
+        // the sign is OR-ed back so -0.4 rounds to -0, like Math.Round.
+        var sign = Vector.AsVectorInt64(x.V) & new Vector<long>(long.MinValue);
+        var magic = Vector.AsVectorDouble(sign | new Vector<long>(0x4330000000000000L));   // ±2^52
+        var r = Vector.AsVectorDouble(Vector.AsVectorInt64(x.V + magic - magic) | sign);
+        var small = Vector.LessThan(Vector.Abs(x.V), new Vector<double>(4503599627370496.0));
+        return new VDouble(Vector.ConditionalSelect(small, r, x.V));
+    }
+
+    /// <summary>
+    /// Per-lane round to nearest, ties away from zero (2.5 → 3, -2.5 → -3): the same result as
+    /// <c>Math.Round(x, MidpointRounding.AwayFromZero)</c>. Exact for every input. Note that a
+    /// plain <c>Math.Round(x)</c> rounds ties to even instead: see <see cref="RoundToEven(VDouble)"/>.
     /// </summary>
     public static VDouble Round(VDouble x)
     {
-        var half = new VDouble(0.5);
-        var sign = VDouble.Select(x < VDouble.Zero, new VDouble(-1d), VDouble.One);
-        return new VDouble(Vector.ConvertToDouble(Vector.ConvertToInt64((x + (sign * half)).V)));
+        var a = Abs(x);
+        var t = Floor(a);
+        var r = t + VDouble.Select((a - t) >= new VDouble(0.5), VDouble.One, VDouble.Zero);
+        var sign = Vector.AsVectorInt64(x.V) & new Vector<long>(long.MinValue);
+        return new VDouble(Vector.AsVectorDouble(Vector.AsVectorInt64(r.V) | sign));
     }
 
     /// <summary>
     /// Per-lane e^x. Range-reduced (x = k*ln2 + r, split-constant subtraction) + a divide-free
     /// degree-11 Taylor polynomial for exp(r) + exponent bit assembly. Accurate to ~1e-14 relative
-    /// (a few ulp) for x in [-708, 709]; clamps outside to avoid Inf/denormal bit tricks.
+    /// (a few ulp) over the whole double range: like <see cref="Math.Exp(double)"/> it overflows
+    /// to +Inf (x &gt; 709.78), underflows through the denormals to 0, and returns NaN for NaN.
     ///
     /// The reduced-argument evaluation is a polynomial, not a Cephes P/Q rational: the rational
     /// form needed a vector divide (the slowest lane op, and only 2-4 lanes wide for doubles),
@@ -372,9 +520,15 @@ public static class VectorMath
     /// Degree 11 (not 13) is the throughput sweet spot: it holds ~1e-14 relative here (well inside
     /// the 1e-13 double contract) while the two extra terms of degree 13 only cost FMA throughput.
     /// </summary>
+    // Inlined into the caller's loop on purpose: out of line, every gang pays a call with the
+    // vector passed through memory and reloads all of the constants below.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VDouble Exp(VDouble x)
     {
-        x = Clamp(x, new VDouble(-708.0), new VDouble(709.0));
+        // Beyond these the result is already +Inf / 0; clamping keeps k inside the range the
+        // two-step scaling below can represent, and turns ±Inf into ordinary lanes.
+        var x0 = x;
+        x = Clamp(x, new VDouble(-746.0), new VDouble(710.0));
 
         // k = round(x·log2e), as BOTH a double (for the reduced argument r) and an int64 (for
         // 2^k), via the magic constant, no double↔int64 conversion. Round-to-nearest-even here
@@ -382,7 +536,8 @@ public static class VectorMath
         // gives the identical result, and r stays inside [-ln2/2, ln2/2].
         var t = (x * new VDouble(Log2ED)) + new VDouble(RoundMagicD);
         var k = t - new VDouble(RoundMagicD);
-        var ki = Vector.AsVectorInt64(t.V) - RoundMagicBits + new Vector<long>(1023L);
+        // kb = k + 2*1023: positive, so its two halves are valid biased exponents as they stand.
+        var kb = Vector.AsVectorInt64(t.V) - RoundMagicBits + new Vector<long>(2046L);
         var r = x - (k * new VDouble(LnTwoHiD)) - (k * new VDouble(LnTwoLoD)); // r in [-ln2/2, ln2/2]
 
         // exp(r) = Σ r^n/n! to degree 11 (truncation ~6e-15 over |r| <= ln2/2, well under the
@@ -402,33 +557,33 @@ public static class VectorMath
         pe = VDouble.MulAdd(pe, r2, VDouble.One);                     // 1/0!
         var expR = VDouble.MulAdd(r, po, pe);                         // even(r²) + r·odd(r²)
 
-        // 2^k via IEEE754 bits: (k + 1023) << 52.
-#if NET8_0_OR_GREATER
-        // A real vector shift (vpsllq), one instruction on any AVX2+.
-        var bits = Vector.ShiftLeft(ki, 52);
-#else
-        var bits = ki * MantissaShiftD;
-#endif
-        var scale = new VDouble(Vector.AsVectorDouble(bits));
+        // 2^k as 2^k1 * 2^k2 (k1 + k2 = k): one factor cannot hold 2^1024 (the exponent field
+        // would read as Inf even where the result is still finite) or anything below 2^-1022.
+        // Logical shifts only (vpsrlq/vpsllq) — AVX2 has no 64-bit arithmetic shift.
+        var k1 = Vector.AsVectorInt64(Vector.ShiftRightLogical(Vector.AsVectorUInt64(kb), 1));
+        var k2 = kb - k1;
+        var s1 = new VDouble(Vector.AsVectorDouble(Vector.ShiftLeft(k1, 52)));
+        var s2 = new VDouble(Vector.AsVectorDouble(Vector.ShiftLeft(k2, 52)));
+        var result = expR * s1 * s2;
 
-        return expR * scale;
+        return VDouble.Select(VDouble.Eq(x0, x0), result, x0);        // NaN in, NaN out
     }
 
     /// <summary>
-    /// Per-lane natural log. Valid for x &gt; 0 (lanes &lt;= 0 produce garbage, mask them).
-    /// Mantissa/exponent split via IEEE754 bits + atanh-form polynomial; ~1-2 ulp.
+    /// Per-lane natural log, ~1-2 ulp. Mantissa/exponent split via IEEE754 bits + atanh-form
+    /// polynomial. Matches <see cref="Math.Log(double)"/> on the edges too: log(0) = -Inf,
+    /// log(negative) = NaN, log(+Inf) = +Inf, log(NaN) = NaN, and denormals are exact.
     /// </summary>
+    // Inlined into the caller's loop on purpose: out of line, every gang pays a call with the
+    // vector passed through memory and reloads all of the constants below.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VDouble Log(VDouble x)
     {
         var bits = Vector.AsVectorInt64(x.V);
 
         // exponent = (bits >> 52) - 1023 (bits are positive for x > 0, so a logical shift —
         // vpsrlq, one AVX2 instruction, replaces the former per-lane scalar 64-bit divide).
-#if NET8_0_OR_GREATER
         var e = Vector.AsVectorInt64(Vector.ShiftRightLogical(Vector.AsVectorUInt64(bits), 52)) - new Vector<long>(1023L);
-#else
-        var e = Divide(bits, MantissaShiftD) - new Vector<long>(1023L);
-#endif
 
         // mantissa in [1, 2): keep fraction bits, force exponent to 0 (0x3FF00000_00000000)
         var mBits = (bits & new Vector<long>(0x000FFFFFFFFFFFFFL)) | new Vector<long>(0x3FF0000000000000L);
@@ -459,19 +614,66 @@ public static class VectorMath
         var logM = p * t;
 
         // e*ln2 with the split constant so the product doesn't erode logM's precision.
-        return VDouble.MulAdd(ef, new VDouble(LnTwoHiD), VDouble.MulAdd(ef, new VDouble(LnTwoLoD), logM));
+        var r = VDouble.MulAdd(ef, new VDouble(LnTwoHiD), VDouble.MulAdd(ef, new VDouble(LnTwoLoD), logM));
+
+        // Positive normal finite lanes (bit patterns 0x0010…0 .. 0x7FEF…F) are done; anything
+        // else is patched up out of line (see the float overload for the one-compare test).
+        if (Vector.LessThanAll(bits + new Vector<long>(0x7FF0000000000000L), new Vector<long>(unchecked((long)0xFFE0000000000000UL))))
+            return r;
+
+        return LogSpecialLanes(x, r);
+    }
+
+    /// <inheritdoc cref="LogSpecialLanes(VFloat, VFloat)"/>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static VDouble LogSpecialLanes(VDouble x, VDouble r)
+    {
+        r = VDouble.Select(x < new VDouble(double.PositiveInfinity), r, x);       // +Inf, NaN
+        var positive = x > VDouble.Zero;
+        var nonPositive = VDouble.Select(VDouble.Eq(x, VDouble.Zero), new VDouble(double.NegativeInfinity), new VDouble(double.NaN));
+        r = VDouble.Select(positive, r, nonPositive);                              // 0, negatives
+
+        var denormal = positive & (x < new VDouble(MinNormalD));
+        if (!denormal.Any())
+            return r;
+
+        Span<double> xs = stackalloc double[VDouble.LaneCount];
+        Span<double> rs = stackalloc double[VDouble.LaneCount];
+        x.V.CopyTo(xs);
+        r.V.CopyTo(rs);
+        for (ulong b = denormal.ToBitmask(); b != 0; b &= b - 1)
+        {
+            int l = BitOperations.TrailingZeroCount(b);
+            rs[l] = Math.Log(xs[l]);
+        }
+
+        return VDouble.Load(rs);
     }
 
     /// <summary>
-    /// Per-lane x^y for x &gt; 0 (uses exp(y*log(x))).
+    /// Per-lane x^y (exp(y*log|x|) with the sign and edge cases of <see cref="Math.Pow(double, double)"/>):
+    /// a negative base works for integer exponents and is NaN otherwise; <c>Pow(x, 0) = 1</c>;
+    /// <c>Pow(0, y)</c> is 0 or +Inf by the sign of y.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static VDouble Pow(VDouble x, VDouble y) => Exp(y * Log(x));
+    public static VDouble Pow(VDouble x, VDouble y)
+    {
+        var r = Exp(y * Log(Abs(x)));
+
+        var negative = x < VDouble.Zero;
+        var yIsInt = VDouble.Eq(Floor(y), y);
+        var halfY = Floor(y * new VDouble(0.5));
+        var yIsOdd = yIsInt & VDouble.Neq(halfY + halfY, y);
+        r = VDouble.Select(negative & yIsOdd, -r, r);
+        r = VDouble.Select(VMaskD.AndNot(negative, yIsInt), new VDouble(double.NaN), r);
+        return VDouble.Select(VDouble.Eq(y, VDouble.Zero), VDouble.One, r);
+    }
 
     /// <summary>
     /// Per-lane sine. Range-reduced to [-π/2, π/2] (split-constant 2π subtraction, exact
     /// for |x| &lt; ~6e6) then degree-19 polynomial; ~1e-15 abs error over that range.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static VDouble Sin(VDouble x)
     {
         // Reduce to [-π, π]: x -= 2π * round(x / 2π), with 2π split so k*hi stays exact.
@@ -623,15 +825,6 @@ public static class VectorMath
         return VDouble.Select(VDouble.Eq(m, VDouble.Zero), VDouble.Zero, r);
     }
 
-    // Portable per-lane long divide (Vector<long> has no division or shift op on netstandard2.1).
-    private static Vector<long> Divide(Vector<long> a, long divisor)
-    {
-        Span<long> tmp = stackalloc long[Vector<long>.Count];
-        for (int l = 0; l < Vector<long>.Count; l++)
-            tmp[l] = a[l] / divisor;
-        return new Vector<long>(tmp);
-    }
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VDouble2 Sqrt(VDouble2 x) => new(Sqrt(x.Lower), Sqrt(x.Upper));
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VDouble2 Abs(VDouble2 x) => new(Abs(x.Lower), Abs(x.Upper));
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VDouble2 Min(VDouble2 a, VDouble2 b) => new(Min(a.Lower, b.Lower), Min(a.Upper, b.Upper));
@@ -642,6 +835,7 @@ public static class VectorMath
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VDouble2 Rsqrt(VDouble2 x) => new(Rsqrt(x.Lower), Rsqrt(x.Upper));
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VDouble2 Floor(VDouble2 x) => new(Floor(x.Lower), Floor(x.Upper));
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VDouble2 Round(VDouble2 x) => new(Round(x.Lower), Round(x.Upper));
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VDouble2 RoundToEven(VDouble2 x) => new(RoundToEven(x.Lower), RoundToEven(x.Upper));
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VDouble2 Truncate(VDouble2 x) => new(Truncate(x.Lower), Truncate(x.Upper));
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VDouble2 Exp(VDouble2 x) => new(Exp(x.Lower), Exp(x.Upper));
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static VDouble2 Log(VDouble2 x) => new(Log(x.Lower), Log(x.Upper));

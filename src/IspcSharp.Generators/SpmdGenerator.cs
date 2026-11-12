@@ -533,6 +533,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         string vectorBody = emitter.EmitStatements(body, maskExpr: null, indent: "            ");
         foreach (var diag in emitter.Diagnostics)
             report(diag);
+        string? peelBuffer = emitter.StreamingTarget;
 
         // Per-lane 'return' retires one element. In the scalar tail that must advance to
         // the NEXT element (not exit the method), so bare returns become 'goto __tail_next;'
@@ -569,6 +570,10 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         _ = src.AppendLine("{");
 
         _ = src.AppendLine($"    /// <summary>Vectorized version of <see cref=\"{name}\"/> (generated).</summary>");
+        // The kernel stays its own JIT root. Inlined into a caller it shares that caller's
+        // inlining budget, and once the budget runs out the lane operators inside the hot loop
+        // are left as real calls (vectors passed through memory): several times slower.
+        _ = src.AppendLine("    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]");
         _ = src.AppendLine($"    public static {returnType} {name}_Simd({paramDecl})");
         _ = src.AppendLine("    {");
         EmitFlatSpanSetup(src, "        ", paramInfos, structMap);
@@ -577,7 +582,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
             // Scaffold: emit the whole method body, uniform statements verbatim, with the
             // one Spmd.Range loop replaced by its vectorized SIMD loop + scalar tail.
             var ctx = new ScaffoldContext(fe, loopVar, startExpr, endExpr,
-                vectorBody, scalarBody, reductions, laneCountExpr, doubleMode, longMode, unroll, hasLaneReturns);
+                vectorBody, scalarBody, reductions, laneCountExpr, doubleMode, longMode, unroll, hasLaneReturns, peelBuffer);
             EmitScaffold(src, method.Body.Statements, "        ", ctx);
         }
         else
@@ -601,7 +606,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 _ = src.AppendLine("                for (int __y = __ty; __y < __yEnd; __y++)");
                 _ = src.AppendLine("                {");
                 _ = src.AppendLine($"                    int {rowVar} = __y;");
-                EmitLoopCore(src, "                    ", "__tx", "__xEnd", loopVar, vectorBody, scalarBody, reductions, laneCountExpr, doubleMode, longMode, unroll: unroll, hasLaneReturns: hasLaneReturns);
+                EmitLoopCore(src, "                    ", "__tx", "__xEnd", loopVar, vectorBody, scalarBody, reductions, laneCountExpr, doubleMode, longMode, unroll: unroll, hasLaneReturns: hasLaneReturns, peelBuffer: peelBuffer);
                 _ = src.AppendLine("                }");
                 _ = src.AppendLine("            }");
                 _ = src.AppendLine("        }");
@@ -613,12 +618,12 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 _ = src.AppendLine("        for (int __y = 0; __y < __height; __y++)");
                 _ = src.AppendLine("        {");
                 _ = src.AppendLine($"            int {rowVar} = __y;");
-                EmitLoopCore(src, "            ", "0", "__width", loopVar, vectorBody, scalarBody, reductions, laneCountExpr, doubleMode, longMode, unroll: unroll, hasLaneReturns: hasLaneReturns);
+                EmitLoopCore(src, "            ", "0", "__width", loopVar, vectorBody, scalarBody, reductions, laneCountExpr, doubleMode, longMode, unroll: unroll, hasLaneReturns: hasLaneReturns, peelBuffer: peelBuffer);
                 _ = src.AppendLine("        }");
             }
             else
             {
-                EmitLoopCore(src, "        ", startExpr, endExpr, loopVar, vectorBody, scalarBody, reductions, laneCountExpr, doubleMode, longMode, unroll: unroll, hasLaneReturns: hasLaneReturns);
+                EmitLoopCore(src, "        ", startExpr, endExpr, loopVar, vectorBody, scalarBody, reductions, laneCountExpr, doubleMode, longMode, unroll: unroll, hasLaneReturns: hasLaneReturns, peelBuffer: peelBuffer);
             }
 
             foreach (var st in post)
@@ -695,7 +700,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 _ = src.AppendLine("            {");
                 _ = src.AppendLine($"                int {rowVar} = __y;");
                 EmitLoopCore(src, "                ", "__tx", "__xEnd", loopVar, vectorBody, scalarBodyParallel,
-                    reductions, laneCountExpr, doubleMode, longMode, unroll: unroll, redTargetPrefix: "__loc_", hasLaneReturns: hasLaneReturns);
+                    reductions, laneCountExpr, doubleMode, longMode, unroll: unroll, redTargetPrefix: "__loc_", hasLaneReturns: hasLaneReturns, peelBuffer: peelBuffer);
                 _ = src.AppendLine("            }");
                 foreach (var r in reductions)
                     _ = src.AppendLine($"            __part_{r.Name}[__t] = __loc_{r.Name};");
@@ -721,7 +726,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 foreach (var r in reductions)
                     _ = src.AppendLine($"            {ScalarType(r)} __loc_{r.Name} = {ScalarIdentity(r)};");
                 EmitLoopCore(src, "            ", "0", "__width0", loopVar, vectorBody, scalarBodyParallel,
-                    reductions, laneCountExpr, doubleMode, longMode, unroll: unroll, redTargetPrefix: "__loc_", hasLaneReturns: hasLaneReturns);
+                    reductions, laneCountExpr, doubleMode, longMode, unroll: unroll, redTargetPrefix: "__loc_", hasLaneReturns: hasLaneReturns, peelBuffer: peelBuffer);
                 foreach (var r in reductions)
                     _ = src.AppendLine($"            __part_{r.Name}[__y] = __loc_{r.Name};");
                 _ = src.AppendLine("        });");
@@ -749,7 +754,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
                 foreach (var r in reductions)
                     _ = src.AppendLine($"            {ScalarType(r)} __loc_{r.Name} = {ScalarIdentity(r)};");
                 EmitLoopCore(src, "            ", "__cs", "__ce", loopVar, vectorBody, scalarBodyParallel,
-                    reductions, laneCountExpr, doubleMode, longMode, unroll: unroll, redTargetPrefix: "__loc_", hasLaneReturns: hasLaneReturns);
+                    reductions, laneCountExpr, doubleMode, longMode, unroll: unroll, redTargetPrefix: "__loc_", hasLaneReturns: hasLaneReturns, peelBuffer: peelBuffer);
                 foreach (var r in reductions)
                     _ = src.AppendLine($"            __part_{r.Name}[__c] = __loc_{r.Name};");
                 _ = src.AppendLine("        });");
@@ -776,7 +781,8 @@ public sealed class SpmdGenerator : IIncrementalGenerator
 
     private static void EmitLoopCore(StringBuilder src, string ind, string startExpr, string endExpr,
         string loopVar, string vectorBody, string scalarBody, List<ReductionInfo> reductions,
-        string laneCountExpr, bool doubleMode, bool longMode, int unroll = 1, string redTargetPrefix = "", bool hasLaneReturns = false)
+        string laneCountExpr, bool doubleMode, bool longMode, int unroll = 1, string redTargetPrefix = "", bool hasLaneReturns = false,
+        string? peelBuffer = null)
     {
         // The body strings are generated at a fixed base indent; each append below re-indents them to
         // one level under the enclosing brace at this loop's actual nesting depth (so braces line up).
@@ -786,6 +792,21 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         _ = src.AppendLine($"{ind}int __end = {endExpr};");
         _ = src.AppendLine($"{ind}int __w = {laneCountExpr};");
         _ = src.AppendLine($"{ind}int __i = __start;");
+
+        if (peelBuffer != null)
+        {
+            // Streaming: a non-temporal store only happens on a vector-aligned address, and an
+            // array's first element rarely sits on one. Run the original scalar body up to the
+            // first aligned element so every gang after it can stream.
+            _ = src.AppendLine($"{ind}// Alignment peel for the non-temporal stores to '{peelBuffer}'.");
+            _ = src.AppendLine($"{ind}for (int __peelEnd = __i + Memory.StreamingPeel({peelBuffer}, __i, __end - __i); __i < __peelEnd; __i++)");
+            _ = src.AppendLine($"{ind}{{");
+            _ = src.AppendLine($"{ind}    int {loopVar} = __i;");
+            _ = src.Append(Reindent(scalarBody.Replace("__tail_next", "__peel_next"), bodyIndent));
+            if (hasLaneReturns)
+                _ = src.AppendLine($"{ind}    __peel_next: ;");
+            _ = src.AppendLine($"{ind}}}");
+        }
 
         if (unroll > 1 && reductions.Count > 0)
         {
@@ -1628,7 +1649,7 @@ public sealed class SpmdGenerator : IIncrementalGenerator
         if (st == ctx.Fe)
         {
             EmitLoopCore(src, indent, ctx.StartExpr, ctx.EndExpr, ctx.LoopVar, ctx.VectorBody,
-                ctx.ScalarBody, ctx.Reductions, ctx.LaneCountExpr, ctx.DoubleMode, ctx.LongMode, unroll: ctx.Unroll, hasLaneReturns: ctx.HasLaneReturns);
+                ctx.ScalarBody, ctx.Reductions, ctx.LaneCountExpr, ctx.DoubleMode, ctx.LongMode, unroll: ctx.Unroll, hasLaneReturns: ctx.HasLaneReturns, peelBuffer: ctx.PeelBuffer);
             return;
         }
 
