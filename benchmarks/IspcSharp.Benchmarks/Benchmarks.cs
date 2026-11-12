@@ -53,6 +53,47 @@ public static class Program
 /// </summary>
 public static partial class GeneratedKernels
 {
+
+    /// <summary>
+    /// One level of a sparse-table range-minimum build: cur[i] = min(prev[i], prev[i + half]).
+    ///
+    /// This is the RMQ formulation that fits SPMD. The textbook O(n^2) table has
+    /// <c>lookup[i, j]</c> depending on <c>lookup[i, j - 1]</c> — a loop-carried recurrence, which
+    /// no SPMD compiler can vectorize. The sparse table breaks that: within a level every element
+    /// is independent, and <paramref name="half"/> is uniform so <c>prev[i + half]</c> is an affine
+    /// index and stays a contiguous load rather than a gather. Math.Min on int lanes is pminsd.
+    /// </summary>
+    [Spmd]
+    public static void SparseTableLevel(int[] prev, int[] cur, int half, int count)
+    {
+        foreach (int i in Spmd.Range(count))
+        {
+            cur[i] = Math.Min(prev[i], prev[i + half]);
+        }
+    }
+
+    /// <summary>
+    /// Answer a batch of range-minimum queries against a built sparse table:
+    /// min(table[k][L], table[k][R - 2^k + 1]) where k = floor(log2(R - L + 1)).
+    ///
+    /// Included deliberately as the *unflattering* case. Every query reads a different row and a
+    /// different offset, so all three table reads are lane-varying — three gathers per query
+    /// (ISPC101). Queries are embarrassingly parallel, but memory latency, not arithmetic, is what
+    /// this loop is made of.
+    /// </summary>
+    [Spmd]
+    public static void RmqQueryBatch(
+        int[] table, int[] logTable, int[] ls, int[] rs, int[] output, int stride, int count)
+    {
+        foreach (int q in Spmd.Range(count))
+        {
+            int l = ls[q];
+            int r = rs[q];
+            int k = logTable[r - l + 1];
+            int span = 1 << k;
+            output[q] = Math.Min(table[(k * stride) + l], table[(k * stride) + r - span + 1]);
+        }
+    }
     /// <summary>
     /// Branchless saturate + scale, best case for SIMD.
     /// </summary>
@@ -1658,8 +1699,10 @@ public class ShortSaturateMixBench
             _output[i] = (short)Math.Clamp(_a[i] + _b[i], short.MinValue, short.MaxValue);
     }
 
+    // Hand-written against the lane type, so it is named for that (the report groups methods by
+    // name: 'Generated*' is reserved for the generated _Simd / _ParallelSimd companions).
     [Benchmark]
-    public void GeneratedSimd()
+    public void SimdVShort()
     {
         int w = VShort.LaneCount;
         int i = 0;
@@ -1668,5 +1711,158 @@ public class ShortSaturateMixBench
 
         for (; i < N; i++)
             _output[i] = (short)Math.Clamp(_a[i] + _b[i], short.MinValue, short.MaxValue);
+    }
+}
+
+
+/// <summary>
+/// Range minimum query, build phase. A sparse table is log2(n) levels, each level an
+/// elementwise min of the previous level against itself shifted by a uniform stride — the shape
+/// SPMD is built for.
+/// </summary>
+[MemoryDiagnoser]
+[SimpleJob]
+public class RmqBuildBench
+{
+    // Swept on purpose. This kernel does one Math.Min per 8 bytes of traffic, so it is
+    // compute-bound only while a level fits in cache and bandwidth-bound after that: measured
+    // 5.3x at 64 KB, 2.0x at 4 MB, 1.6x at 16 MB, and 0.2x at 16 KB where per-call overhead
+    // swamps the work. A single N would report one point on that curve as if it were the answer.
+    [Params(1 << 12, 1 << 16, 1 << 20, 1 << 22)]
+    public int N;
+
+    private int[] _values = null!;
+    private int[][] _table = null!;
+    private int _levels;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        Random rng = new Random(42);
+        _values = new int[N];
+        for (int i = 0; i < N; i++)
+            _values[i] = rng.Next();
+
+        _levels = 1;
+        while ((1 << _levels) <= N) _levels++;
+        _table = new int[_levels][];
+        for (int k = 0; k < _levels; k++)
+            _table[k] = new int[N];
+        Array.Copy(_values, _table[0], N);
+    }
+
+    [Benchmark(Baseline = true)]
+    public int Scalar()
+    {
+        for (int k = 1; k < _levels; k++)
+        {
+            int half = 1 << (k - 1);
+            int count = N - (1 << k) + 1;
+            int[] prev = _table[k - 1], cur = _table[k];
+            for (int i = 0; i < count; i++)
+                cur[i] = Math.Min(prev[i], prev[i + half]);
+        }
+
+        return _table[_levels - 1][0];
+    }
+
+    [Benchmark]
+    public int GeneratedSimd()
+    {
+        for (int k = 1; k < _levels; k++)
+            GeneratedKernels.SparseTableLevel_Simd(_table[k - 1], _table[k], 1 << (k - 1), N - (1 << k) + 1);
+        return _table[_levels - 1][0];
+    }
+
+    [Benchmark]
+    public int GeneratedParallelSimd()
+    {
+        for (int k = 1; k < _levels; k++)
+            GeneratedKernels.SparseTableLevel_ParallelSimd(_table[k - 1], _table[k], 1 << (k - 1), N - (1 << k) + 1);
+        return _table[_levels - 1][0];
+    }
+}
+
+/// <summary>
+/// Range minimum query, query phase: three gathers per query. The counterpart to
+/// <see cref="RmqBuildBench"/> and a companion to <see cref="GatherReadBench"/> — included to
+/// show where the SPMD model stops paying, not to flatter it.
+/// </summary>
+[MemoryDiagnoser]
+[SimpleJob]
+public class RmqQueryBench
+{
+    [Params(1 << 20)]
+    public int Queries;
+
+    private const int N = 1 << 16;
+
+    private int[] _flatTable = null!;
+    private int[] _logTable = null!;
+    private int[] _l = null!;
+    private int[] _r = null!;
+    private int[] _output = null!;
+    private int _levels;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        Random rng = new Random(7);
+        _levels = 1;
+        while ((1 << _levels) <= N) _levels++;
+
+        // Rows laid out flat and contiguously: row k starts at k * N.
+        _flatTable = new int[_levels * N];
+        for (int i = 0; i < N; i++)
+            _flatTable[i] = rng.Next();
+        for (int k = 1; k < _levels; k++)
+        {
+            int half = 1 << (k - 1);
+            int count = N - (1 << k) + 1;
+            for (int i = 0; i < count; i++)
+                _flatTable[(k * N) + i] = Math.Min(_flatTable[((k - 1) * N) + i], _flatTable[((k - 1) * N) + i + half]);
+        }
+
+        _logTable = new int[N + 1];
+        for (int i = 2; i <= N; i++)
+            _logTable[i] = _logTable[i / 2] + 1;
+
+        _l = new int[Queries];
+        _r = new int[Queries];
+        _output = new int[Queries];
+        for (int i = 0; i < Queries; i++)
+        {
+            int a = rng.Next(N), b = rng.Next(N);
+            _l[i] = Math.Min(a, b);
+            _r[i] = Math.Max(a, b);
+        }
+    }
+
+    [Benchmark(Baseline = true)]
+    public int Scalar()
+    {
+        for (int q = 0; q < Queries; q++)
+        {
+            int l = _l[q], r = _r[q];
+            int k = _logTable[r - l + 1];
+            int span = 1 << k;
+            _output[q] = Math.Min(_flatTable[(k * N) + l], _flatTable[(k * N) + r - span + 1]);
+        }
+
+        return _output[0];
+    }
+
+    [Benchmark]
+    public int GeneratedSimd()
+    {
+        GeneratedKernels.RmqQueryBatch_Simd(_flatTable, _logTable, _l, _r, _output, N, Queries);
+        return _output[0];
+    }
+
+    [Benchmark]
+    public int GeneratedParallelSimd()
+    {
+        GeneratedKernels.RmqQueryBatch_ParallelSimd(_flatTable, _logTable, _l, _r, _output, N, Queries);
+        return _output[0];
     }
 }
